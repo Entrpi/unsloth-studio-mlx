@@ -45,7 +45,10 @@ if str(_BACKEND_DIR) not in sys.path:
 # venv.
 _loggers_stub = types.ModuleType("loggers")
 _loggers_stub.get_logger = lambda name: __import__("logging").getLogger(name)
-sys.modules.setdefault("loggers", _loggers_stub)
+# Chunk E (E6): only install the stub when real loggers is absent.
+import importlib.util as _iu_lg
+if "loggers" not in sys.modules and _iu_lg.find_spec("loggers") is None:
+    sys.modules["loggers"] = _loggers_stub
 
 # structlog is only used for a module-level import; a bare stub is
 # enough because we never call into it in these tests.

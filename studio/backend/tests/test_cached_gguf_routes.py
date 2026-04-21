@@ -9,7 +9,11 @@ from types import SimpleNamespace
 
 # Keep this test runnable in lightweight environments where optional logging
 # deps are not installed.
-if "structlog" not in sys.modules:
+import importlib.util as _iu_sl
+# Chunk E (E6): only install dummy when real structlog is truly absent;
+# previously the minimal SimpleNamespace dummy poisoned real users that
+# got imported later in the same pytest session.
+if "structlog" not in sys.modules and _iu_sl.find_spec("structlog") is None:
 
     class _DummyLogger:
         def __getattr__(self, _name):

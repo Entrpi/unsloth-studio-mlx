@@ -2,12 +2,18 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 from pathlib import Path
+import importlib.util as _iu
 import sys
 import types
 
 # Keep this test runnable in lightweight environments where optional logging
-# deps are not installed.
-if "structlog" not in sys.modules:
+# deps are not installed. Chunk E (E6): only install the dummy when real
+# structlog is truly absent — previously, this ran at collection time and
+# the minimal dummy (no ConsoleRenderer, no BoundLogger bindings) poisoned
+# real structlog users that got imported later in the same pytest run
+# (e.g. mlx_lm.py via core.inference.mlx_lm), silently swallowing all
+# log output and breaking any test that asserts on captured log content.
+if "structlog" not in sys.modules and _iu.find_spec("structlog") is None:
 
     class _DummyLogger:
         def __getattr__(self, _name):

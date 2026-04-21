@@ -35,10 +35,16 @@ if _BACKEND_DIR not in sys.path:
 
 _loggers_stub = _types.ModuleType("loggers")
 _loggers_stub.get_logger = lambda name: __import__("logging").getLogger(name)
-sys.modules.setdefault("loggers", _loggers_stub)
+# Chunk E (E6): only install the stub when real loggers is absent.
+import importlib.util as _iu_lg
+if "loggers" not in sys.modules and _iu_lg.find_spec("loggers") is None:
+    sys.modules["loggers"] = _loggers_stub
 
 _structlog_stub = _types.ModuleType("structlog")
-sys.modules.setdefault("structlog", _structlog_stub)
+# Chunk E (E6): only install the stub when real structlog is absent.
+import importlib.util as _iu_sl
+if "structlog" not in sys.modules and _iu_sl.find_spec("structlog") is None:
+    sys.modules["structlog"] = _structlog_stub
 
 _httpx_stub = _types.ModuleType("httpx")
 for _exc in (
@@ -60,7 +66,14 @@ _httpx_stub.Client = type(
         "__exit__": lambda s, *a: None,
     },
 )
-sys.modules.setdefault("httpx", _httpx_stub)
+# Chunk E (E6): only install the stub when the real httpx is
+# genuinely absent. The previous unconditional setdefault put an
+# incomplete stub (missing HTTPError, Response, etc.) into
+# sys.modules at collection time, which broke any subsequently-run
+# test that imported huggingface_hub (e.g. MLX tests).
+import importlib.util as _iu
+if "httpx" not in sys.modules and _iu.find_spec("httpx") is None:
+    sys.modules["httpx"] = _httpx_stub
 
 from core.inference import llama_cpp as llama_cpp_module
 
