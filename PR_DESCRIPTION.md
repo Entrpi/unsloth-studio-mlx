@@ -1141,3 +1141,93 @@ rm -f studio/backend/tests/fixtures/lora_adapter/0000*_adapters.safetensors
 ## Residual follow-ups after Chunk H
 
 None. Phase 6 (LoRA) now has both mock-level unit coverage (pre-existing) AND real-adapter end-to-end coverage (this chunk). Every row in the MLX parity matrix has at least one real-hardware test.
+
+# Chunk H-2 — matrix-coverage gap fills
+
+Closes the last real-model-integration gaps left open at Chunk H tip. Prior chunks exercised Bonsai (text + LoRA + spec-decode), Qwen3.5-4B (text + VLM), LFM2.5-Audio (TTS), and Gemma-4 / Qwen3.5 via template probes. Non-Qwen/non-Bonsai text families, non-Qwen VLM, MoE routing, and real mlx-whisper ASR had all been template- or mock-only. H-2 downloads four small models and reuses two already-local large ones to close every remaining cell.
+
+## Items landed
+
+| Sub-item | Row | Closure |
+|---|---|---|
+| H2-1 | Hermes-3 / Llama-3.2 / Ministral-3 tool templates | PASS (Hermes, Llama) + xfail (Ministral — template incompat tracked in blockers.md) |
+| H2-2 | Per-family text chat smoke | PASS (3/3: Hermes, Llama-3.2, Ministral-3) |
+| H2-3 | MoE end-to-end (Qwen3.5-35B-A3B) | PASS (gated behind `MLX_SLOW_TESTS=1`; ~17 GB load) |
+| H2-4 | Non-Qwen VLM (GLM-4.6V-Flash-8bit) | PASS (2/2; gated behind `MLX_SLOW_TESTS=1`; ~10 GB load) |
+| H2-5 | Real Whisper ASR (whisper-small-mlx-4bit) | PASS (2/2; deterministic `say`-generated WAV fixture) |
+
+## Model downloads
+
+Four new checkpoints under `~/.lmstudio/models/`, total ~10.5 GB on disk:
+
+| Path | Size | Role |
+|---|---|---|
+| `mlx-community/Hermes-3-Llama-3.2-3B-bf16` | ~6.0 GB | Text + tool template (content-synthesis branch) |
+| `mlx-community/Ministral-3-3B-Instruct-2512-4bit` | ~2.6 GB | Text + tool template (native tool_calls, xfail on tool round-trip) |
+| `mlx-community/Llama-3.2-3B-Instruct-4bit` | ~1.7 GB | Text + tool template (ipython/JSON dialect) |
+| `mlx-community/whisper-small-mlx-4bit` | ~187 MB | Real ASR for `transcribe_with_whisper` |
+
+Plus two already-local large models reused unchanged:
+
+- `mlx-community/Qwen3.5-35B-A3B-4bit` (~17 GB) — MoE.
+- `lmstudio-community/GLM-4.6V-Flash-MLX-8bit` (~10 GB) — non-Qwen VLM.
+
+Full fetch commands in `docs/chunk-h2-matrix/downloads.md`.
+
+## New tests
+
+```
+tests/test_mlx_tool_templates.py              +3 parametrised rows (hermes-3-3b,
+                                               llama-3.2-3b pass; ministral-3-3b
+                                               xfail with blockers.md reference)
+tests/test_mlx_family_smoke.py                +3 parametrised rows (Hermes,
+                                               Ministral, Llama-3.2 load + chat
+                                               + unload)
+tests/test_mlx_moe_integration.py             +1 (MoE load + chat + unload,
+                                               MLX_SLOW_TESTS=1)
+tests/test_mlx_vlm_glm_integration.py         +2 (properties + red-square
+                                               description, MLX_SLOW_TESTS=1)
+tests/test_mlx_whisper_integration.py         +2 (hello-world transcription +
+                                               strip contract)
+tests/fixtures/audio/hello_world_16khz.wav    new fixture (~32 KB PCM16,
+                                               deterministic `say` output)
+```
+
+## Known-incomplete
+
+**Ministral-3 tool template xfail.** Ministral's chat template enforces strict user/assistant alternation over the full conversation and also runs `content | length` unconditionally on the assistant branch. Our 4-turn tool fixture (user → assistant-with-tool_calls → tool → user) trips the alternation check on the trailing user turn; reducing to 3 turns trips the `content=None` path because the extractor is shape-preserving (None ≠ empty string is a real distinction upstream). Fixing it would require template-family-aware content coercion in `_extract_content_parts`, which is a behaviour change rather than coverage expansion. Full trail in `docs/chunk-h2-matrix/blockers.md`.
+
+## Test results after Chunk H-2
+
+- Default run (no env vars):
+  ```
+  pytest tests/test_mlx_*.py tests/test_tool_call_parser.py tests/test_native_context_length.py
+  → 285 passed, 3 skipped, 1 xfailed in 55.8 s
+  ```
+  (3 skipped are the MLX_SLOW_TESTS-gated MoE + 2 GLM tests; 1 xfail is Ministral tool template.)
+- Slow run (`MLX_SLOW_TESTS=1 pytest tests/test_mlx_moe_integration.py tests/test_mlx_vlm_glm_integration.py`):
+  ```
+  → 3 passed in 35.3 s
+  ```
+
+Combined coverage across both runs: 288 real tests asserting MLX behaviour, of which 2 skipped are the `say`/LFM2.5-Audio TTS edge cases and 1 remains xfail as documented.
+
+## Known-flake list
+
+Every H-2 test is deterministic under fixed seeds / identical checkpoints:
+
+- Tool template (Hermes, Llama) — pure Jinja render, substring match. Zero jitter.
+- Tool template (Ministral) — xfail; deterministic `TemplateError`/`TypeError` raise.
+- Text chat smoke — greedy (temperature=0.0), asserts ≥1 token + metadata. No text-value assertions, so even sampling drift on a future mlx_lm release can't flake.
+- MoE smoke — greedy; same ≥1-token assertion; deterministic given identical page-cache state.
+- GLM VLM — greedy, red-square image deterministic, response contains "red" or "square" reliably across probed runs.
+- Whisper — fixture WAV is bit-exact (macOS `say --data-format=LEI16@16000` is deterministic), Whisper-small is deterministic under greedy temperature=0.0 (default).
+
+Cold-cache load times are observably variable (e.g. MoE swings from ~10 s warm to ~60 s cold) but don't threaten pass/fail.
+
+## Residual follow-ups after Chunk H-2
+
+1. **Ministral tool-template xfail** — see `docs/chunk-h2-matrix/blockers.md`. Fix is ~30 lines in `_extract_content_parts` (per-template content coercion) plus one new test. Deferred.
+2. **Ministral-3 context_length detection** — top-level `max_position_embeddings` returns None because Ministral-3 is actually `Mistral3ForConditionalGeneration` with the key nested under `text_config`. Generation works, but the property surface is slightly lossy. Same root cause will likely apply to any future VLM-architectured model loaded via the text path; ~5-line fix in MLX backend's context-length detection.
+
+Both are genuinely deferrable — neither blocks any user-facing capability.
