@@ -1279,3 +1279,83 @@ Follow-up items 1 and 2 above are both fixed on this same branch:
   (2 new passing rows vs chunk-H-2 tip: Ministral tool-template row flipped
   xfail → pass, plus two new unit tests for the `text_config` fallback in
   `test_mlx_backend_detection.py`. Net count: 285 → 288 passed; 1 → 0 xfail.)
+
+## H-2 Gemma-4 matrix closure
+
+Prior H-2 work left Gemma-4 with template-only coverage: one tokenizer
+probe against the 31B dense sibling, no weights-loaded tests, zero
+coverage of the Gemma-4 MoE variant. This pass downloads the small
+dense E4B variant (~4.9 GB) and adds four focused tests that light up
+every remaining Gemma-4 cell.
+
+### Download added
+
+| Path | Size | Role |
+|---|---|---|
+| `mlx-community/gemma-4-e4b-it-4bit` | ~4.9 GB | Gemma-4 dense — smoke + tool-template + tool-call E2E |
+
+Regeneration command appended to `docs/chunk-h2-matrix/downloads.md`:
+```
+/tmp/mlxtest/bin/hf download mlx-community/gemma-4-e4b-it-4bit \
+  --local-dir /Users/ent/.lmstudio/models/mlx-community/gemma-4-e4b-it-4bit
+```
+
+Two already-local Gemma-4 siblings are reused as-is (documented in the
+manifest but never downloaded by this pass):
+
+- `mlx-community/gemma-4-31b-it-4bit` (~17 GB) — 31B dense, still
+  template-probe-only.
+- `mlx-community/gemma-4-26b-a4b-4bit` (~14 GB) — MoE, now covered by
+  the slow-gated MoE suite.
+
+### Tests added
+
+| Row | File | Gate |
+|---|---|---|
+| G4-1 | `test_mlx_family_smoke.py` (new `gemma-4-e4b` row) | Default fast suite |
+| G4-2 | `test_mlx_tool_templates.py` (new `gemma-4-e4b` row) | Default fast suite |
+| G4-3 | `test_mlx_gemma_tool_calling.py::test_gemma_e4b_tool_loop_exercises_code_path` | Default fast suite |
+| G4-4 | `test_mlx_moe_integration.py` (new `gemma-4-26b-a4b` row via parametrise) | `MLX_SLOW_TESTS=1` |
+
+### G4-3 reliability note
+
+Gemma-4's tool-call idiom is
+`<|tool_call>call:NAME{...}<tool_call|>` — distinct from the shared
+`<tool_call>{...}</tool_call>` dialect the parser currently recognises
+(Qwen / Bonsai / Hermes). G4-3 asserts the "code path exercised"
+fallback: `supports_tools` is True at load, the loop terminates with a
+metadata event + `completion_tokens >= 1`, and any `tool_start` that
+fires is balanced by a matching `tool_end`. An aspirational branch
+asserts the full tool-call payload (`tool_name == "get_weather"`,
+"Paris" in arguments) IF a `tool_start` ever fires — currently
+unreachable, auto-upgrades the moment parser support for the Gemma
+dialect lands. Tracked as B3 in `docs/chunk-h2-matrix/blockers.md`.
+
+### Test results after G4 closure
+
+- Default run (no env vars):
+  ```
+  pytest tests/test_mlx_*.py tests/test_tool_call_parser.py tests/test_native_context_length.py
+  → 291 passed, 4 skipped, 0 xfailed
+  ```
+  (+3 fast passing rows vs B1/B2 tip: G4-1 smoke, G4-2 template probe,
+  G4-3 tool-call E2E. +1 slow-gated skip: G4-4 Gemma-4 MoE row. Net
+  count: 288 → 291 passed; 3 → 4 skipped; still 0 xfails.)
+- Slow run (`MLX_SLOW_TESTS=1 pytest tests/test_mlx_moe_integration.py tests/test_mlx_vlm_glm_integration.py`):
+  ```
+  → 4 passed in ~50 s
+  ```
+  (+1 passing row vs B1/B2 tip: Gemma-4 26B-a4b MoE. Previously 3
+  slow-gated passes; now 4.)
+
+Combined across both runs: 295 real MLX tests assert behaviour on
+hardware, of which 2 are the `say`/LFM2.5-Audio TTS edge cases that
+skip when the audio tools aren't installed.
+
+### Memory observations (M5 / 32 GB unified)
+
+- G4-3 E4B tool-loop: peak RSS ~5.8 GB. Loads in ~1.3 s warm.
+- G4-4 Gemma-4 26B-a4b MoE: peak RSS ~9.1 GB. Generates Count:-style
+  continuation in ~30 s cold, well under the MoE file's 60 s budget.
+- Both rows unload cleanly and the suite can run them sequentially
+  without OOM pressure on 32 GB.
