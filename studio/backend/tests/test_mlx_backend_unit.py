@@ -73,12 +73,19 @@ def test_backend_has_internal_lock() -> None:
 
 def test_backend_generate_raises_when_cold() -> None:
     b = _fresh_backend()
-    with pytest.raises(NotImplementedError):
-        # Phase 2 of the skeleton raises NotImplementedError; after step 5
-        # this becomes a RuntimeError for the cold-backend case. The
-        # integration test covers the loaded path.
+    with pytest.raises(RuntimeError, match = "not loaded"):
         gen = b.generate_chat_completion(
             messages = [{"role": "user", "content": "hi"}],
+        )
+        next(gen)
+
+
+def test_backend_generate_rejects_image() -> None:
+    b = _fresh_backend()
+    with pytest.raises(ValueError, match = "image"):
+        gen = b.generate_chat_completion(
+            messages = [{"role": "user", "content": "hi"}],
+            image_b64 = "abc",
         )
         next(gen)
 

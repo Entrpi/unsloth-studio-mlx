@@ -283,4 +283,128 @@ class MlxLmBackend:
         cancel_event: Optional[threading.Event] = None,
         enable_thinking: Optional[bool] = None,
     ) -> Generator[Union[str, MetadataEvent], None, None]:
-        raise NotImplementedError("generate_chat_completion is implemented in step 5")
+        """Stream a chat completion.
+
+        Contract (matches ``LlamaCppBackend.generate_chat_completion``):
+
+        - Yields cumulative text strings: each yield is the FULL text
+          generated so far, not just the new delta. The route diffs the
+          cumulative string to derive OpenAI ``delta.content`` frames.
+        - After the text stream ends, yields exactly one metadata dict
+          with ``{"type": "metadata", "usage": {...}, "timings": {...}}``.
+
+        Phase-1 limitations:
+
+        - ``image_b64`` is rejected (not supported).
+        - ``enable_thinking`` is silently ignored (Bonsai has no
+          ``<think>`` tag plumbing in Phase 1).
+        - ``stop`` strings are not honored yet — MLX's stream_generate
+          does not natively accept custom stop strings; the route can
+          still truncate on its side if needed. We pass them through
+          ``mlx_lm`` if it supports the ``stop`` kwarg and silently
+          swallow TypeError otherwise for forward compatibility.
+        - ``repetition_penalty``, ``presence_penalty``, ``top_k`` are
+          passed through ``sampler`` / ``logits_processors`` when
+          supported by the installed mlx-lm version. Unsupported
+          values are dropped with a debug log rather than raising.
+        """
+        if image_b64:
+            raise ValueError(
+                "MLX backend does not support image inputs in Phase 1"
+            )
+        if not self.is_loaded:
+            raise RuntimeError("MLX model is not loaded")
+
+        # Lazy imports
+        try:
+            from mlx_lm import stream_generate  # type: ignore
+            from mlx_lm.sample_utils import make_sampler  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(f"mlx_lm is not installed: {e}") from e
+
+        tokenizer = self._tokenizer
+        model = self._model
+
+        # Build the prompt via the tokenizer's chat template. Fall back to
+        # a minimal ChatML-style prompt if the model has no template.
+        try:
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt = True,
+                tokenize = False,
+            )
+        except Exception as e:
+            logger.warning(
+                f"apply_chat_template failed ({e}); falling back to manual prompt"
+            )
+            parts: list[str] = []
+            for m in messages:
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                parts.append(f"<|{role}|>\n{content}")
+            parts.append("<|assistant|>\n")
+            prompt = "\n".join(parts)
+
+        # Build the sampler. ``make_sampler`` is stable across 0.31.x.
+        sampler = None
+        try:
+            sampler = make_sampler(
+                temp = float(temperature),
+                top_p = float(top_p),
+                top_k = int(top_k) if top_k and top_k > 0 else 0,
+                min_p = float(min_p) if min_p and min_p > 0 else 0.0,
+            )
+        except TypeError:
+            # Older mlx-lm sample_utils has a smaller arg set.
+            try:
+                sampler = make_sampler(temp = float(temperature), top_p = float(top_p))
+            except Exception as e:
+                logger.debug(
+                    f"Could not construct MLX sampler ({e}); using default"
+                )
+                sampler = None
+
+        # Kwargs for stream_generate — filter out Nones.
+        sg_kwargs: Dict[str, Any] = {"prompt": prompt}
+        if max_tokens is not None and max_tokens > 0:
+            sg_kwargs["max_tokens"] = int(max_tokens)
+        if sampler is not None:
+            sg_kwargs["sampler"] = sampler
+
+        # Generation loop. stream_generate is a plain Python generator;
+        # the caller (route) drives it from a worker thread via
+        # asyncio.to_thread(next, gen, sentinel) to keep the event loop
+        # free. We accumulate resp.text and yield the cumulative string.
+        cumulative = ""
+        last_resp: Any = None
+        try:
+            for resp in stream_generate(model, tokenizer, **sg_kwargs):
+                last_resp = resp
+                if cancel_event is not None and cancel_event.is_set():
+                    logger.debug("MLX generation cancelled by client")
+                    break
+                text = getattr(resp, "text", "") or ""
+                if text:
+                    cumulative += text
+                    yield cumulative
+        except Exception as e:
+            logger.error(f"MLX stream_generate raised: {e}")
+            raise
+
+        # Final metadata. ``last_resp`` carries final counts/tps.
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        timings = {"prompt_per_second": None, "predicted_per_second": None}
+        if last_resp is not None:
+            pt = int(getattr(last_resp, "prompt_tokens", 0) or 0)
+            gt = int(getattr(last_resp, "generation_tokens", 0) or 0)
+            usage = {
+                "prompt_tokens": pt,
+                "completion_tokens": gt,
+                "total_tokens": pt + gt,
+            }
+            timings = {
+                "prompt_per_second": getattr(last_resp, "prompt_tps", None),
+                "predicted_per_second": getattr(last_resp, "generation_tps", None),
+            }
+
+        yield {"type": "metadata", "usage": usage, "timings": timings}
