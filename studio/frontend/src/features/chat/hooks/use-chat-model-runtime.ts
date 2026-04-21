@@ -216,6 +216,9 @@ export function useChatModelRuntime() {
     percent: number | null;
     label: string | null;
     phase: "downloading" | "starting";
+    // Chunk E (E4): non-fatal warnings emitted by the MLX backend during
+    // load (e.g. memory-headroom advisories). Undefined / empty when none.
+    warnings?: string[];
   } | null>(null);
   const loadAbortRef = useRef<AbortController | null>(null);
   const loadingModelRef = useRef<typeof loadingModel>(null);
@@ -840,6 +843,7 @@ export function useChatModelRuntime() {
               percent: pct,
               label,
               phase: "starting",
+              warnings: prog.warnings && prog.warnings.length > 0 ? prog.warnings : undefined,
             });
             if (loadToastDismissedRef.current) return;
             toast(null, {

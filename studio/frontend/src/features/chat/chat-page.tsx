@@ -873,6 +873,7 @@ export function ChatPage(): ReactElement {
                 }
                 progressPercent={loadProgress?.percent}
                 progressLabel={loadProgress?.label}
+                warnings={loadProgress?.warnings}
                 onStop={cancelLoading}
               />
             ) : null}

@@ -103,6 +103,12 @@ type ModelLoadInlineStatusProps = {
   title: string;
   progressPercent?: number | null;
   progressLabel?: string | null;
+  /**
+   * Non-fatal advisories emitted by the MLX backend during load.
+   * Chunk E (E4). Rendered as small muted bullet points below the
+   * phase text. Empty / undefined → nothing rendered.
+   */
+  warnings?: string[];
   onStop?: () => void;
 };
 
@@ -111,45 +117,56 @@ export function ModelLoadInlineStatus({
   title,
   progressPercent,
   progressLabel,
+  warnings,
   onStop,
 }: ModelLoadInlineStatusProps) {
   const hasProgress = typeof progressPercent === "number";
+  const hasWarnings = Array.isArray(warnings) && warnings.length > 0;
 
   return (
-    <div className="flex min-w-[20rem] items-center gap-2.5 text-muted-foreground" title={title}>
-      <div className="flex items-center gap-1.5 shrink-0">
-        <Spinner className="size-3.5 shrink-0" />
-        <span className="text-xs">{label}</span>
-      </div>
-      {hasProgress ? (
-        <div className="flex min-w-0 flex-[1.35] items-center gap-2.5">
-          <div className="min-w-[7rem] flex-1">
-            <Progress value={clampProgress(progressPercent)} className="h-1 bg-foreground/[0.08]" />
-          </div>
-          <div
-            className="flex shrink-0 items-center gap-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground/80"
-            title={progressLabel ?? undefined}
-          >
-            {/* Inline layout is horizontal and tight -- show only the
-                primary (bytes) chunk; the full label (with rate/ETA)
-                stays available via the tooltip. */}
-            <span>{splitProgressLabel(progressLabel).primary}</span>
-            <span className="tabular-nums">
-              {Math.round(clampProgress(progressPercent))}%
-            </span>
-          </div>
+    <div className="flex min-w-[20rem] flex-col gap-0.5 text-muted-foreground" title={title}>
+      <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-1.5 shrink-0">
+          <Spinner className="size-3.5 shrink-0" />
+          <span className="text-xs">{label}</span>
         </div>
-      ) : null}
-      {onStop ? (
-        <Button
-          type="button"
-          size="xs"
-          variant="outline"
-          className="shrink-0 text-[11px]"
-          onClick={onStop}
-        >
-          Stop
-        </Button>
+        {hasProgress ? (
+          <div className="flex min-w-0 flex-[1.35] items-center gap-2.5">
+            <div className="min-w-[7rem] flex-1">
+              <Progress value={clampProgress(progressPercent)} className="h-1 bg-foreground/[0.08]" />
+            </div>
+            <div
+              className="flex shrink-0 items-center gap-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground/80"
+              title={progressLabel ?? undefined}
+            >
+              {/* Inline layout is horizontal and tight -- show only the
+                  primary (bytes) chunk; the full label (with rate/ETA)
+                  stays available via the tooltip. */}
+              <span>{splitProgressLabel(progressLabel).primary}</span>
+              <span className="tabular-nums">
+                {Math.round(clampProgress(progressPercent))}%
+              </span>
+            </div>
+          </div>
+        ) : null}
+        {onStop ? (
+          <Button
+            type="button"
+            size="xs"
+            variant="outline"
+            className="shrink-0 text-[11px]"
+            onClick={onStop}
+          >
+            Stop
+          </Button>
+        ) : null}
+      </div>
+      {hasWarnings ? (
+        <ul className="list-disc pl-5 text-[10px] text-muted-foreground/70">
+          {warnings!.map((w, i) => (
+            <li key={i}>{w}</li>
+          ))}
+        </ul>
       ) : null}
     </div>
   );

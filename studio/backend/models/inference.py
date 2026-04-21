@@ -339,6 +339,16 @@ class LoadProgressResponse(BaseModel):
     fraction: float = Field(
         0.0, description = "bytes_loaded / bytes_total, clamped to 0..1."
     )
+    warnings: List[str] = Field(
+        default_factory = list,
+        description = (
+            "Non-fatal warnings the backend emitted during load — e.g. "
+            "memory-headroom advisories when a draft model brings combined "
+            "footprint close to the 75% unified-memory limit. Empty list "
+            "when no warnings are present or the active backend does not "
+            "emit any."
+        ),
+    )
 
 
 class InferenceStatusResponse(BaseModel):

@@ -1112,6 +1112,38 @@ def test_generate_omits_draft_model_when_none() -> None:
     assert "num_draft_tokens" not in captured
 
 
+# ── Chunk E (E4): warnings surfaced through LoadProgressResponse ────
+
+
+def test_load_progress_includes_warnings_when_present() -> None:
+    """When ``_load_warnings`` is populated, ``load_progress()`` must
+    include them in its return dict so the route handler can surface
+    them to the frontend via the new LoadProgressResponse.warnings field."""
+    b = _fresh_backend()
+    b._load_phase = "loading"
+    b._weights_bytes_total = 1024 * 1024 * 1024  # 1 GB
+    b._load_warnings = [
+        "model size 45.0 GB exceeds 1.5x available RAM (20.0 GB) — expect swap",
+    ]
+    p = b.load_progress()
+    assert p is not None
+    assert "warnings" in p
+    assert len(p["warnings"]) == 1
+    assert "swap" in p["warnings"][0]
+
+
+def test_load_progress_omits_warnings_when_empty() -> None:
+    """Empty warnings list → key omitted (backward compat with callers
+    that don't know about the field)."""
+    b = _fresh_backend()
+    b._load_phase = "loading"
+    b._weights_bytes_total = 1024
+    b._load_warnings = []
+    p = b.load_progress()
+    assert p is not None
+    assert "warnings" not in p
+
+
 # ── Chunk E (E3): num_draft_tokens override via LoadRequest ─────────
 
 

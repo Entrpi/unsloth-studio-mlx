@@ -157,6 +157,14 @@ export interface LoadProgressResponse {
   bytes_loaded: number;
   bytes_total: number;
   fraction: number;
+  /**
+   * Non-fatal warnings the backend emitted during load — e.g. MLX
+   * memory-headroom advisories when a draft model brings combined
+   * footprint close to the 75% unified-memory limit. Chunk E (E4)
+   * added this field; older backends omit it, so callers must treat
+   * ``undefined`` the same as ``[]``.
+   */
+  warnings?: string[];
 }
 
 /**

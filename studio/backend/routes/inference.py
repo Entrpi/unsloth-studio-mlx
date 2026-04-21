@@ -1291,15 +1291,13 @@ async def get_load_progress(
         mlx_backend = get_mlx_lm_backend()
         mlx_progress = mlx_backend.load_progress()
         if mlx_progress is not None and mlx_progress.get("phase") is not None:
-            # Strip MLX-only "warnings" key before handing to the
-            # GGUF-shaped response model — the GGUF schema has no
-            # warnings field and we don't want to break existing
-            # clients. The warnings are already surfaced in the
-            # backend logs and will ride on LoadResponse eventually.
+            # Chunk E (E4): the schema now has a warnings field — surface
+            # any memory-headroom advisories the backend collected during
+            # load alongside the phase/bytes data.
             filtered = {
                 k: v
                 for k, v in mlx_progress.items()
-                if k in ("phase", "bytes_loaded", "bytes_total", "fraction")
+                if k in ("phase", "bytes_loaded", "bytes_total", "fraction", "warnings")
             }
             return LoadProgressResponse(**filtered)
 
@@ -1311,7 +1309,7 @@ async def get_load_progress(
                     filtered = {
                         k: v
                         for k, v in prog.items()
-                        if k in ("phase", "bytes_loaded", "bytes_total", "fraction")
+                        if k in ("phase", "bytes_loaded", "bytes_total", "fraction", "warnings")
                     }
                     return LoadProgressResponse(**filtered)
 
@@ -1319,6 +1317,9 @@ async def get_load_progress(
         progress = llama_backend.load_progress()
         if progress is None:
             return LoadProgressResponse()
+        # GGUF backend does not emit warnings today; if/when it does the
+        # LoadProgressResponse default_factory tolerates absence and the
+        # schema accepts additional keys via the filtered passthrough below.
         return LoadProgressResponse(**progress)
     except Exception as e:
         logger.warning(f"Error sampling load progress: {e}")
