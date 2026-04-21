@@ -85,6 +85,7 @@ except ImportError:
     from utils.models.model_config import load_model_defaults
 
 from models.inference import (
+    BackendKind,
     LoadRequest,
     UnloadRequest,
     GenerateRequest,
@@ -923,12 +924,40 @@ async def validate_model(
                 detail = f"Invalid model identifier: {request.model_path}",
             )
 
+        # Chunk G (G2): derive ``backend_kind`` from the resolved config
+        # so the validate endpoint is symmetric with LoadResponse /
+        # InferenceStatusResponse. ``ModelConfig.from_identifier`` sets
+        # exactly one of the is_mlx_* flags (or leaves them all False for
+        # GGUF / unsloth paths), so the dispatch is deterministic.
+        is_gguf = bool(getattr(config, "is_gguf", False))
+        is_mlx = bool(getattr(config, "is_mlx", False))
+        is_mlx_lora = bool(getattr(config, "is_mlx_lora", False))
+        is_mlx_vlm = bool(getattr(config, "is_mlx_vlm", False))
+        is_mlx_audio = bool(getattr(config, "is_mlx_audio", False))
+        backend_kind: Optional[BackendKind]
+        if is_mlx_vlm:
+            backend_kind = "mlx+vlm"
+        elif is_mlx_audio:
+            backend_kind = "mlx+audio"
+        elif is_mlx_lora or (is_mlx and getattr(config, "is_lora", False)):
+            backend_kind = "mlx+lora"
+        elif is_mlx:
+            backend_kind = "mlx"
+        elif is_gguf:
+            backend_kind = "gguf"
+        else:
+            backend_kind = "unsloth"
+
         return ValidateModelResponse(
             valid = True,
             message = "Model identifier is valid.",
             identifier = config.identifier,
             display_name = getattr(config, "display_name", config.identifier),
-            is_gguf = getattr(config, "is_gguf", False),
+            is_gguf = is_gguf,
+            is_mlx = is_mlx,
+            is_mlx_vlm = is_mlx_vlm,
+            is_mlx_audio = is_mlx_audio,
+            backend_kind = backend_kind,
             is_lora = getattr(config, "is_lora", False),
             is_vision = getattr(config, "is_vision", False),
             requires_trust_remote_code = bool(

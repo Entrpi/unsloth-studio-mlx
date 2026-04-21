@@ -193,6 +193,15 @@ class ValidateModelResponse(BaseModel):
         ),
         deprecated = True,
     )
+    backend_kind: Optional[BackendKind] = Field(
+        default = None,
+        description = (
+            "Primary source of truth for the backend type; booleans are "
+            "deprecated. Chunk G (G2) — symmetric with LoadResponse / "
+            "InferenceStatusResponse. ``None`` when validation runs on an "
+            "identifier that hasn't resolved into a concrete backend yet."
+        ),
+    )
     is_lora: bool = Field(False, description = "Whether this is a LoRA adapter")
     is_vision: bool = Field(False, description = "Whether this is a vision-capable model")
     requires_trust_remote_code: bool = Field(
