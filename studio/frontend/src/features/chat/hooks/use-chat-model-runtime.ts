@@ -546,12 +546,30 @@ export function useChatModelRuntime() {
             }
 
             const { chatTemplateOverride, kvCacheDtype, customContextLength, ggufContextLength, speculativeType, draftModelPath } = useChatRuntimeStore.getState();
-            // GGUF: use custom context length, or 0 = model's native context
-            // Non-GGUF: use the Max Seq Length slider value
+            // GGUF / MLX / MLX-VLM / MLX-Audio: use custom context length,
+            // or 0 = model's native context (backend reads max_position_embeddings).
+            // Unsloth/transformers: use the Max Seq Length slider value
+            // because there's no native-context concept.
+            //
+            // Chunk H-2 follow-up: without the hasNativeCtx gate, MLX loads
+            // clamped to the legacy 4096 slider default — e.g. Bonsai 8B
+            // surfaced as 4096 despite max_position_embeddings=65536, because
+            // MlxLmBackend.load_model applies min(native, n_ctx) when n_ctx>0.
+            // Chunk G exposes backend_kind on ValidateModelResponse, so we
+            // can dispatch before the load without another round-trip.
+            const validatedKind = validation.backend_kind ?? null;
+            const hasNativeCtx =
+              validatedKind === "gguf" ||
+              validatedKind === "mlx" ||
+              validatedKind === "mlx+lora" ||
+              validatedKind === "mlx+vlm" ||
+              validatedKind === "mlx+audio";
             const isDirectGgufFile = modelId.toLowerCase().endsWith(".gguf");
             const effectiveMaxSeqLength = customContextLength != null
               ? customContextLength
-              : (ggufVariant != null || isDirectGgufFile) ? (ggufContextLength ?? 0) : maxSeqLength;
+              : hasNativeCtx || ggufVariant != null || isDirectGgufFile
+                ? (ggufContextLength ?? 0)
+                : maxSeqLength;
             const loadResponse = await loadModel({
               model_path: modelId,
               hf_token: hfToken,

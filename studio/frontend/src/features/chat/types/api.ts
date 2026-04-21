@@ -87,6 +87,14 @@ export interface ValidateModelResponse {
   is_lora?: boolean;
   is_vision?: boolean;
   requires_trust_remote_code?: boolean;
+  /**
+   * Primary source-of-truth for backend routing; set server-side from
+   * ModelConfig during validation. Chunk G (G2) added this on the backend
+   * schema; matching TS surface followed in the Chunk H-2 context-length
+   * fix so pre-load routing can dispatch on the enum without another
+   * round-trip.
+   */
+  backend_kind?: BackendKind | null;
 }
 
 export interface GgufVariantDetail {
