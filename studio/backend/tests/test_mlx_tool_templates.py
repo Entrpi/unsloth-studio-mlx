@@ -83,6 +83,16 @@ _CANDIDATES = [
         "<|tool_call>",
         id = "gemma-4-31b",
     ),
+    # Gemma 4 E4B — same template family / marker as 31B. Added on the
+    # Gemma-4 matrix-closure pass so both dense variants are locked in
+    # for tool-template round-trip regression protection. Inherits the
+    # native-iteration branch (template uses ``message['tool_calls']``).
+    pytest.param(
+        "gemma-4-e4b",
+        _LMSTUDIO_ROOT / "mlx-community" / "gemma-4-e4b-it-4bit",
+        "<|tool_call>",
+        id = "gemma-4-e4b",
+    ),
     # Bonsai (2bit) — already the baseline Chunk C tested, include here
     # for regression-protection parity across the whole candidate set.
     pytest.param(
