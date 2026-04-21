@@ -184,6 +184,12 @@ class MlxLmBackend:
         self._model_identifier: Optional[str] = None
         self._local_path: Optional[str] = None
         self._context_length: Optional[int] = None
+        # Phase 4 — reasoning / <think> state. Populated at load time by
+        # ``_detect_reasoning``; reset by ``_unload_locked``.
+        self._chat_template: Optional[str] = None
+        self._supports_reasoning: bool = False
+        self._reasoning_always_on: bool = False
+        self._reasoning_default: bool = True
         self._lock = threading.Lock()
 
     # ── Properties ────────────────────────────────────────────────
@@ -227,19 +233,24 @@ class MlxLmBackend:
 
     @property
     def chat_template(self) -> Optional[str]:
-        return None
+        return self._chat_template
 
     @property
     def supports_reasoning(self) -> bool:
-        return False
+        return self._supports_reasoning
 
     @property
     def reasoning_always_on(self) -> bool:
-        return False
+        return self._reasoning_always_on
 
     @property
     def reasoning_default(self) -> bool:
-        return False
+        # When a model always reasons the UI hides the toggle but the
+        # effective mode is still "thinking on". Mirrors the GGUF logic at
+        # llama_cpp.py:1519-1535: when ``reasoning_always_on`` is True the
+        # template emits ``<think>`` regardless of the kwarg; the
+        # advertised default stays True so no user-facing contradiction.
+        return self._reasoning_default
 
     @property
     def supports_tools(self) -> bool:
@@ -267,6 +278,69 @@ class MlxLmBackend:
     def _platform_ok() -> bool:
         """True iff the host can run MLX (Apple Silicon macOS)."""
         return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+    def _detect_reasoning(
+        self, tokenizer: Any, model_identifier: str
+    ) -> None:
+        """Populate reasoning flags by inspecting the chat template.
+
+        Mirrors the GGUF metadata scan at ``llama_cpp.py:893-921`` and the
+        size-based default logic at ``llama_cpp.py:1519-1535``. The rule is:
+
+        * ``enable_thinking`` substring in the template → supports_reasoning
+          is True and the template actually reads the kwarg (Qwen3, Bonsai
+          derivatives that kept it, etc.).
+        * Else if BOTH ``<think>`` AND ``</think>`` appear in the template →
+          supports_reasoning is True AND reasoning_always_on is True: the
+          template hardcodes the tags, so the model always reasons and the
+          toggle has no effect. The UI hides it.
+        * Otherwise no reasoning support.
+
+        For always-on-capable reasoning models (``enable_thinking`` path)
+        the default is True unless the model identifier says Qwen3.5 /
+        Qwen3.6 < 9B — those ship with thinking disabled by default
+        per upstream Qwen recommendation.
+        """
+        self._chat_template = None
+        self._supports_reasoning = False
+        self._reasoning_always_on = False
+        self._reasoning_default = True
+
+        template = getattr(tokenizer, "chat_template", None)
+        if not isinstance(template, str) or not template:
+            return
+        self._chat_template = template
+
+        if "enable_thinking" in template:
+            self._supports_reasoning = True
+            # Size-based default, ported from llama_cpp.py:1519-1535.
+            thinking_default = True
+            mid = (model_identifier or "").lower()
+            if "qwen3.5" in mid or "qwen3.6" in mid:
+                try:
+                    from utils.models import extract_model_size_b
+
+                    size_val = extract_model_size_b(mid)
+                    if size_val is not None and size_val < 9:
+                        thinking_default = False
+                except Exception as e:
+                    logger.debug(
+                        f"extract_model_size_b failed ({e}); keeping default=True"
+                    )
+            self._reasoning_default = thinking_default
+            logger.info(
+                f"MLX: reasoning detected via enable_thinking kwarg "
+                f"(default={thinking_default})"
+            )
+            return
+
+        if "<think>" in template and "</think>" in template:
+            self._supports_reasoning = True
+            self._reasoning_always_on = True
+            self._reasoning_default = True
+            logger.info(
+                "MLX: reasoning detected via literal <think> tags (always-on)"
+            )
 
     def load_model(
         self,
@@ -353,10 +427,20 @@ class MlxLmBackend:
             self._local_path = str(path)
             self._context_length = effective_ctx
 
+            # Phase 4: introspect reasoning support from the tokenizer's
+            # chat template. Errors are non-fatal — a model without a
+            # template just gets supports_reasoning=False.
+            try:
+                self._detect_reasoning(tokenizer, model_identifier)
+            except Exception as e:
+                logger.debug(f"MLX reasoning detection failed ({e}); defaulting to off")
+
             logger.info(
                 f"MLX model loaded in {load_s:.2f}s: "
                 f"identifier={model_identifier} path={path} "
-                f"context_length={effective_ctx}"
+                f"context_length={effective_ctx} "
+                f"reasoning={self._supports_reasoning} "
+                f"always_on={self._reasoning_always_on}"
             )
             return True
 
@@ -370,6 +454,12 @@ class MlxLmBackend:
         self._model_identifier = None
         self._local_path = None
         self._context_length = None
+        # Phase 4: clear reasoning state. A subsequent load_model of a
+        # different model must not inherit the previous model's flags.
+        self._chat_template = None
+        self._supports_reasoning = False
+        self._reasoning_always_on = False
+        self._reasoning_default = True
 
         gc.collect()
         # mx.metal.clear_cache() may not exist in every MLX build.

@@ -1853,6 +1853,14 @@ async def openai_chat_completions(
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
 
+        # Normalize OpenAI's ``stop`` field: str | list[str] | None.
+        _mlx_stop: Optional[list[str]] = None
+        if payload.stop is not None:
+            if isinstance(payload.stop, str):
+                _mlx_stop = [payload.stop]
+            elif isinstance(payload.stop, list):
+                _mlx_stop = [s for s in payload.stop if isinstance(s, str) and s]
+
         def mlx_generate():
             return mlx_backend.generate_chat_completion(
                 messages = mlx_messages,
@@ -1863,6 +1871,7 @@ async def openai_chat_completions(
                 max_tokens = payload.max_tokens,
                 repetition_penalty = payload.repetition_penalty,
                 presence_penalty = payload.presence_penalty,
+                stop = _mlx_stop,
                 cancel_event = cancel_event,
                 enable_thinking = payload.enable_thinking,
             )

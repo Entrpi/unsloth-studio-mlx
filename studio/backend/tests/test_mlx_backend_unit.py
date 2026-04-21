@@ -52,7 +52,12 @@ def test_backend_property_defaults() -> None:
     assert b.supports_tools is False
     assert b.supports_reasoning is False
     assert b.reasoning_always_on is False
-    assert b.reasoning_default is False
+    # Default matches GGUF's LlamaCppBackend.__init__ at llama_cpp.py:111.
+    # When the UI sees ``supports_reasoning=False`` it hides the toggle, so
+    # this value is only consulted when a reasoning-capable model is
+    # loaded. Start it at True so a newly-detected reasoning model with
+    # default semantics ("thinking on") doesn't need to flip a flag.
+    assert b.reasoning_default is True
     assert b.hf_variant is None
     assert b.context_length is None
     assert b.max_context_length is None

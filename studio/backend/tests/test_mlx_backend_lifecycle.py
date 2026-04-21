@@ -48,10 +48,16 @@ def test_load_unload_roundtrip():
     assert backend.context_length is not None
     assert backend.context_length > 0
     assert backend.native_context_length == backend.context_length
-    # Feature flags: nothing but plain text in Phase 1.
+    # Feature flags. Bonsai ships a Qwen3-derived template with literal
+    # <think>/</think> tags → Phase 4 detects it as reasoning-capable
+    # (always-on). Vision and tools remain false in Chunk A.
     assert backend.is_vision is False
     assert backend.supports_tools is False
-    assert backend.supports_reasoning is False
+    assert backend.supports_reasoning is True
+    assert backend.reasoning_always_on is True
+    assert backend.reasoning_default is True
+    assert backend.chat_template is not None
+    assert len(backend.chat_template) > 0
     assert backend.cache_type_kv is None
 
     assert backend.unload_model() is True
