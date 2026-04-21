@@ -91,6 +91,69 @@ _CANDIDATES = [
         "<tool_call>",
         id = "bonsai-1.7b",
     ),
+    # Chunk H-2 (H2-1): non-Qwen / non-Gemma tool-template families.
+    #
+    # Hermes-3-Llama-3.2-3B — Nous Research Hermes chat-ML style.
+    # Its chat_template is minimal (just <|im_start|>/<|im_end|> role
+    # wrapping) and does NOT iterate ``message.tool_calls``. Chunk F1's
+    # content-synthesis branch fires: the extractor injects
+    # ``<tool_call>...</tool_call>`` JSON into the assistant turn's
+    # content so the raw text carries the call. Marker: ``<tool_call>``.
+    pytest.param(
+        "hermes-3-3b",
+        _LMSTUDIO_ROOT / "mlx-community" / "Hermes-3-Llama-3.2-3B-bf16",
+        "<tool_call>",
+        id = "hermes-3-3b",
+    ),
+    # Llama-3.2-3B-Instruct — Meta ipython / JSON dialect.
+    # The template DOES iterate ``message.tool_calls`` natively (camp
+    # (a) in F1 parlance); it emits the tool call as inline
+    # ``{"name": "...", "parameters": {...}}`` JSON inside an
+    # ``<|start_header_id|>assistant<|end_header_id|>`` block. There is
+    # no ``<tool_call>`` literal — the JSON object itself IS the call.
+    # Marker: the function-name signature the template bakes in.
+    pytest.param(
+        "llama-3.2-3b",
+        _LMSTUDIO_ROOT / "mlx-community" / "Llama-3.2-3B-Instruct-4bit",
+        '{"name": "get_weather"',
+        id = "llama-3.2-3b",
+    ),
+    # Ministral-3-3B-Instruct — Mistral 2512 dialect.
+    # Uses ``[AVAILABLE_TOOLS]`` / ``[TOOL_CALLS]`` / ``[TOOL_RESULTS]``.
+    # The template DOES iterate ``message.tool_calls`` (camp (a)), but
+    # it ALSO executes ``message['content'] | length > 0`` eagerly when
+    # tool_calls are present — which raises ``TypeError`` on the
+    # ``content=None`` shape our extractor emits for assistant-only-
+    # tool-calls turns. The rendering succeeds end-to-end when content
+    # is coerced to an empty string, but the extractor is intentionally
+    # shape-preserving (Chunk F / Chunk G contract: content=None means
+    # "no text was emitted"). Fixing this requires per-template content-
+    # coercion logic in the extractor — deliberately out of scope for
+    # Chunk H-2 (coverage expansion, not behaviour change). See
+    # docs/chunk-h2-matrix/blockers.md for the full note.
+    pytest.param(
+        "ministral-3-3b",
+        _LMSTUDIO_ROOT / "mlx-community" / "Ministral-3-3B-Instruct-2512-4bit",
+        "[TOOL_CALLS]",
+        id = "ministral-3-3b",
+        marks = pytest.mark.xfail(
+            reason = (
+                "Ministral-3's template enforces strict user/assistant "
+                "alternation on the full conversation and also runs "
+                "``content|length`` unconditionally on the assistant "
+                "branch. Our 4-turn tool fixture (user→assistant-tc→tool→"
+                "user) trips the alternation check on the trailing user "
+                "turn, and reducing to 3 turns trips the content=None "
+                "check. Tracked in docs/chunk-h2-matrix/blockers.md; "
+                "fix belongs in a future Chunk."
+            ),
+            strict = False,
+            # TemplateError from alternation; TypeError from len(None).
+            # AssertionError kept as a fallback in case some transformers
+            # upgrade normalises one path.
+            raises = Exception,
+        ),
+    ),
 ]
 
 
