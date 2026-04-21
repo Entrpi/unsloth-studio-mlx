@@ -80,6 +80,20 @@ class ModelDetails(BaseModel):
         False,
         description = "Whether model is an MLX model (Apple Silicon via mlx-lm)",
     )
+    is_mlx_vlm: bool = Field(
+        False,
+        description = (
+            "Whether model is an MLX vision-language model loaded via "
+            "``mlx-vlm`` (Phase 9 / Chunk D)."
+        ),
+    )
+    is_mlx_audio: bool = Field(
+        False,
+        description = (
+            "Whether model is an MLX audio model loaded via ``mlx-audio`` "
+            "(Phase 10 / Chunk D)."
+        ),
+    )
     is_audio: bool = Field(False, description = "Whether model is a TTS audio model")
     audio_type: Optional[str] = Field(
         None, description = "Audio codec type: snac, csm, bicodec, dac"

@@ -14,6 +14,32 @@ from typing import Annotated, Any, Dict, Literal, Optional, List, Union
 from pydantic import BaseModel, Discriminator, Field, Tag, model_validator
 
 
+# ── Chunk D — backend_kind enum ────────────────────────────────────
+# Additive enum that collapses the set of ``is_gguf`` / ``is_mlx`` /
+# ``is_mlx_lora`` / ``is_mlx_vlm`` / ``is_mlx_audio`` booleans down to a
+# single discriminator string. Per the roadmap (Section 4.2) the enum
+# lands **additively** in Phase 9+10 — the booleans stay on every
+# response for backwards compatibility with existing frontends and
+# third-party tools, but new code should read ``backend_kind`` for the
+# source of truth about which backend owns the active model.
+#
+# Values:
+#   "gguf"       — GGUF via llama-server
+#   "mlx"        — base MLX text model via mlx-lm
+#   "mlx+lora"   — MLX text model with a LoRA adapter layered on top
+#   "mlx+vlm"    — MLX vision-language model via mlx-vlm (Phase 9)
+#   "mlx+audio"  — MLX audio model via mlx-audio (Phase 10)
+#   "unsloth"    — Unsloth / transformers (default transformers path)
+BackendKind = Literal[
+    "gguf",
+    "mlx",
+    "mlx+lora",
+    "mlx+vlm",
+    "mlx+audio",
+    "unsloth",
+]
+
+
 class LoadRequest(BaseModel):
     """Request to load a model for inference"""
 
@@ -116,6 +142,20 @@ class ValidateModelResponse(BaseModel):
         False,
         description = "Whether this is an MLX model (Apple Silicon via mlx-lm)",
     )
+    is_mlx_vlm: bool = Field(
+        False,
+        description = (
+            "Whether this is an MLX vision-language model loaded via "
+            "``mlx-vlm`` (Phase 9 / Chunk D)."
+        ),
+    )
+    is_mlx_audio: bool = Field(
+        False,
+        description = (
+            "Whether this is an MLX audio model loaded via ``mlx-audio`` "
+            "(Phase 10 / Chunk D)."
+        ),
+    )
     is_lora: bool = Field(False, description = "Whether this is a LoRA adapter")
     is_vision: bool = Field(False, description = "Whether this is a vision-capable model")
     requires_trust_remote_code: bool = Field(
@@ -166,6 +206,38 @@ class LoadResponse(BaseModel):
             "top of the base model (Phase 6). Mutually exclusive with "
             "the standalone ``is_lora`` flag, which is used by the "
             "non-MLX adapter-only flow."
+        ),
+    )
+    is_mlx_vlm: bool = Field(
+        False,
+        description = (
+            "Whether the active model is a vision-language MLX model "
+            "loaded via ``mlx-vlm`` (Phase 9 / Chunk D). When True, the "
+            "route dispatches image-bearing chat completions to "
+            "``MlxVlmBackend.generate_chat_completion`` instead of "
+            "``MlxLmBackend``. Mutually exclusive with ``is_mlx`` (base "
+            "text) and ``is_mlx_audio``."
+        ),
+    )
+    is_mlx_audio: bool = Field(
+        False,
+        description = (
+            "Whether the active model is an audio MLX model loaded via "
+            "``mlx-audio`` (Phase 10 / Chunk D). When True, the route "
+            "dispatches TTS / ASR / S2S via ``MlxAudioBackend``. "
+            "Mutually exclusive with ``is_mlx`` and ``is_mlx_vlm``."
+        ),
+    )
+    backend_kind: Optional[BackendKind] = Field(
+        None,
+        description = (
+            "Single enum value identifying which backend owns the "
+            "active model. Additive companion to the existing "
+            "is_gguf / is_mlx / is_mlx_lora / is_mlx_vlm / is_mlx_audio "
+            "booleans (Phase 9+10 roadmap item). Prefer this over the "
+            "individual flags in new code; the booleans are preserved "
+            "for backward compatibility and will outlive several "
+            "releases."
         ),
     )
     is_audio: bool = Field(False, description = "Whether model is a TTS audio model")
@@ -273,6 +345,28 @@ class InferenceStatusResponse(BaseModel):
     is_mlx: bool = Field(
         False,
         description = "Whether the active model is an MLX model (Apple Silicon)",
+    )
+    is_mlx_vlm: bool = Field(
+        False,
+        description = (
+            "Whether the active model is an MLX vision-language model "
+            "loaded via mlx-vlm (Phase 9 / Chunk D)."
+        ),
+    )
+    is_mlx_audio: bool = Field(
+        False,
+        description = (
+            "Whether the active model is an MLX audio model loaded via "
+            "mlx-audio (Phase 10 / Chunk D)."
+        ),
+    )
+    backend_kind: Optional[BackendKind] = Field(
+        None,
+        description = (
+            "Single enum value identifying which backend owns the "
+            "active model (Phase 9+10 additive field). Prefer this over "
+            "the individual boolean flags."
+        ),
     )
     gguf_variant: Optional[str] = Field(
         None, description = "GGUF quantization variant (e.g. Q4_K_M)"
