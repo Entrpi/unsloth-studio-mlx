@@ -390,17 +390,48 @@ class TestRouteCompleteness:
             ), f"GGUF LoadResponse block #{i} missing native_context_length:\n{block[:200]}"
 
     def test_non_gguf_load_responses_omit_field(self):
-        """Non-GGUF LoadResponse blocks do not set native_context_length (defaults to None)."""
+        """Non-GGUF LoadResponse blocks that reference native_context_length must
+        source it from the MLX backend (not the GGUF backend).
+
+        Phase 1 (MLX parity) added ``native_context_length`` population to the
+        MLX ``LoadResponse`` branch too — sourced from ``mlx_backend.native_context_length``.
+        This test used to assert that MLX paths *omit* the field entirely; that
+        assertion is stale now. The structural invariant we still want to enforce
+        is that a non-GGUF block never reads the value from the GGUF backend
+        (``self.native_context_length`` / ``llama_backend.native_context_length``).
+        """
         blocks = self._find_construction_blocks("LoadResponse")
         non_gguf = [
             b for b in blocks if "is_gguf = True" not in b and "is_gguf=True" not in b
         ]
-        # Non-GGUF paths should not reference native_context_length
-        # (Pydantic defaults it to None, so not setting it is correct)
+        # Acceptable MLX sources for native_context_length in non-GGUF blocks:
+        # any MLX-family backend attribute (either .native_context_length, which
+        # the text/VLM MLX backends expose, or .context_length which the audio
+        # backend uses since it doesn't distinguish native vs capped context).
+        mlx_sources = (
+            "mlx_backend.native_context_length",
+            "mlx_vlm_backend.native_context_length",
+            "mlx_audio_backend.native_context_length",
+            "mlx_lora_backend.native_context_length",
+            "mlx_audio_backend.context_length",
+        )
         for block in non_gguf:
+            if "native_context_length" not in block:
+                # Still allowed — Pydantic defaults to None.
+                continue
+            # If the field IS present, it must be populated from an MLX-family
+            # backend, NOT from the GGUF backend (self / llama_backend).
+            assert any(src in block for src in mlx_sources), (
+                "Non-GGUF LoadResponse sets native_context_length but not from an "
+                f"MLX backend:\n{block[:400]}"
+            )
             assert (
-                "native_context_length" not in block
-            ), f"Non-GGUF LoadResponse should not set native_context_length:\n{block[:200]}"
+                "llama_backend.native_context_length" not in block
+                and "self.native_context_length" not in block
+            ), (
+                "Non-GGUF LoadResponse must not read native_context_length from "
+                f"the GGUF backend:\n{block[:400]}"
+            )
 
     def test_status_path(self):
         """InferenceStatusResponse construction with llama_backend has the field."""
