@@ -1,4 +1,4 @@
-# MLX-LM backend for Unsloth Studio (Phase 1)
+# MLX-LM backend for Unsloth Studio (Phase 1 + Chunk A)
 
 Adds an in-process `MlxLmBackend` as a peer to the existing `LlamaCppBackend`
 so that on Apple Silicon, users can load MLX checkpoints — specifically
@@ -129,10 +129,148 @@ beats the GGUF cancel-during-streaming latency.
 | `mlx_lm` minor-version API drift | Pinned `>=0.31.2,<0.32`; bump after smoke-testing 0.32. |
 | 16 GB RAM boxes swap when loading 8B | Logged warning planned — out of scope for Phase 1. |
 
-## Follow-ups (Phase 2+)
+## Follow-ups (Phase 3, 5–10)
 
+- Remote-HF MLX loading by teaching `from_identifier` to pull `config.json`
+  from HF Hub — Phase 3 of the parity roadmap.
+- Tool calling (XML parser extraction + in-process OpenAI passthrough) —
+  Phase 5.
+- LoRA adapter loading, speculative decoding, quantized KV, vision
+  (`mlx-vlm`), audio (`mlx-audio` + `mlx-whisper`).
 - Collapse `is_gguf` / `is_mlx` / Unsloth flags into a single `backend_kind`
   enum once a fourth backend lands.
-- Remote-HF MLX loading by teaching `from_identifier` to pull `config.json`
-  from HF Hub.
-- MLX vision via `mlx-vlm` when the UI shows a vision MLX model.
+
+---
+
+# Chunk A (Phases 2 + 4)
+
+Adds sampling fidelity and reasoning/`<think>` support on top of Phase 1.
+
+## Phase 2 — Sampling fidelity
+
+Brings MLX chat quality to parity with the GGUF backend for a given set of
+sampling settings.
+
+- `_build_mlx_sampler_and_processors` (module-private helper) centralizes
+  the `mlx_lm.sample_utils` surface: `make_sampler(temp, top_p, top_k, min_p)`
+  + `make_logits_processors(repetition_penalty, presence_penalty,
+  frequency_penalty, logit_bias, *context_size)`. Empty processor list is
+  the fast path — defaults never pay per-token overhead. Processor kwargs
+  are only forwarded when non-default (`repetition_penalty > 1.0`,
+  `presence/frequency != 0`, non-empty `logit_bias`).
+- `temperature <= 0` → greedy / argmax (upstream `make_sampler(temp=0)`).
+- Defensive fallback: if a kwarg is rejected by a different `mlx-lm` patch
+  release, drop it and retry. Mirrors Phase 1's pattern.
+- **Backend-side stop-string enforcement.** `mlx-lm` 0.31.2 has no native
+  `stop` kwarg (verified against upstream). After each token tick we
+  scan the tail of the cumulative decoded text — window size is
+  `max_stop_len + len(latest_delta)` so cross-boundary matches are caught
+  without rescanning the full buffer each tick. On match we truncate
+  cumulative, yield it once, and terminate with `finish_reason="stop"`
+  in the metadata event.
+- Route: `payload.stop` is normalized (str → [str], empty strings
+  filtered) and forwarded into the MLX generator.
+
+## Phase 4 — Reasoning / `<think>` support
+
+Detection at load time by inspecting `tokenizer.chat_template`:
+
+1. Template contains literal `enable_thinking` → `supports_reasoning=True`,
+   `reasoning_always_on=False`. Qwen3.5/3.6 `<9B` → `reasoning_default=False`,
+   else `True`. Ported from `llama_cpp.py:1519-1535`.
+2. Template contains both `<think>` and `</think>` (but not
+   `enable_thinking`) → `supports_reasoning=True`,
+   `reasoning_always_on=True`, `reasoning_default=True`. Template
+   hardcodes the tags, so the toggle has no effect and the UI hides it.
+3. Otherwise → no reasoning support.
+
+`generate_chat_completion` threads `enable_thinking` into
+`tokenizer.apply_chat_template` via `chat_template_kwargs={"enable_thinking":
+bool}` **only when** the backend advertises reasoning support AND the
+caller explicitly set the flag. Non-reasoning models never see the kwarg
+(protects templates that reject unknown keys). Literal `<think>...</think>`
+tags in the stream are passed through unmodified — the existing
+frontend parser handles them directly.
+
+Route / `LoadResponse` / `InferenceStatusResponse` now surface
+`supports_reasoning`, `reasoning_always_on`, and `chat_template` from
+`MlxLmBackend`. The frontend's existing reasoning-toggle UI in
+`shared-composer.tsx` and `use-chat-model-runtime.ts` is already
+backend-agnostic (keys off `supportsReasoning` in the runtime store), so
+the thinking panel lights up for MLX reasoning models automatically — no
+frontend code changes required.
+
+## Verified against Ternary-Bonsai-8B-mlx-2bit
+
+Probed the Bonsai 8B MLX 2-bit checkpoint at load time. Its chat template
+contains literal `<think>\n\n</think>\n\n` in the assistant prefix (a
+Qwen3-derived template that seeds empty thinking — effectively always-on
+reasoning), so Phase 4 detects it correctly: `supports_reasoning=True`,
+`reasoning_always_on=True`, `chat_template` length ≈ 4063 chars.
+
+## Files (Chunk A additions)
+
+| File | Change |
+|---|---|
+| `studio/backend/core/inference/mlx_lm.py` | +`_build_mlx_sampler_and_processors`, `_detect_reasoning`, stop-string loop, reasoning-state fields, `chat_template` / `supports_reasoning` / `reasoning_always_on` / `reasoning_default` properties, `enable_thinking` threading into `apply_chat_template` |
+| `studio/backend/routes/inference.py` | MLX `LoadResponse` / `InferenceStatusResponse` surface the new reasoning flags; MLX chat branch normalizes + forwards `payload.stop` |
+| `studio/backend/tests/test_mlx_backend_unit.py` | +18 unit tests (sampler helper, stop strings, reasoning detection, enable_thinking threading) |
+| `studio/backend/tests/test_mlx_backend_lifecycle.py` | +5 integration tests (stop string end-to-end, repetition penalty changes output, reasoning flags populated after load, enable_thinking changes prompt, <think> tags pass through) |
+| `PR_DESCRIPTION.md` | this section |
+
+Frontend: **no changes**. The existing reasoning/thinking UI in
+`shared-composer.tsx` already reads `supportsReasoning` / `reasoningAlwaysOn`
+from the chat runtime store, and `use-chat-model-runtime.ts` already
+populates those fields from any `LoadResponse` (GGUF or MLX).
+`chat-adapter.ts` already forwards `enable_thinking` when
+`supportsReasoning` is true.
+
+## Chunk A smoke-test checklist
+
+Build on the Phase 1 checklist above.
+
+11. Load Bonsai MLX. `GET /api/inference/status` returns
+    `supports_reasoning=true`, `reasoning_always_on=true`, and a
+    non-empty `chat_template` string.
+12. `POST /v1/chat/completions` with `{"stop": ["END"]}`:
+
+    ```bash
+    curl -sN http://127.0.0.1:8000/v1/chat/completions \
+      -H 'content-type: application/json' \
+      -d '{
+        "model": "Ternary-Bonsai-8B-mlx-2bit",
+        "messages": [{"role": "user", "content": "Reply exactly: ok END more"}],
+        "stream": true,
+        "stop": ["END"]
+      }'
+    ```
+
+    Assert the concatenated `delta.content` does NOT contain `END`.
+
+13. `POST /v1/chat/completions` with `{"repetition_penalty": 1.3,
+    "temperature": 0}` twice (once at 1.0, once at 1.3) — greedy, identical
+    prompt, outputs differ.
+
+14. `POST /v1/chat/completions` with `{"enable_thinking": true}` against
+    a reasoning model:
+
+    ```bash
+    curl -sN http://127.0.0.1:8000/v1/chat/completions \
+      -H 'content-type: application/json' \
+      -d '{
+        "model": "Ternary-Bonsai-8B-mlx-2bit",
+        "messages": [{"role": "user", "content": "What is 2+2?"}],
+        "enable_thinking": true,
+        "stream": true
+      }'
+    ```
+
+    Assert the server emits a 200 (the flag is forwarded) and the UI's
+    thinking toggle becomes visible/active after load.
+
+## Follow-ups (remaining phases)
+
+- Phase 3: remote HF-hub download + load_progress UI.
+- Phase 5: tool calling (XML parser extraction, in-process OpenAI/Anthropic
+  passthrough, agentic loop).
+- Phases 6–10 as per `/tmp/mlx-parity-roadmap.md`.
