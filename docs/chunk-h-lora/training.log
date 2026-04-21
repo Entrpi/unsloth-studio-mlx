@@ -1,0 +1,28 @@
+Loading pretrained model
+Loading datasets
+Training
+Trainable parameters: 0.072% (1.245M/1720.028M)
+Starting training..., iters: 200
+Calculating loss...:   0%|          | 0/5 [00:00<?, ?it/s]Calculating loss...:  20%|██        | 1/5 [00:00<00:01,  2.68it/s]Calculating loss...:  60%|██████    | 3/5 [00:00<00:00,  7.20it/s]Calculating loss...: 100%|██████████| 5/5 [00:00<00:00,  8.90it/s]
+Iter 1: Val loss 5.522, Val took 0.572s
+Iter 20: Train loss 3.687, Learning Rate 1.000e-04, It/sec 9.536, Tokens/sec 562.607, Trained Tokens 1180, Peak mem 0.833 GB
+Iter 40: Train loss 2.875, Learning Rate 1.000e-04, It/sec 9.262, Tokens/sec 614.056, Trained Tokens 2506, Peak mem 0.978 GB
+Calculating loss...:   0%|          | 0/5 [00:00<?, ?it/s]Calculating loss...:  60%|██████    | 3/5 [00:00<00:00, 23.70it/s]Calculating loss...: 100%|██████████| 5/5 [00:00<00:00, 24.61it/s]
+Iter 50: Val loss 2.663, Val took 0.206s
+Iter 60: Train loss 2.941, Learning Rate 1.000e-04, It/sec 9.856, Tokens/sec 649.481, Trained Tokens 3824, Peak mem 0.983 GB
+Iter 80: Train loss 2.800, Learning Rate 1.000e-04, It/sec 10.082, Tokens/sec 591.329, Trained Tokens 4997, Peak mem 0.983 GB
+Calculating loss...:   0%|          | 0/5 [00:00<?, ?it/s]Calculating loss...:  60%|██████    | 3/5 [00:00<00:00, 21.11it/s]Calculating loss...: 100%|██████████| 5/5 [00:00<00:00, 22.86it/s]
+Iter 100: Val loss 2.756, Val took 0.221s
+Iter 100: Train loss 2.778, Learning Rate 1.000e-04, It/sec 9.982, Tokens/sec 601.917, Trained Tokens 6203, Peak mem 0.983 GB
+Iter 100: Saved adapter weights to studio/backend/tests/fixtures/lora_adapter/adapters.safetensors and studio/backend/tests/fixtures/lora_adapter/0000100_adapters.safetensors.
+Iter 120: Train loss 2.663, Learning Rate 1.000e-04, It/sec 10.152, Tokens/sec 665.459, Trained Tokens 7514, Peak mem 0.983 GB
+Iter 140: Train loss 2.645, Learning Rate 1.000e-04, It/sec 10.049, Tokens/sec 621.056, Trained Tokens 8750, Peak mem 0.987 GB
+Calculating loss...:   0%|          | 0/5 [00:00<?, ?it/s]Calculating loss...:  60%|██████    | 3/5 [00:00<00:00, 23.96it/s]Calculating loss...: 100%|██████████| 5/5 [00:00<00:00, 22.71it/s]
+Iter 150: Val loss 2.727, Val took 0.223s
+Iter 160: Train loss 2.590, Learning Rate 1.000e-04, It/sec 10.993, Tokens/sec 655.179, Trained Tokens 9942, Peak mem 0.987 GB
+Iter 180: Train loss 2.950, Learning Rate 1.000e-04, It/sec 10.339, Tokens/sec 616.718, Trained Tokens 11135, Peak mem 0.987 GB
+Calculating loss...:   0%|          | 0/5 [00:00<?, ?it/s]Calculating loss...:  60%|██████    | 3/5 [00:00<00:00, 28.21it/s]Calculating loss...: 100%|██████████| 5/5 [00:00<00:00, 27.16it/s]
+Iter 200: Val loss 2.711, Val took 0.187s
+Iter 200: Train loss 2.795, Learning Rate 1.000e-04, It/sec 9.588, Tokens/sec 602.576, Trained Tokens 12392, Peak mem 0.987 GB
+Iter 200: Saved adapter weights to studio/backend/tests/fixtures/lora_adapter/adapters.safetensors and studio/backend/tests/fixtures/lora_adapter/0000200_adapters.safetensors.
+Saved final weights to studio/backend/tests/fixtures/lora_adapter/adapters.safetensors.
