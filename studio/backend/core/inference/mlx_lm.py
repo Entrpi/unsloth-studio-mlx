@@ -236,6 +236,10 @@ class MlxLmBackend:
         self._model_identifier: Optional[str] = None
         self._local_path: Optional[str] = None
         self._context_length: Optional[int] = None
+        # Phase 6 — LoRA adapter path threaded into ``mlx_lm.load`` via
+        # its native ``adapter_path`` kwarg. ``None`` means "base model
+        # only"; a non-None value means an adapter is layered on top.
+        self._adapter_path: Optional[str] = None
         # Phase 4 — reasoning / <think> state. Populated at load time by
         # ``_detect_reasoning``; reset by ``_unload_locked``.
         self._chat_template: Optional[str] = None
@@ -272,6 +276,16 @@ class MlxLmBackend:
     @property
     def is_vision(self) -> bool:
         return False
+
+    @property
+    def is_lora(self) -> bool:
+        """True iff the backend was loaded with an adapter path."""
+        return self._adapter_path is not None
+
+    @property
+    def adapter_path(self) -> Optional[str]:
+        """Absolute path of the loaded LoRA adapter directory, or None."""
+        return self._adapter_path
 
     @property
     def hf_variant(self) -> Optional[str]:
@@ -424,6 +438,7 @@ class MlxLmBackend:
         hf_token: Optional[str] = None,
         n_ctx: Optional[int] = None,
         cache_type_kv: Optional[str] = None,
+        adapter_path: Optional[str] = None,
     ) -> bool:
         """Load an MLX checkpoint.
 
@@ -445,6 +460,13 @@ class MlxLmBackend:
                 ``kv_group_size`` into ``stream_generate`` on each
                 generation tick; MLX applies the quantization when it
                 builds the prompt cache.
+            adapter_path: Phase 6 — absolute path to an MLX LoRA adapter
+                directory (containing ``adapters.safetensors`` +
+                ``adapter_config.json``). When provided, forwarded to
+                ``mlx_lm.load(..., adapter_path=...)`` which fuses the
+                adapter onto the base model at load time. The base must
+                match the adapter's target architecture; otherwise
+                mlx-lm raises and this function returns False.
 
         Returns:
             True on success. Returns False on a failed load (and logs
@@ -478,9 +500,23 @@ class MlxLmBackend:
                     f"mlx_lm is not installed in this Python env: {e}"
                 ) from e
 
+            # Phase 6 — when an adapter path is provided, pass it through
+            # to mlx_lm.load. Verified adapter_path kwarg exists on 0.31.2.
+            load_kwargs: Dict[str, Any] = {}
+            resolved_adapter: Optional[str] = None
+            if adapter_path:
+                adapter_dir = Path(adapter_path)
+                if not adapter_dir.is_dir():
+                    logger.error(
+                        f"MLX adapter path is not a directory: {adapter_path}"
+                    )
+                    return False
+                resolved_adapter = str(adapter_dir)
+                load_kwargs["adapter_path"] = resolved_adapter
+
             t0 = time.time()
             try:
-                model, tokenizer = _mlx_load(str(path))
+                model, tokenizer = _mlx_load(str(path), **load_kwargs)
             except Exception as e:
                 logger.error(f"mlx_lm.load failed for {local_path}: {e}")
                 return False
@@ -509,6 +545,8 @@ class MlxLmBackend:
             self._model_identifier = model_identifier
             self._local_path = str(path)
             self._context_length = effective_ctx
+            # Phase 6 — record the adapter path (None for base-only loads).
+            self._adapter_path = resolved_adapter
 
             # Phase 8: map the UI KV-dtype label to mlx-lm's
             # (kv_bits, kv_group_size) pair and stash for the generate
@@ -534,7 +572,8 @@ class MlxLmBackend:
                 f"context_length={effective_ctx} "
                 f"reasoning={self._supports_reasoning} "
                 f"always_on={self._reasoning_always_on} "
-                f"cache_type_kv={self.cache_type_kv}"
+                f"cache_type_kv={self.cache_type_kv} "
+                f"adapter={self._adapter_path or 'none'}"
             )
             return True
 
@@ -548,6 +587,8 @@ class MlxLmBackend:
         self._model_identifier = None
         self._local_path = None
         self._context_length = None
+        # Phase 6 — reset LoRA adapter state.
+        self._adapter_path = None
         # Phase 4: clear reasoning state. A subsequent load_model of a
         # different model must not inherit the previous model's flags.
         self._chat_template = None

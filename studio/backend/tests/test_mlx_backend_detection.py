@@ -16,6 +16,7 @@ import pytest
 
 from utils.models.model_config import (
     ModelConfig,
+    _detect_mlx_adapter,
     _detect_mlx_model,
     _read_mlx_max_position_embeddings,
 )
@@ -116,3 +117,54 @@ def test_read_max_position_embeddings_missing(tmp_path: Path) -> None:
 def test_read_max_position_embeddings_malformed(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text("{bad")
     assert _read_mlx_max_position_embeddings(tmp_path) is None
+
+
+# ── Phase 6 — MLX LoRA adapter detection ─────────────────────────────
+
+
+def test_detect_mlx_adapter_happy_path(tmp_path: Path) -> None:
+    """A dir with both adapters.safetensors + adapter_config.json is an
+    MLX LoRA adapter."""
+    (tmp_path / "adapters.safetensors").write_bytes(b"\x00\x00")
+    _write_json(tmp_path / "adapter_config.json", {"peft_type": "LORA"})
+    assert _detect_mlx_adapter(tmp_path) is True
+
+
+def test_detect_mlx_adapter_missing_weights(tmp_path: Path) -> None:
+    """Without the weights file the detector must return False."""
+    _write_json(tmp_path / "adapter_config.json", {"peft_type": "LORA"})
+    assert _detect_mlx_adapter(tmp_path) is False
+
+
+def test_detect_mlx_adapter_missing_config(tmp_path: Path) -> None:
+    """Without the adapter_config.json the detector must return False."""
+    (tmp_path / "adapters.safetensors").write_bytes(b"\x00\x00")
+    assert _detect_mlx_adapter(tmp_path) is False
+
+
+def test_detect_mlx_adapter_hf_peft_is_not_mlx(tmp_path: Path) -> None:
+    """HuggingFace PEFT adapters write adapter_model.safetensors (singular,
+    different stem) — not adapters.safetensors (plural). The MLX adapter
+    detector must NOT misclassify an HF PEFT adapter as MLX."""
+    (tmp_path / "adapter_model.safetensors").write_bytes(b"\x00\x00")
+    _write_json(tmp_path / "adapter_config.json", {"peft_type": "LORA"})
+    assert _detect_mlx_adapter(tmp_path) is False
+
+
+def test_detect_mlx_adapter_base_mlx_is_not_adapter(tmp_path: Path) -> None:
+    """A base MLX model dir has config.json + a quantization block but no
+    adapters.safetensors. It must not register as an adapter."""
+    _write_json(
+        tmp_path / "config.json",
+        {"quantization": {"bits": 2, "group_size": 128}},
+    )
+    (tmp_path / "model.safetensors").write_bytes(b"\x00\x00")
+    assert _detect_mlx_adapter(tmp_path) is False
+    # The base detector still fires:
+    assert _detect_mlx_model(tmp_path) is True
+
+
+def test_detect_mlx_adapter_not_a_directory(tmp_path: Path) -> None:
+    f = tmp_path / "notdir"
+    f.write_text("not a dir")
+    assert _detect_mlx_adapter(f) is False

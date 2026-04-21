@@ -948,6 +948,35 @@ def _detect_mlx_model(path: Path) -> bool:
     return "bits" in quant and "group_size" in quant
 
 
+def _detect_mlx_adapter(path: Path) -> bool:
+    """Return True iff *path* is a directory containing MLX LoRA adapter files.
+
+    MLX-LM writes LoRA adapters as two files alongside each other:
+
+    - ``adapters.safetensors`` — the trained LoRA weights.
+    - ``adapter_config.json`` — the adapter hyperparameters (rank, targets…).
+
+    The keying on ``adapters.safetensors`` (plural) specifically is what
+    distinguishes an MLX adapter from a HuggingFace PEFT adapter
+    (which writes ``adapter_model.safetensors`` — singular, different
+    stem). The base-model MLX detector keys on ``config.json`` +
+    ``quantization`` block, so the two detectors never collide on the
+    same directory.
+
+    Phase 6 uses this to wire ``mlx_lm.load(path, adapter_path=...)``
+    when the user points the loader at a base model dir + adapter dir.
+    """
+    try:
+        p = Path(path)
+        if not p.is_dir():
+            return False
+        return (p / "adapters.safetensors").is_file() and (
+            p / "adapter_config.json"
+        ).is_file()
+    except OSError:
+        return False
+
+
 def _read_mlx_max_position_embeddings(path: Path) -> Optional[int]:
     """Read ``max_position_embeddings`` from an MLX model's ``config.json``.
 
@@ -1908,6 +1937,14 @@ class ModelConfig:
     is_gguf: bool = False  # Is this a GGUF model?
     is_mlx: bool = False  # Is this an MLX (Apple Silicon) checkpoint?
     mlx_path: Optional[str] = None  # Absolute path to the MLX model dir
+    # Phase 6 — MLX LoRA support. When ``is_mlx_lora=True``, the loader
+    # should pass ``mlx_adapter_path`` as the ``adapter_path=`` kwarg to
+    # ``mlx_lm.load``. The base model itself is resolved via the normal
+    # ``mlx_path`` / ``identifier`` mechanism. Unlike HF PEFT adapters,
+    # MLX adapters are a separate-directory arrangement and are NOT
+    # stored inside the base model's directory.
+    is_mlx_lora: bool = False
+    mlx_adapter_path: Optional[str] = None
     native_context_length: Optional[int] = None  # From config.json (MLX)
     is_audio: bool = False  # Is this a TTS audio model?
     audio_type: Optional[str] = (

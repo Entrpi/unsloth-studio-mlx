@@ -777,6 +777,133 @@ def test_generate_omits_kv_bits_when_unquantized() -> None:
     assert "quantized_kv_start" not in captured_kwargs
 
 
+# ── Phase 6: LoRA adapter loading ───────────────────────────────────
+
+
+def test_is_lora_default_false() -> None:
+    """Fresh backend has no adapter, so is_lora must be False."""
+    b = _fresh_backend()
+    assert b.is_lora is False
+    assert b.adapter_path is None
+
+
+def test_is_lora_true_when_adapter_path_set() -> None:
+    """Directly poking the adapter path field must flip is_lora True."""
+    b = _fresh_backend()
+    b._adapter_path = "/some/path"
+    assert b.is_lora is True
+    assert b.adapter_path == "/some/path"
+
+
+def test_adapter_state_resets_on_unload() -> None:
+    b = _fresh_backend()
+    b._model = object()
+    b._tokenizer = object()
+    b._adapter_path = "/some/adapter"
+    b._unload_locked()
+    assert b._adapter_path is None
+    assert b.is_lora is False
+
+
+def test_load_model_rejects_missing_adapter_dir(tmp_path) -> None:
+    """Pointing ``adapter_path`` at a non-existent directory must
+    surface a clean False return rather than exploding in mlx_lm.load."""
+    import importlib.util
+    import platform as _platform
+
+    if not (
+        _platform.system() == "Darwin"
+        and _platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_lm") is not None
+    ):
+        pytest.skip("mlx_lm not available on this platform")
+
+    # Synthesize a plausible base MLX dir so the base-path check passes.
+    import json as _json
+
+    (tmp_path / "config.json").write_text(
+        _json.dumps({"quantization": {"bits": 2, "group_size": 128}})
+    )
+    b = _fresh_backend()
+    ok = b.load_model(
+        local_path = str(tmp_path),
+        model_identifier = "fake",
+        adapter_path = str(tmp_path / "not-there"),
+    )
+    assert ok is False
+    # State must not have been mutated.
+    assert b.is_loaded is False
+    assert b.is_lora is False
+
+
+def test_load_model_threads_adapter_path_into_mlx_load() -> None:
+    """With a mocked mlx_lm.load we verify:
+
+    - the kwarg ``adapter_path`` is forwarded verbatim,
+    - ``self._adapter_path`` is set post-load,
+    - ``is_lora`` returns True.
+
+    We skip the platform gate here because the only import we touch is
+    the private ``_mlx_load`` name inside ``load_model``, which we
+    monkey-patch before the function runs.
+    """
+    import importlib.util
+    import platform as _platform
+
+    if not (
+        _platform.system() == "Darwin"
+        and _platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_lm") is not None
+    ):
+        pytest.skip("mlx_lm not available on this platform")
+
+    import json as _json
+    import tempfile
+    from pathlib import Path as _Path
+
+    from unittest import mock
+
+    base = _Path(tempfile.mkdtemp(prefix = "mlx-base-"))
+    (base / "config.json").write_text(
+        _json.dumps(
+            {
+                "quantization": {"bits": 2, "group_size": 128},
+                "max_position_embeddings": 4096,
+            }
+        )
+    )
+    adapter = _Path(tempfile.mkdtemp(prefix = "mlx-adapter-"))
+    (adapter / "adapters.safetensors").write_bytes(b"\x00\x00")
+    (adapter / "adapter_config.json").write_text(_json.dumps({"peft_type": "LORA"}))
+
+    captured: Dict = {}
+
+    class _FakeTokenizer:
+        chat_template = None
+
+        def apply_chat_template(self, *a, **kw):
+            return "prompt"
+
+    def _fake_mlx_load(path, *args, **kwargs):
+        captured["path"] = path
+        captured["kwargs"] = kwargs
+        return object(), _FakeTokenizer()
+
+    b = _fresh_backend()
+    with mock.patch("mlx_lm.load", _fake_mlx_load):
+        ok = b.load_model(
+            local_path = str(base),
+            model_identifier = "fake",
+            adapter_path = str(adapter),
+        )
+    assert ok is True
+    assert captured["kwargs"].get("adapter_path") == str(adapter)
+    assert b.is_loaded
+    assert b.is_lora is True
+    assert b.adapter_path == str(adapter)
+    b.unload_model()
+
+
 def test_enable_thinking_omitted_when_none() -> None:
     """When the caller passes ``enable_thinking=None`` we must not
     inject chat_template_kwargs even if the model supports reasoning —
