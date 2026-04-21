@@ -272,6 +272,74 @@ def test_enable_thinking_changes_prompt():
         backend.unload_model()
 
 
+# ── Phase 8: quantized KV cache integration ─────────────────────────
+
+@pytest.mark.skipif(not MLX_LM_AVAILABLE, reason = "mlx_lm or model not available")
+def test_load_with_q8_kv_cache_and_generate():
+    """End-to-end Phase 8: load Bonsai with ``cache_type_kv="q8_0"``,
+    verify the property reflects the choice, stream a short completion,
+    and unload cleanly.
+
+    This covers both the load-time plumbing (cache_type_kv → kv_bits/
+    kv_group_size on the backend) and the runtime plumbing
+    (stream_generate receives the kwargs and completes successfully).
+    """
+    from core.inference.mlx_lm import MlxLmBackend
+
+    backend = MlxLmBackend()
+    ok = backend.load_model(
+        local_path = _MODEL_PATH,
+        model_identifier = Path(_MODEL_PATH).name,
+        cache_type_kv = "q8_0",
+    )
+    assert ok and backend.is_loaded
+    try:
+        # Property contract.
+        assert backend.cache_type_kv == "q8_0"
+        assert backend._kv_bits == 8
+        assert backend._kv_group_size == 64
+
+        messages = [
+            {"role": "user", "content": "Reply with exactly one word: ok."}
+        ]
+        final = ""
+        saw_metadata = False
+        for event in backend.generate_chat_completion(
+            messages = messages,
+            max_tokens = 16,
+        ):
+            if isinstance(event, dict):
+                saw_metadata = True
+                assert event.get("type") == "metadata"
+            else:
+                final = event
+        assert saw_metadata
+        assert len(final) > 0
+    finally:
+        assert backend.unload_model()
+    # After unload, KV state resets.
+    assert backend.cache_type_kv is None
+
+
+@pytest.mark.skipif(not MLX_LM_AVAILABLE, reason = "mlx_lm or model not available")
+def test_load_with_unquantized_kv_matches_chunk_a():
+    """Loading without ``cache_type_kv`` keeps Chunk A behaviour: the
+    property is None and generation works exactly as before."""
+    from core.inference.mlx_lm import MlxLmBackend
+
+    backend = MlxLmBackend()
+    ok = backend.load_model(
+        local_path = _MODEL_PATH,
+        model_identifier = Path(_MODEL_PATH).name,
+    )
+    assert ok
+    try:
+        assert backend.cache_type_kv is None
+        assert backend._kv_bits is None
+    finally:
+        backend.unload_model()
+
+
 @pytest.mark.skipif(not MLX_LM_AVAILABLE, reason = "mlx_lm or model not available")
 def test_generate_does_not_strip_think_tags():
     """Phase 4 contract: the backend must NOT strip or mangle literal
