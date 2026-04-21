@@ -982,6 +982,25 @@ async def get_load_progress(
     ``ready``.
     """
     try:
+        # Phase 3 — MLX uses the same endpoint. When the MLX backend has
+        # a load in flight (phase != None), prefer it over GGUF. This
+        # is safe because only one peer can be mid-load at a time: the
+        # route unloads the other peer before starting a new load.
+        mlx_backend = get_mlx_lm_backend()
+        mlx_progress = mlx_backend.load_progress()
+        if mlx_progress is not None:
+            # Strip MLX-only "warnings" key before handing to the
+            # GGUF-shaped response model — the GGUF schema has no
+            # warnings field and we don't want to break existing
+            # clients. The warnings are already surfaced in the
+            # backend logs and will ride on LoadResponse eventually.
+            filtered = {
+                k: v
+                for k, v in mlx_progress.items()
+                if k in ("phase", "bytes_loaded", "bytes_total", "fraction")
+            }
+            return LoadProgressResponse(**filtered)
+
         llama_backend = get_llama_cpp_backend()
         progress = llama_backend.load_progress()
         if progress is None:
