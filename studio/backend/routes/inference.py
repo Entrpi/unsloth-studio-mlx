@@ -692,6 +692,9 @@ async def load_model(
                 adapter_path = _mlx_adapter_path,
                 # Phase 7: forward the draft model path for speculative.
                 draft_model_path = request.draft_model_path,
+                # Chunk E (E3): forward optional override for number of draft
+                # tokens speculated per step (None → backend default of 3).
+                num_draft_tokens = request.num_draft_tokens,
             )
             if not success:
                 raise HTTPException(

@@ -781,6 +781,7 @@ class MlxLmBackend:
         cache_type_kv: Optional[str] = None,
         adapter_path: Optional[str] = None,
         draft_model_path: Optional[str] = None,
+        num_draft_tokens: Optional[int] = None,
     ) -> bool:
         """Load an MLX checkpoint.
 
@@ -844,6 +845,14 @@ class MlxLmBackend:
             self._download_bytes_total = 0
             self._weights_bytes_total = 0
             self._load_warnings = []
+
+            # Chunk E (E3) — advanced users can override the number of draft
+            # tokens speculated per step. ``None`` preserves the class default
+            # (3) set in ``__init__``. Bounds are enforced at the API layer
+            # (LoadRequest.num_draft_tokens), but we clamp defensively here
+            # too to avoid a silent misconfiguration.
+            if num_draft_tokens is not None:
+                self._num_draft_tokens = max(1, min(32, int(num_draft_tokens)))
 
             # Phase 3 — remote HF repo path. If the local dir doesn't
             # exist but the identifier looks like an HF repo id (has a

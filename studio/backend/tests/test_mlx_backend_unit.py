@@ -1112,6 +1112,162 @@ def test_generate_omits_draft_model_when_none() -> None:
     assert "num_draft_tokens" not in captured
 
 
+# ── Chunk E (E3): num_draft_tokens override via LoadRequest ─────────
+
+
+def test_num_draft_tokens_propagates() -> None:
+    """When ``load_model`` is called with ``num_draft_tokens=N``, the
+    backend's ``_num_draft_tokens`` must be set to N (overriding the
+    class default of 3). ``None`` preserves the default."""
+    import importlib.util
+    import platform as _platform
+
+    if not (
+        _platform.system() == "Darwin"
+        and _platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_lm") is not None
+    ):
+        pytest.skip("mlx_lm not available on this platform")
+
+    import json as _json
+    import tempfile
+    from pathlib import Path as _Path
+
+    from unittest import mock
+
+    base = _Path(tempfile.mkdtemp(prefix = "mlx-base-"))
+    (base / "config.json").write_text(
+        _json.dumps(
+            {
+                "quantization": {"bits": 2, "group_size": 128},
+                "max_position_embeddings": 4096,
+            }
+        )
+    )
+
+    class _FakeTokenizer:
+        chat_template = None
+
+        def apply_chat_template(self, *a, **kw):
+            return "prompt"
+
+    def _fake_mlx_load(path, *args, **kwargs):
+        return object(), _FakeTokenizer()
+
+    b = _fresh_backend()
+    # Class default must be 3 (preserved for backwards compatibility).
+    assert b._num_draft_tokens == 3
+
+    with mock.patch("mlx_lm.load", _fake_mlx_load):
+        ok = b.load_model(
+            local_path = str(base),
+            model_identifier = "fake",
+            num_draft_tokens = 5,
+        )
+    assert ok is True
+    assert b._num_draft_tokens == 5
+    b.unload_model()
+
+
+def test_num_draft_tokens_none_preserves_default() -> None:
+    """Passing ``num_draft_tokens=None`` (the API default) must leave
+    the backend's setting at 3 — not overwrite it with a stale value."""
+    import importlib.util
+    import platform as _platform
+
+    if not (
+        _platform.system() == "Darwin"
+        and _platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_lm") is not None
+    ):
+        pytest.skip("mlx_lm not available on this platform")
+
+    import json as _json
+    import tempfile
+    from pathlib import Path as _Path
+
+    from unittest import mock
+
+    base = _Path(tempfile.mkdtemp(prefix = "mlx-base-"))
+    (base / "config.json").write_text(
+        _json.dumps(
+            {
+                "quantization": {"bits": 2, "group_size": 128},
+                "max_position_embeddings": 4096,
+            }
+        )
+    )
+
+    class _FakeTokenizer:
+        chat_template = None
+
+        def apply_chat_template(self, *a, **kw):
+            return "prompt"
+
+    def _fake_mlx_load(path, *args, **kwargs):
+        return object(), _FakeTokenizer()
+
+    b = _fresh_backend()
+    with mock.patch("mlx_lm.load", _fake_mlx_load):
+        ok = b.load_model(
+            local_path = str(base),
+            model_identifier = "fake",
+            # No num_draft_tokens kwarg.
+        )
+    assert ok is True
+    assert b._num_draft_tokens == 3
+    b.unload_model()
+
+
+def test_num_draft_tokens_clamps_out_of_range() -> None:
+    """Backend defensively clamps out-of-range overrides to [1, 32]."""
+    import importlib.util
+    import platform as _platform
+
+    if not (
+        _platform.system() == "Darwin"
+        and _platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_lm") is not None
+    ):
+        pytest.skip("mlx_lm not available on this platform")
+
+    import json as _json
+    import tempfile
+    from pathlib import Path as _Path
+
+    from unittest import mock
+
+    base = _Path(tempfile.mkdtemp(prefix = "mlx-base-"))
+    (base / "config.json").write_text(
+        _json.dumps(
+            {
+                "quantization": {"bits": 2, "group_size": 128},
+                "max_position_embeddings": 4096,
+            }
+        )
+    )
+
+    class _FakeTokenizer:
+        chat_template = None
+
+        def apply_chat_template(self, *a, **kw):
+            return "prompt"
+
+    def _fake_mlx_load(path, *args, **kwargs):
+        return object(), _FakeTokenizer()
+
+    b = _fresh_backend()
+    with mock.patch("mlx_lm.load", _fake_mlx_load):
+        ok = b.load_model(
+            local_path = str(base),
+            model_identifier = "fake",
+            num_draft_tokens = 999,
+        )
+    assert ok is True
+    assert b._num_draft_tokens == 32  # clamped to upper bound
+    b.unload_model()
+
+
 # ── Phase 3: remote HF pulls, load_progress, hf_variant ─────────────
 
 

@@ -98,6 +98,17 @@ class LoadRequest(BaseModel):
             "backends."
         ),
     )
+    num_draft_tokens: Optional[int] = Field(
+        None,
+        ge = 1,
+        le = 32,
+        description = (
+            "Number of draft tokens to speculate per step during "
+            "speculative decoding. Only meaningful when "
+            "``draft_model_path`` is also set. ``None`` preserves the "
+            "backend default (3). Ignored for non-MLX backends."
+        ),
+    )
 
 
 class UnloadRequest(BaseModel):
