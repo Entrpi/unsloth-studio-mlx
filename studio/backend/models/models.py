@@ -73,26 +73,41 @@ class ModelDetails(BaseModel):
         False, description = "Whether model is an embedding/sentence-transformer model"
     )
     is_lora: bool = Field(False, description = "Whether model is a LoRA adapter")
+    # F2: these backend-identity booleans are deprecated in favour of
+    # ``backend_kind`` (on LoadResponse / InferenceStatusResponse) but
+    # still populated for backward compatibility on ModelDetails.
+    # ModelDetails itself doesn't currently carry a backend_kind field
+    # — the model registry returns shape metadata, not a "which backend
+    # is loaded" discriminator. Callers that need a collapsed kind can
+    # map (is_gguf, is_mlx, is_mlx_vlm, is_mlx_audio) through the same
+    # helper the routes use.
     is_gguf: bool = Field(
-        False, description = "Whether model is a GGUF model (llama.cpp format)"
+        False,
+        description = "DEPRECATED: prefer backend_kind-style discriminator. Whether model is a GGUF model (llama.cpp format)",
+        deprecated = True,
     )
     is_mlx: bool = Field(
         False,
-        description = "Whether model is an MLX model (Apple Silicon via mlx-lm)",
+        description = "DEPRECATED: prefer backend_kind-style discriminator. Whether model is an MLX model (Apple Silicon via mlx-lm)",
+        deprecated = True,
     )
     is_mlx_vlm: bool = Field(
         False,
         description = (
-            "Whether model is an MLX vision-language model loaded via "
-            "``mlx-vlm`` (Phase 9 / Chunk D)."
+            "DEPRECATED: prefer backend_kind-style discriminator. Whether "
+            "model is an MLX vision-language model loaded via ``mlx-vlm`` "
+            "(Phase 9 / Chunk D)."
         ),
+        deprecated = True,
     )
     is_mlx_audio: bool = Field(
         False,
         description = (
-            "Whether model is an MLX audio model loaded via ``mlx-audio`` "
-            "(Phase 10 / Chunk D)."
+            "DEPRECATED: prefer backend_kind-style discriminator. Whether "
+            "model is an MLX audio model loaded via ``mlx-audio`` (Phase 10 "
+            "/ Chunk D)."
         ),
+        deprecated = True,
     )
     is_audio: bool = Field(False, description = "Whether model is a TTS audio model")
     audio_type: Optional[str] = Field(

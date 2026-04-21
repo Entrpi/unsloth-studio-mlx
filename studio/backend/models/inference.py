@@ -40,6 +40,23 @@ BackendKind = Literal[
 ]
 
 
+# ── Chunk F (F2) — boolean deprecation plan ────────────────────────
+# The ``is_gguf`` / ``is_mlx`` / ``is_mlx_vlm`` / ``is_mlx_audio`` /
+# ``is_mlx_lora`` booleans on ``LoadResponse`` / ``InferenceStatusResponse``
+# / ``ModelDetails`` / ``ValidateModelResponse`` are now marked with
+# ``deprecated=True``. Pydantic v2 surfaces this as:
+#
+#   * a ``DeprecationWarning`` when the field is read off an instance, and
+#   * a ``"deprecated": true`` flag on the generated JSON schema / OpenAPI.
+#
+# Callers should migrate their reads to ``backend_kind`` (single enum)
+# and treat the booleans as legacy mirrors. The booleans remain
+# populated on every response — no external API consumer is broken by
+# this change. Removal is deferred to a future chunk once we have
+# telemetry on which third-party readers still hit the legacy fields.
+# See the Chunk F PR description for the migration plan.
+
+
 class LoadRequest(BaseModel):
     """Request to load a model for inference"""
 
@@ -148,24 +165,33 @@ class ValidateModelResponse(BaseModel):
     display_name: Optional[str] = Field(
         None, description = "Display name derived from identifier"
     )
-    is_gguf: bool = Field(False, description = "Whether this is a GGUF model (llama.cpp)")
+    # F2: these backend-identity booleans are deprecated in favour of
+    # ``backend_kind`` but still populated for backward compatibility.
+    is_gguf: bool = Field(
+        False,
+        description = "DEPRECATED: prefer backend_kind. Whether this is a GGUF model (llama.cpp)",
+        deprecated = True,
+    )
     is_mlx: bool = Field(
         False,
-        description = "Whether this is an MLX model (Apple Silicon via mlx-lm)",
+        description = "DEPRECATED: prefer backend_kind. Whether this is an MLX model (Apple Silicon via mlx-lm)",
+        deprecated = True,
     )
     is_mlx_vlm: bool = Field(
         False,
         description = (
-            "Whether this is an MLX vision-language model loaded via "
-            "``mlx-vlm`` (Phase 9 / Chunk D)."
+            "DEPRECATED: prefer backend_kind. Whether this is an MLX "
+            "vision-language model loaded via ``mlx-vlm`` (Phase 9 / Chunk D)."
         ),
+        deprecated = True,
     )
     is_mlx_audio: bool = Field(
         False,
         description = (
-            "Whether this is an MLX audio model loaded via ``mlx-audio`` "
-            "(Phase 10 / Chunk D)."
+            "DEPRECATED: prefer backend_kind. Whether this is an MLX audio "
+            "model loaded via ``mlx-audio`` (Phase 10 / Chunk D)."
         ),
+        deprecated = True,
     )
     is_lora: bool = Field(False, description = "Whether this is a LoRA adapter")
     is_vision: bool = Field(False, description = "Whether this is a vision-capable model")
@@ -203,52 +229,62 @@ class LoadResponse(BaseModel):
     display_name: str = Field(..., description = "Display name of the model")
     is_vision: bool = Field(False, description = "Whether model is a vision model")
     is_lora: bool = Field(False, description = "Whether model is a LoRA adapter")
+    # F2: these backend-identity booleans are deprecated in favour of
+    # ``backend_kind`` but still populated for backward compatibility.
     is_gguf: bool = Field(
-        False, description = "Whether model is a GGUF model (llama.cpp)"
+        False,
+        description = "DEPRECATED: prefer backend_kind. Whether model is a GGUF model (llama.cpp)",
+        deprecated = True,
     )
     is_mlx: bool = Field(
         False,
-        description = "Whether model is loaded via MLX (Apple Silicon)",
+        description = "DEPRECATED: prefer backend_kind. Whether model is loaded via MLX (Apple Silicon)",
+        deprecated = True,
     )
     is_mlx_lora: bool = Field(
         False,
         description = (
-            "Whether the active MLX load has a LoRA adapter layered on "
-            "top of the base model (Phase 6). Mutually exclusive with "
-            "the standalone ``is_lora`` flag, which is used by the "
-            "non-MLX adapter-only flow."
+            "DEPRECATED: prefer backend_kind == 'mlx+lora'. Whether the "
+            "active MLX load has a LoRA adapter layered on top of the "
+            "base model (Phase 6). Mutually exclusive with the standalone "
+            "``is_lora`` flag, which is used by the non-MLX adapter-only "
+            "flow."
         ),
+        deprecated = True,
     )
     is_mlx_vlm: bool = Field(
         False,
         description = (
-            "Whether the active model is a vision-language MLX model "
-            "loaded via ``mlx-vlm`` (Phase 9 / Chunk D). When True, the "
-            "route dispatches image-bearing chat completions to "
+            "DEPRECATED: prefer backend_kind == 'mlx+vlm'. Whether the "
+            "active model is a vision-language MLX model loaded via "
+            "``mlx-vlm`` (Phase 9 / Chunk D). When True, the route "
+            "dispatches image-bearing chat completions to "
             "``MlxVlmBackend.generate_chat_completion`` instead of "
             "``MlxLmBackend``. Mutually exclusive with ``is_mlx`` (base "
             "text) and ``is_mlx_audio``."
         ),
+        deprecated = True,
     )
     is_mlx_audio: bool = Field(
         False,
         description = (
-            "Whether the active model is an audio MLX model loaded via "
-            "``mlx-audio`` (Phase 10 / Chunk D). When True, the route "
-            "dispatches TTS / ASR / S2S via ``MlxAudioBackend``. "
-            "Mutually exclusive with ``is_mlx`` and ``is_mlx_vlm``."
+            "DEPRECATED: prefer backend_kind == 'mlx+audio'. Whether the "
+            "active model is an audio MLX model loaded via ``mlx-audio`` "
+            "(Phase 10 / Chunk D). When True, the route dispatches TTS / "
+            "ASR / S2S via ``MlxAudioBackend``. Mutually exclusive with "
+            "``is_mlx`` and ``is_mlx_vlm``."
         ),
+        deprecated = True,
     )
-    backend_kind: Optional[BackendKind] = Field(
+    backend_kind: BackendKind | None = Field(
         None,
         description = (
             "Single enum value identifying which backend owns the "
-            "active model. Additive companion to the existing "
+            "active model. Primary source of truth as of Chunk F — the "
             "is_gguf / is_mlx / is_mlx_lora / is_mlx_vlm / is_mlx_audio "
-            "booleans (Phase 9+10 roadmap item). Prefer this over the "
-            "individual flags in new code; the booleans are preserved "
-            "for backward compatibility and will outlive several "
-            "releases."
+            "booleans are deprecated mirrors. ``None`` is returned only "
+            "on cold-start when no backend is loaded; on any successful "
+            "load this field is populated deterministically."
         ),
     )
     is_audio: bool = Field(False, description = "Whether model is a TTS audio model")
@@ -360,33 +396,44 @@ class InferenceStatusResponse(BaseModel):
     is_vision: bool = Field(
         False, description = "Whether the active model is a vision model"
     )
+    # F2: these backend-identity booleans are deprecated in favour of
+    # ``backend_kind`` but still populated for backward compatibility.
     is_gguf: bool = Field(
-        False, description = "Whether the active model is a GGUF model (llama.cpp)"
+        False,
+        description = "DEPRECATED: prefer backend_kind. Whether the active model is a GGUF model (llama.cpp)",
+        deprecated = True,
     )
     is_mlx: bool = Field(
         False,
-        description = "Whether the active model is an MLX model (Apple Silicon)",
+        description = "DEPRECATED: prefer backend_kind. Whether the active model is an MLX model (Apple Silicon)",
+        deprecated = True,
     )
     is_mlx_vlm: bool = Field(
         False,
         description = (
-            "Whether the active model is an MLX vision-language model "
-            "loaded via mlx-vlm (Phase 9 / Chunk D)."
+            "DEPRECATED: prefer backend_kind == 'mlx+vlm'. Whether the "
+            "active model is an MLX vision-language model loaded via "
+            "mlx-vlm (Phase 9 / Chunk D)."
         ),
+        deprecated = True,
     )
     is_mlx_audio: bool = Field(
         False,
         description = (
-            "Whether the active model is an MLX audio model loaded via "
-            "mlx-audio (Phase 10 / Chunk D)."
+            "DEPRECATED: prefer backend_kind == 'mlx+audio'. Whether the "
+            "active model is an MLX audio model loaded via mlx-audio "
+            "(Phase 10 / Chunk D)."
         ),
+        deprecated = True,
     )
-    backend_kind: Optional[BackendKind] = Field(
+    backend_kind: BackendKind | None = Field(
         None,
         description = (
             "Single enum value identifying which backend owns the "
-            "active model (Phase 9+10 additive field). Prefer this over "
-            "the individual boolean flags."
+            "active model. Primary source of truth as of Chunk F — the "
+            "individual boolean flags above are deprecated mirrors. "
+            "``None`` is returned on cold-start when no backend is "
+            "loaded."
         ),
     )
     gguf_variant: Optional[str] = Field(
