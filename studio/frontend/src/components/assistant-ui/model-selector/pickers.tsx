@@ -490,7 +490,12 @@ export function HubModelPicker({
   const modelGgufIds = useMemo(() => {
     const ids = new Set<string>();
     for (const model of models) {
-      if (model.isGguf) ids.add(model.id.toLowerCase());
+      // Chunk G (G1): prefer ``backendKind``; fall back to the
+      // deprecated boolean for options populated before the enum
+      // propagated through the store.
+      if (model.backendKind === "gguf" || model.isGguf) {
+        ids.add(model.id.toLowerCase());
+      }
     }
     return ids;
   }, [models]);

@@ -667,9 +667,11 @@ export function ChatPage(): ReactElement {
         id: model.id,
         name: model.name,
         description: model.description,
-        // Chunk F (F2): prefer backendKind; fall back to the
-        // deprecated boolean to stay compatible with summaries produced
-        // before the enum was populated.
+        // Chunk G (G1): carry ``backendKind`` through from the summary
+        // so downstream pickers can read the enum directly. ``isGguf``
+        // is still populated (deprecated) for compat with any callers
+        // not yet migrated off the boolean.
+        backendKind: model.backendKind ?? null,
         isGguf: model.backendKind === "gguf" || model.isGguf,
       })),
     [modelsFromStore],
