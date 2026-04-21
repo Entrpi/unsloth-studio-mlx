@@ -232,7 +232,9 @@ async def load_model(
                 # Phase 4: surface reasoning introspection from the backend.
                 supports_reasoning = mlx_backend.supports_reasoning,
                 reasoning_always_on = mlx_backend.reasoning_always_on,
-                supports_tools = False,
+                # Phase 5: surface tool-calling support on the
+                # "already loaded" short-circuit too.
+                supports_tools = mlx_backend.supports_tools,
                 # Phase 8: surface the effective KV-cache dtype. On the
                 # "already loaded" short-circuit the backend state is
                 # authoritative — don't echo the request field.
@@ -516,7 +518,10 @@ async def load_model(
                 # Phase 4: surface reasoning introspection from the backend.
                 supports_reasoning = mlx_backend.supports_reasoning,
                 reasoning_always_on = mlx_backend.reasoning_always_on,
-                supports_tools = False,
+                # Phase 5: surface tool-calling support so the UI can
+                # gate the tools panel on an MLX-loaded model just like
+                # it already does for GGUF.
+                supports_tools = mlx_backend.supports_tools,
                 # Phase 8: surface the effective KV-cache dtype so the UI
                 # can reflect what the backend actually applied (e.g. a
                 # q5_1 request rounds down to q4_0).
@@ -886,7 +891,10 @@ async def get_status(
                 # Phase 4: surface reasoning introspection from the backend.
                 supports_reasoning = mlx_backend.supports_reasoning,
                 reasoning_always_on = mlx_backend.reasoning_always_on,
-                supports_tools = False,
+                # Phase 5: surface tool-calling support in /status so
+                # the frontend can enable the tools panel when an MLX
+                # tool-capable model is active.
+                supports_tools = mlx_backend.supports_tools,
                 context_length = mlx_backend.context_length,
                 max_context_length = mlx_backend.max_context_length,
                 native_context_length = mlx_backend.native_context_length,
@@ -2994,13 +3002,27 @@ async def anthropic_messages(
     non-streaming JSON).
     """
     llama_backend = get_llama_cpp_backend()
-    if not llama_backend.is_loaded:
+    mlx_backend = get_mlx_lm_backend()
+
+    # Prefer MLX when it's the active backend; fall back to GGUF;
+    # otherwise 503. Mirrors the /v1/chat/completions routing logic.
+    using_mlx = mlx_backend.is_loaded
+    using_gguf = llama_backend.is_loaded
+
+    if not using_mlx and not using_gguf:
         raise HTTPException(
             status_code = 503,
-            detail = "No GGUF model loaded. Load a GGUF model first.",
+            detail = "No model loaded. Load a GGUF or MLX model first.",
         )
 
-    model_name = getattr(llama_backend, "model_identifier", None) or payload.model
+    if using_mlx:
+        model_name = (
+            getattr(mlx_backend, "model_identifier", None) or payload.model
+        )
+    else:
+        model_name = (
+            getattr(llama_backend, "model_identifier", None) or payload.model
+        )
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
 
     # ── Translate Anthropic → OpenAI ──────────────────────────
@@ -3031,17 +3053,254 @@ async def anthropic_messages(
     cancel_event = threading.Event()
 
     # ── Tool routing ──────────────────────────────────────────
-    # Three paths:
+    # Three paths, evaluated per the active backend:
     # 1. enable_tools=true → server-side execution of built-in tools (Unsloth shorthand)
     # 2. tools=[...] only  → client-side pass-through (standard Anthropic behavior)
     # 3. neither           → plain chat
-    server_tools = payload.enable_tools and llama_backend.supports_tools
-    client_tools = (
+    active_backend = mlx_backend if using_mlx else llama_backend
+    server_tools = bool(payload.enable_tools and active_backend.supports_tools)
+    client_tools = bool(
         not server_tools
         and payload.tools
         and len(payload.tools) > 0
-        and llama_backend.supports_tools
+        and active_backend.supports_tools
     )
+
+    # ── MLX branch for tools ──────────────────────────────────
+    # MLX has no HTTP endpoint to proxy so we drive the same
+    # OpenAI-format pass-through helpers the /v1/chat/completions
+    # route uses and convert the emitted SSE to Anthropic's wire
+    # format via AnthropicPassthroughEmitter — exactly the
+    # translation llama-server's SSE goes through for GGUF clients.
+    if using_mlx and (server_tools or client_tools):
+        # Convert Anthropic tools to OpenAI format for the backend's
+        # apply_chat_template. Studio's built-in tools (web_search /
+        # python / terminal) use the OpenAI schema shape unchanged.
+        if server_tools:
+            from core.inference.tools import ALL_TOOLS as _ALL_TOOLS
+
+            if payload.enabled_tools is not None:
+                openai_tools = [
+                    t
+                    for t in _ALL_TOOLS
+                    if t["function"]["name"] in payload.enabled_tools
+                ]
+            else:
+                openai_tools = _ALL_TOOLS
+        else:
+            openai_tools = anthropic_tools_to_openai(payload.tools)
+
+        # Build an MLX message list that preserves prior tool history
+        # (assistant tool_calls, role=tool results) so the model sees
+        # the full conversation context.
+        mlx_conv_messages = list(openai_messages)
+
+        # Build a synthetic ChatCompletionRequest-compatible payload so
+        # we can reuse the OpenAI pass-through helper. Only the fields
+        # the helper reads need to be populated.
+        _ns = type("NS", (), {})()
+        _ns.tools = openai_tools
+        _ns.tool_choice = openai_tool_choice
+        _ns.temperature = temperature
+        _ns.top_p = top_p
+        _ns.top_k = top_k
+        _ns.min_p = min_p
+        _ns.max_tokens = payload.max_tokens
+        _ns.presence_penalty = presence_penalty
+        _ns.repetition_penalty = repetition_penalty
+        _ns.enable_thinking = None
+        _ns.stop = stop
+        _ns.enable_tools = bool(server_tools)
+        _ns.enabled_tools = payload.enabled_tools
+        _ns.auto_heal_tool_calls = True
+        _ns.max_tool_calls_per_message = 10
+        _ns.tool_call_timeout = 300
+        _ns.session_id = payload.session_id
+
+        # Generate OpenAI-format frames from MLX, translate to Anthropic
+        # as we go. For server_tools (agentic), the route just needs to
+        # bridge the agentic events into Anthropic SSE — reuse
+        # AnthropicStreamEmitter with the MLX generator.
+        if server_tools:
+
+            def _mlx_anthropic_run_gen():
+                return mlx_backend.generate_chat_completion_with_tools(
+                    messages = mlx_conv_messages,
+                    tools = openai_tools,
+                    tool_choice = openai_tool_choice,
+                    temperature = temperature,
+                    top_p = top_p,
+                    top_k = top_k,
+                    min_p = min_p,
+                    max_tokens = payload.max_tokens,
+                    repetition_penalty = repetition_penalty,
+                    presence_penalty = presence_penalty,
+                    stop = stop,
+                    cancel_event = cancel_event,
+                    enable_thinking = None,
+                    max_tool_iterations = 10,
+                    auto_heal_tool_calls = True,
+                    tool_call_timeout = 300,
+                    session_id = payload.session_id,
+                )
+
+            if payload.stream:
+                return await _anthropic_tool_stream(
+                    request,
+                    cancel_event,
+                    _mlx_anthropic_run_gen,
+                    message_id,
+                    model_name,
+                )
+            return await _anthropic_tool_non_streaming(
+                _mlx_anthropic_run_gen,
+                message_id,
+                model_name,
+            )
+
+        # client_tools path: drive the MLX passthrough helper and
+        # translate its OpenAI-SSE output through the Anthropic
+        # passthrough emitter. We capture the emitted data strings
+        # and feed each chunk dict into the emitter.
+        async def _mlx_to_anthropic_stream():
+            emitter = AnthropicPassthroughEmitter()
+            for line in emitter.start(message_id, model_name):
+                yield line
+
+            try:
+                async for raw in _mlx_openai_passthrough_stream(
+                    request = request,
+                    cancel_event = cancel_event,
+                    mlx_backend = mlx_backend,
+                    payload = _ns,
+                    messages = mlx_conv_messages,
+                    stop = stop,
+                    completion_id = message_id,
+                    created = int(time.time()),
+                    model_name = model_name,
+                ):
+                    # raw is an SSE "data: {...}\n\n" string.
+                    line_body = raw.strip()
+                    if not line_body.startswith("data: "):
+                        continue
+                    payload_body = line_body[6:]
+                    if payload_body == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(payload_body)
+                    except json.JSONDecodeError:
+                        continue
+                    for ev in emitter.feed_chunk(chunk):
+                        yield ev
+            except Exception as e:
+                logger.error(
+                    "anthropic_messages MLX passthrough stream error: %s", e,
+                    exc_info = True,
+                )
+
+            for ev in emitter.finish():
+                yield ev
+
+        if payload.stream:
+            return StreamingResponse(
+                _mlx_to_anthropic_stream(),
+                media_type = "text/event-stream",
+                headers = {
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        # Non-streaming MLX client-side tools: run the passthrough
+        # non-streaming helper, then convert the OpenAI JSON response
+        # into Anthropic Messages format via the same inline logic
+        # that _anthropic_passthrough_non_streaming uses for GGUF.
+        resp = await _mlx_openai_passthrough_non_streaming(
+            mlx_backend = mlx_backend,
+            payload = _ns,
+            messages = mlx_conv_messages,
+            stop = stop,
+            completion_id = message_id,
+            created = int(time.time()),
+            model_name = model_name,
+        )
+        data = json.loads(resp.body.decode())
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        finish_reason = choice.get("finish_reason")
+
+        content_blocks = []
+        text = message.get("content") or ""
+        if text:
+            text = _TOOL_XML_RE.sub("", text).strip()
+            if text:
+                content_blocks.append(AnthropicResponseTextBlock(text = text))
+
+        for tc in message.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                args = {}
+            content_blocks.append(
+                AnthropicResponseToolUseBlock(
+                    id = tc.get("id", ""),
+                    name = fn.get("name", ""),
+                    input = args,
+                )
+            )
+
+        if finish_reason == "tool_calls":
+            stop_reason = "tool_use"
+        elif finish_reason == "length":
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = "end_turn"
+
+        usage = data.get("usage") or {}
+        resp_obj = AnthropicMessagesResponse(
+            id = message_id,
+            model = model_name,
+            content = content_blocks,
+            stop_reason = stop_reason,
+            usage = AnthropicUsage(
+                input_tokens = usage.get("prompt_tokens", 0),
+                output_tokens = usage.get("completion_tokens", 0),
+            ),
+        )
+        return JSONResponse(content = resp_obj.model_dump())
+
+    # When MLX is loaded without tools, fall through to the plain path
+    # below, but the plain-path helpers assume llama_backend — so branch:
+    if using_mlx:
+
+        def _mlx_plain_run_gen():
+            return mlx_backend.generate_chat_completion(
+                messages = openai_messages,
+                temperature = temperature,
+                top_p = top_p,
+                top_k = top_k,
+                min_p = min_p,
+                max_tokens = payload.max_tokens,
+                repetition_penalty = repetition_penalty,
+                presence_penalty = presence_penalty,
+                stop = stop,
+                cancel_event = cancel_event,
+                enable_thinking = None,
+            )
+
+        if payload.stream:
+            return await _anthropic_plain_stream(
+                request,
+                cancel_event,
+                _mlx_plain_run_gen,
+                message_id,
+                model_name,
+            )
+        return await _anthropic_plain_non_streaming(
+            _mlx_plain_run_gen, message_id, model_name
+        )
 
     # ── Client-side pass-through path ─────────────────────────
     if client_tools:
