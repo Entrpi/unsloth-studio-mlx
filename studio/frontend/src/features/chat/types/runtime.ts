@@ -30,18 +30,24 @@ export const DEFAULT_INFERENCE_PARAMS: InferenceParams = {
   trustRemoteCode: false,
 };
 
+import type { BackendKind } from "./api";
+
 export interface ChatModelSummary {
   id: string;
   name: string;
   description?: string;
   isVision: boolean;
   isLora: boolean;
+  /** @deprecated Chunk F (F2) — prefer backendKind === "gguf". */
   isGguf?: boolean;
+  /** @deprecated Chunk F (F2) — prefer backendKind === "mlx". */
   isMlx?: boolean;
-  /** Chunk D (Phase 9): MLX vision-language model via mlx-vlm. */
+  /** @deprecated Chunk F (F2) — prefer backendKind === "mlx+vlm". */
   isMlxVlm?: boolean;
-  /** Chunk D (Phase 10): MLX audio model via mlx-audio. */
+  /** @deprecated Chunk F (F2) — prefer backendKind === "mlx+audio". */
   isMlxAudio?: boolean;
+  /** Chunk F (F2) — primary source of truth for the summary's backend. */
+  backendKind?: BackendKind | null;
   isAudio?: boolean;
   audioType?: string | null;
   hasAudioInput?: boolean;

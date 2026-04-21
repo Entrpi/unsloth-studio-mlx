@@ -3,9 +3,11 @@
 
 /**
  * Chunk D (Phase 9+10) — additive backend discriminator enum.
- * Prefer this over the individual is_gguf / is_mlx / is_mlx_vlm /
- * is_mlx_audio booleans in new UI code. The booleans are preserved on
- * every response for backwards compatibility.
+ * Chunk F (F2) — promoted to primary source of truth. Prefer this
+ * over the deprecated is_gguf / is_mlx / is_mlx_vlm / is_mlx_audio /
+ * is_mlx_lora booleans in all UI code. The booleans are still
+ * populated on every response for backwards compatibility with
+ * external API consumers; removal is a future chunk.
  */
 export type BackendKind =
   | "gguf"
@@ -20,11 +22,13 @@ export interface BackendModelDetails {
   name?: string | null;
   is_vision?: boolean;
   is_lora?: boolean;
+  /** @deprecated Chunk F (F2) — prefer backend_kind-style routing. */
   is_gguf?: boolean;
+  /** @deprecated Chunk F (F2) — prefer backend_kind-style routing. */
   is_mlx?: boolean;
-  /** Chunk D: MLX vision-language model via mlx-vlm (Phase 9). */
+  /** @deprecated Chunk F (F2) — prefer backend_kind-style routing. */
   is_mlx_vlm?: boolean;
-  /** Chunk D: MLX audio model via mlx-audio (Phase 10). */
+  /** @deprecated Chunk F (F2) — prefer backend_kind-style routing. */
   is_mlx_audio?: boolean;
   is_audio?: boolean;
   audio_type?: string | null;
@@ -72,11 +76,13 @@ export interface ValidateModelResponse {
   message: string;
   identifier?: string | null;
   display_name?: string | null;
+  /** @deprecated Chunk F (F2) — prefer backend_kind-style routing. */
   is_gguf?: boolean;
+  /** @deprecated Chunk F (F2) — prefer backend_kind-style routing. */
   is_mlx?: boolean;
-  /** Chunk D: MLX vision-language model (mlx-vlm). */
+  /** @deprecated Chunk F (F2) — prefer backend_kind-style routing. */
   is_mlx_vlm?: boolean;
-  /** Chunk D: MLX audio model (mlx-audio). */
+  /** @deprecated Chunk F (F2) — prefer backend_kind-style routing. */
   is_mlx_audio?: boolean;
   is_lora?: boolean;
   is_vision?: boolean;
@@ -103,15 +109,20 @@ export interface LoadModelResponse {
   display_name: string;
   is_vision: boolean;
   is_lora: boolean;
+  /** @deprecated Chunk F (F2) — prefer backend_kind === "gguf". */
   is_gguf?: boolean;
+  /** @deprecated Chunk F (F2) — prefer backend_kind === "mlx". */
   is_mlx?: boolean;
-  /** Phase 6 — the active MLX load has a LoRA adapter fused on top of the base model. */
+  /**
+   * @deprecated Chunk F (F2) — prefer backend_kind === "mlx+lora".
+   * Phase 6 — the active MLX load has a LoRA adapter fused on top of the base model.
+   */
   is_mlx_lora?: boolean;
-  /** Chunk D (Phase 9) — MLX vision-language model via mlx-vlm. */
+  /** @deprecated Chunk F (F2) — prefer backend_kind === "mlx+vlm". */
   is_mlx_vlm?: boolean;
-  /** Chunk D (Phase 10) — MLX audio model via mlx-audio. */
+  /** @deprecated Chunk F (F2) — prefer backend_kind === "mlx+audio". */
   is_mlx_audio?: boolean;
-  /** Chunk D — collapsed backend enum. Additive companion to the booleans above. */
+  /** Chunk F (F2) — primary source of truth for which backend owns the active model. */
   backend_kind?: BackendKind | null;
   is_audio?: boolean;
   audio_type?: string | null;
@@ -143,13 +154,15 @@ export interface UnloadModelRequest {
 export interface InferenceStatusResponse {
   active_model: string | null;
   is_vision: boolean;
+  /** @deprecated Chunk F (F2) — prefer backend_kind === "gguf". */
   is_gguf?: boolean;
+  /** @deprecated Chunk F (F2) — prefer backend_kind === "mlx". */
   is_mlx?: boolean;
-  /** Chunk D (Phase 9) — active model is loaded via mlx-vlm. */
+  /** @deprecated Chunk F (F2) — prefer backend_kind === "mlx+vlm". */
   is_mlx_vlm?: boolean;
-  /** Chunk D (Phase 10) — active model is loaded via mlx-audio. */
+  /** @deprecated Chunk F (F2) — prefer backend_kind === "mlx+audio". */
   is_mlx_audio?: boolean;
-  /** Chunk D — collapsed backend enum. */
+  /** Chunk F (F2) — primary source of truth for which backend owns the active model. */
   backend_kind?: BackendKind | null;
   gguf_variant?: string | null;
   is_audio?: boolean;

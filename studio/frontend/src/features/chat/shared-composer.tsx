@@ -384,9 +384,12 @@ export function SharedComposer({
           chat_template_override: chatTemplateOverride,
         });
         const store = useChatRuntimeStore.getState();
+        // Chunk F (F2): prefer backend_kind; fall back to the boolean.
+        const _respIsGguf =
+          resp.backend_kind === "gguf" || Boolean(resp.is_gguf);
         store.setCheckpoint(
           resp.model,
-          resp.is_gguf ? (sel.ggufVariant ?? undefined) : null,
+          _respIsGguf ? (sel.ggufVariant ?? undefined) : null,
         );
         store.setModelRequiresTrustRemoteCode(
           resp.requires_trust_remote_code ?? false,

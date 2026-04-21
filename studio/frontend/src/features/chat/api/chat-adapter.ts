@@ -365,12 +365,15 @@ async function autoLoadSmallestModel(): Promise<{
             );
             store.setParams({ ...store.params, maxTokens: loadResp.context_length ?? 131072 });
             // Add model to store so the selector shows the name
+            // Chunk F (F2): populate backendKind; keep isGguf as the
+            // deprecated mirror until external consumers migrate.
             const autoModel: ChatModelSummary = {
               id: repo.repo_id,
               name: loadResp.display_name ?? repo.repo_id,
               isVision: loadResp.is_vision ?? false,
               isLora: loadResp.is_lora ?? false,
               isGguf: loadResp.is_gguf ?? false,
+              backendKind: loadResp.backend_kind ?? "gguf",
               isAudio: loadResp.is_audio ?? false,
               audioType: loadResp.audio_type ?? null,
               hasAudioInput: loadResp.has_audio_input ?? false,
@@ -439,6 +442,8 @@ async function autoLoadSmallestModel(): Promise<{
             isVision: sfLoadResp.is_vision ?? false,
             isLora: sfLoadResp.is_lora ?? false,
             isGguf: sfLoadResp.is_gguf ?? false,
+            // Chunk F (F2): prefer the enum from the response.
+            backendKind: sfLoadResp.backend_kind ?? null,
           };
           if (!store.models.some((m) => m.id === repo.repo_id)) {
             store.setModels([...store.models, sfModel]);
@@ -491,6 +496,9 @@ async function autoLoadSmallestModel(): Promise<{
         isVision: loadResp.is_vision ?? false,
         isLora: false,
         isGguf: true,
+        // Chunk F (F2): this path is gated on a GGUF download so the
+        // kind is known-good at construction time.
+        backendKind: "gguf",
       };
       if (!store.models.some((m) => m.id === "unsloth/gemma-4-E2B-it-GGUF")) {
         store.setModels([...store.models, defaultModel]);

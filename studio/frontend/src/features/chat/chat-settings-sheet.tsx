@@ -491,14 +491,25 @@ export function ChatSettingsPanel({
   onReloadModel,
 }: ChatSettingsPanelProps) {
   const isMobile = useIsMobile();
-  const isGguf = useChatRuntimeStore((s) => s.activeGgufVariant) != null;
+  // Chunk F (F2): route off activeBackendKind with a fallback to the
+  // legacy signals (activeGgufVariant / activeIsMlx). The GGUF path
+  // still checks activeGgufVariant because it's set by the variant
+  // picker even when backend_kind hasn't arrived yet.
+  const activeBackendKind = useChatRuntimeStore((s) => s.activeBackendKind);
+  const activeGgufVariant = useChatRuntimeStore((s) => s.activeGgufVariant);
+  const activeIsMlx = useChatRuntimeStore((s) => s.activeIsMlx);
+  const isGguf =
+    activeBackendKind === "gguf" || activeGgufVariant != null;
   // Phase 3/7/8: MLX backends get the same model-settings controls as
   // GGUF (KV cache dtype, speculative decoding, context-length slider).
   // ``isGgufOrMlx`` is the parallel gate — the visual shape matches
   // ``isGguf`` exactly and we reuse the ``gguf*`` runtime-store fields
   // (populated from config.json for MLX and from GGUF metadata
   // otherwise; see use-chat-model-runtime.ts).
-  const isMlx = useChatRuntimeStore((s) => s.activeIsMlx);
+  const isMlx =
+    activeBackendKind === "mlx" ||
+    activeBackendKind === "mlx+lora" ||
+    activeIsMlx;
   const isGgufOrMlx = isGguf || isMlx;
   const speculativeType = useChatRuntimeStore((s) => s.speculativeType);
   const setSpeculativeType = useChatRuntimeStore((s) => s.setSpeculativeType);

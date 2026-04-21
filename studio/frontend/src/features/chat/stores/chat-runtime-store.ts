@@ -156,16 +156,21 @@ type ChatRuntimeStore = {
   // slider) also want to show for MLX. Track whether the active backend
   // is the MLX peer so the settings sheet can gate on ``isGguf ||
   // isMlx``. Set on LoadResponse / status restore and cleared on unload.
+  // @deprecated Chunk F (F2) — prefer activeBackendKind === "mlx"
+  //    || activeBackendKind === "mlx+lora". Kept populated for the
+  //    current release so existing read sites keep working.
   activeIsMlx: boolean;
   // Chunk D (Phase 9): active backend is an MLX vision-language model
   // loaded via mlx-vlm. Drives image-composer visibility + the VLM
   // backend tag in chat settings.
+  // @deprecated Chunk F (F2) — prefer activeBackendKind === "mlx+vlm".
   activeIsMlxVlm: boolean;
   // Chunk D (Phase 10): active backend is an MLX audio model loaded
   // via mlx-audio. Drives TTS / ASR composer entries.
+  // @deprecated Chunk F (F2) — prefer activeBackendKind === "mlx+audio".
   activeIsMlxAudio: boolean;
-  // Chunk D — collapsed backend kind enum. Optional companion to the
-  // booleans above; older restore paths may leave it null.
+  // Chunk F (F2): promoted to primary source of truth. The three
+  // booleans above are deprecated mirrors populated off this enum.
   activeBackendKind:
     | "gguf"
     | "mlx"

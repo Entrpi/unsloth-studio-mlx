@@ -667,7 +667,10 @@ export function ChatPage(): ReactElement {
         id: model.id,
         name: model.name,
         description: model.description,
-        isGguf: model.isGguf,
+        // Chunk F (F2): prefer backendKind; fall back to the
+        // deprecated boolean to stay compatible with summaries produced
+        // before the enum was populated.
+        isGguf: model.backendKind === "gguf" || model.isGguf,
       })),
     [modelsFromStore],
   );

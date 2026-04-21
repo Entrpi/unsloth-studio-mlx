@@ -17,12 +17,52 @@ import {
 } from "../api/chat-api";
 import { formatEta, formatRate } from "../utils/format-transfer";
 import { useChatRuntimeStore } from "../stores/chat-runtime-store";
-import type { InferenceStatusResponse, LoadModelResponse } from "../types/api";
+import type {
+  BackendKind,
+  InferenceStatusResponse,
+  LoadModelResponse,
+} from "../types/api";
 import type {
   ChatLoraSummary,
   ChatModelSummary,
   InferenceParams,
 } from "../types/runtime";
+
+// Chunk F (F2): derive a BackendKind from the boolean flags for
+// responses that don't carry a backend_kind field (e.g. ModelDetails,
+// BackendModelDetails on /models). The function prefers an explicit
+// backend_kind when available and falls back to the booleans so it
+// stays compatible with older backends during the migration window.
+function resolveBackendKind(source: {
+  backend_kind?: BackendKind | null;
+  is_gguf?: boolean;
+  is_mlx?: boolean;
+  is_mlx_lora?: boolean;
+  is_mlx_vlm?: boolean;
+  is_mlx_audio?: boolean;
+}): BackendKind | null {
+  if (source.backend_kind) return source.backend_kind;
+  if (source.is_mlx_lora) return "mlx+lora";
+  if (source.is_mlx_vlm) return "mlx+vlm";
+  if (source.is_mlx_audio) return "mlx+audio";
+  if (source.is_mlx) return "mlx";
+  if (source.is_gguf) return "gguf";
+  return null;
+}
+
+// Chunk F (F2): a cheap gate that asks "is this a backend that
+// populates native context_length + owns its own KV cache?". All four
+// MLX variants + GGUF share this shape; pure unsloth/transformers
+// loads do not.
+function kindHasNativeContextLength(kind: BackendKind | null): boolean {
+  return (
+    kind === "gguf" ||
+    kind === "mlx" ||
+    kind === "mlx+lora" ||
+    kind === "mlx+vlm" ||
+    kind === "mlx+audio"
+  );
+}
 
 type SelectedModelInput = {
   id: string;
@@ -66,27 +106,38 @@ function describeModel(model: {
   is_mlx_audio?: boolean;
   is_audio?: boolean;
   has_audio_input?: boolean;
+  backend_kind?: BackendKind | null;
 }): string | undefined {
+  // Chunk F (F2): drive the tag list off ``backend_kind`` first;
+  // fall back to the deprecated booleans when the field is missing
+  // (pre-Chunk-D servers, ModelDetails-shape payloads, etc).
+  const kind = resolveBackendKind(model);
   const tags: string[] = [];
-  if (model.is_gguf) tags.push("GGUF");
-  if (model.is_mlx_vlm) {
-    tags.push("MLX-VLM");
-  } else if (model.is_mlx_audio) {
-    tags.push("MLX-Audio");
-  } else if (model.is_mlx) {
-    tags.push("MLX");
+  switch (kind) {
+    case "gguf":
+      tags.push("GGUF");
+      break;
+    case "mlx+vlm":
+      tags.push("MLX-VLM");
+      break;
+    case "mlx+audio":
+      tags.push("MLX-Audio");
+      break;
+    case "mlx":
+    case "mlx+lora":
+      tags.push("MLX");
+      break;
+    default:
+      break;
   }
   if (model.is_lora) tags.push("LoRA");
-  if (model.is_vision && !model.is_mlx_vlm) tags.push("Vision");
-  if (model.is_audio && !model.is_mlx_audio) tags.push("Audio");
+  if (model.is_vision && kind !== "mlx+vlm") tags.push("Vision");
+  if (model.is_audio && kind !== "mlx+audio") tags.push("Audio");
   if (model.has_audio_input) tags.push("Audio Input");
   if (
     !model.is_lora &&
     !model.is_vision &&
-    !model.is_gguf &&
-    !model.is_mlx &&
-    !model.is_mlx_vlm &&
-    !model.is_mlx_audio &&
+    kind === null &&
     !model.is_audio &&
     !model.has_audio_input
   )
@@ -106,24 +157,30 @@ function toChatModelSummary(model: {
   is_audio?: boolean;
   audio_type?: string | null;
   has_audio_input?: boolean;
+  backend_kind?: BackendKind | null;
 }): ChatModelSummary {
+  const kind = resolveBackendKind(model);
   return {
     id: model.id,
     name: model.name || model.id,
     description: describeModel(model),
     isLora: Boolean(model.is_lora),
     // A VLM model counts as "vision" for all UI gating: image composer,
-    // vision badge, etc. The is_mlx_vlm flag still rides so we can
-    // disambiguate from a GGUF vision model when needed.
-    isVision: Boolean(model.is_vision) || Boolean(model.is_mlx_vlm),
+    // vision badge, etc. The ``backend_kind === "mlx+vlm"`` check is
+    // the new primary signal; the boolean is kept for fallback.
+    isVision: Boolean(model.is_vision) || kind === "mlx+vlm",
+    // Chunk F (F2): keep the deprecated booleans in the summary for
+    // backwards compatibility with existing consumers; add backendKind
+    // as the new preferred field. New UI code should read backendKind.
     isGguf: Boolean(model.is_gguf),
     isMlx: Boolean(model.is_mlx),
     isMlxVlm: Boolean(model.is_mlx_vlm),
     isMlxAudio: Boolean(model.is_mlx_audio),
-    // Same treatment for audio: an MLX-Audio model is still "audio" for
-    // gating the TTS composer even though the dedicated backend is
-    // mlx-audio rather than the GGUF audio path.
-    isAudio: Boolean(model.is_audio) || Boolean(model.is_mlx_audio),
+    backendKind: kind,
+    // Same treatment for audio: an MLX-Audio model is still "audio"
+    // for gating the TTS composer even though the dedicated backend
+    // is mlx-audio rather than the GGUF audio path.
+    isAudio: Boolean(model.is_audio) || kind === "mlx+audio",
     audioType: model.audio_type ?? null,
     hasAudioInput: Boolean(model.has_audio_input),
   };
@@ -168,14 +225,12 @@ function mergeRecommendedInference(
 ): InferenceParams {
   const inference = response.inference;
   // GGUF / MLX: use actual context length from model metadata, fallback to 131072
-  // Other: 4096
-  const defaultMaxTokens =
-    response.is_gguf ||
-    response.is_mlx ||
-    response.is_mlx_vlm ||
-    response.is_mlx_audio
-      ? (response.context_length ?? 131072)
-      : 4096;
+  // Other: 4096. Chunk F (F2): route via backend_kind first; fall back
+  // to the deprecated booleans for older response payloads.
+  const kind = resolveBackendKind(response);
+  const defaultMaxTokens = kindHasNativeContextLength(kind)
+    ? (response.context_length ?? 131072)
+    : 4096;
   return {
     ...current,
     checkpoint: modelId,
@@ -308,14 +363,11 @@ export function useChatModelRuntime() {
         const supportsReasoning = statusRes.supports_reasoning ?? false;
         const reasoningAlwaysOn = statusRes.reasoning_always_on ?? false;
         const supportsTools = statusRes.supports_tools ?? false;
-        // GGUF, MLX, MLX-VLM, and MLX-Audio all populate context_length
-        // from model metadata; treat them identically for derivation of
-        // slider caps.
-        const _hasNativeCtx =
-          statusRes.is_gguf ||
-          statusRes.is_mlx ||
-          Boolean(statusRes.is_mlx_vlm) ||
-          Boolean(statusRes.is_mlx_audio);
+        // Chunk F (F2): route off backend_kind with a boolean fallback.
+        // GGUF / any MLX variant populates context_length from model
+        // metadata; treat them identically for derivation of slider caps.
+        const _statusKind = resolveBackendKind(statusRes);
+        const _hasNativeCtx = kindHasNativeContextLength(_statusKind);
         const currentGgufContextLength = _hasNativeCtx
           ? (statusRes.context_length ?? null)
           : null;
@@ -332,11 +384,13 @@ export function useChatModelRuntime() {
           supportsTools,
           // Phase 3/7/8: track MLX-active so the settings sheet can
           // gate KV / speculative / context UI on ``isGguf || isMlx``.
-          activeIsMlx: Boolean(statusRes.is_mlx),
-          // Chunk D — track the MLX-VLM + MLX-Audio peers too.
-          activeIsMlxVlm: Boolean(statusRes.is_mlx_vlm),
-          activeIsMlxAudio: Boolean(statusRes.is_mlx_audio),
-          activeBackendKind: statusRes.backend_kind ?? null,
+          // Chunk F (F2): prefer the enum; keep boolean mirrors in the
+          // store for existing consumers until we flip those too.
+          activeIsMlx:
+            _statusKind === "mlx" || _statusKind === "mlx+lora",
+          activeIsMlxVlm: _statusKind === "mlx+vlm",
+          activeIsMlxAudio: _statusKind === "mlx+audio",
+          activeBackendKind: _statusKind,
           ggufContextLength: currentGgufContextLength,
           ggufMaxContextLength,
           ggufNativeContextLength,
@@ -537,11 +591,9 @@ export function useChatModelRuntime() {
             }
             const loadedKv = loadResponse.cache_type_kv ?? null;
             const loadedSpec = loadResponse.speculative_type ?? null;
-            const _hasNativeCtx =
-              loadResponse.is_gguf ||
-              loadResponse.is_mlx ||
-              Boolean(loadResponse.is_mlx_vlm) ||
-              Boolean(loadResponse.is_mlx_audio);
+            // Chunk F (F2): route off backend_kind with a boolean fallback.
+            const _loadKind = resolveBackendKind(loadResponse);
+            const _hasNativeCtx = kindHasNativeContextLength(_loadKind);
             const nativeCtx = _hasNativeCtx
               ? (loadResponse.context_length ?? 131072)
               : null;
@@ -558,11 +610,12 @@ export function useChatModelRuntime() {
             const ggufMaxContextLength = reportedMaxCtx;
             useChatRuntimeStore.setState({
               // Phase 3/7/8: MLX load also gates settings-sheet controls.
-              activeIsMlx: Boolean(loadResponse.is_mlx),
-              // Chunk D — MLX-VLM / MLX-Audio peer flags.
-              activeIsMlxVlm: Boolean(loadResponse.is_mlx_vlm),
-              activeIsMlxAudio: Boolean(loadResponse.is_mlx_audio),
-              activeBackendKind: loadResponse.backend_kind ?? null,
+              // Chunk F (F2): derive from the resolved backend_kind.
+              activeIsMlx:
+                _loadKind === "mlx" || _loadKind === "mlx+lora",
+              activeIsMlxVlm: _loadKind === "mlx+vlm",
+              activeIsMlxAudio: _loadKind === "mlx+audio",
+              activeBackendKind: _loadKind,
               ggufContextLength: nativeCtx,
               ggufMaxContextLength,
               ggufNativeContextLength: reportedNativeCtx,
