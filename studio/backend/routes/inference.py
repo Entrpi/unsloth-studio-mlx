@@ -219,6 +219,8 @@ async def load_model(
                 is_lora = False,
                 is_gguf = False,
                 is_mlx = True,
+                # Phase 6: surface lora-active state on the already-loaded branch.
+                is_mlx_lora = mlx_backend.is_lora,
                 is_audio = False,
                 inference = inference_config,
                 requires_trust_remote_code = False,
@@ -459,6 +461,10 @@ async def load_model(
                 logger.info("Unloading GGUF model before loading MLX model")
                 await asyncio.to_thread(llama_backend.unload_model)
 
+            # Phase 6 — an explicit request.adapter_path wins over the
+            # ModelConfig-derived one (e.g. when the user points at a
+            # base model and supplies the adapter separately).
+            _mlx_adapter_path = request.adapter_path or config.mlx_adapter_path
             success = await asyncio.to_thread(
                 mlx_backend.load_model,
                 local_path = config.mlx_path or config.path,
@@ -468,6 +474,8 @@ async def load_model(
                 # Phase 8: forward the UI's KV-dtype label. ``None`` or
                 # ``"f16"`` / ``"bf16"`` → unquantized (unchanged behaviour).
                 cache_type_kv = request.cache_type_kv,
+                # Phase 6: forward the LoRA adapter path when provided.
+                adapter_path = _mlx_adapter_path,
             )
             if not success:
                 raise HTTPException(
@@ -487,6 +495,8 @@ async def load_model(
                 is_lora = False,
                 is_gguf = False,
                 is_mlx = True,
+                # Phase 6: True when an adapter was layered in.
+                is_mlx_lora = mlx_backend.is_lora,
                 is_audio = False,
                 audio_type = None,
                 has_audio_input = False,

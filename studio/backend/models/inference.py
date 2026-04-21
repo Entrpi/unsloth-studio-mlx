@@ -52,6 +52,26 @@ class LoadRequest(BaseModel):
         None,
         description = "Speculative decoding mode for GGUF models (e.g. 'ngram-simple', 'ngram-mod'). Ignored for non-GGUF and vision models.",
     )
+    adapter_path: Optional[str] = Field(
+        None,
+        description = (
+            "Absolute path to an MLX LoRA adapter directory (containing "
+            "``adapters.safetensors`` + ``adapter_config.json``). When "
+            "set, the MLX loader forwards it to "
+            "``mlx_lm.load(..., adapter_path=...)``. Ignored for "
+            "non-MLX backends."
+        ),
+    )
+    draft_model_path: Optional[str] = Field(
+        None,
+        description = (
+            "Absolute path or HF repo of an MLX draft model for "
+            "speculative decoding. When set, the MLX loader loads a "
+            "second model alongside the base and passes it into "
+            "``stream_generate(draft_model=...)``. Ignored for non-MLX "
+            "backends."
+        ),
+    )
 
 
 class UnloadRequest(BaseModel):
@@ -138,6 +158,15 @@ class LoadResponse(BaseModel):
     is_mlx: bool = Field(
         False,
         description = "Whether model is loaded via MLX (Apple Silicon)",
+    )
+    is_mlx_lora: bool = Field(
+        False,
+        description = (
+            "Whether the active MLX load has a LoRA adapter layered on "
+            "top of the base model (Phase 6). Mutually exclusive with "
+            "the standalone ``is_lora`` flag, which is used by the "
+            "non-MLX adapter-only flow."
+        ),
     )
     is_audio: bool = Field(False, description = "Whether model is a TTS audio model")
     audio_type: Optional[str] = Field(

@@ -43,6 +43,10 @@ export interface LoadModelRequest {
   chat_template_override?: string | null;
   cache_type_kv?: string | null;
   speculative_type?: string | null;
+  /** Phase 6 — absolute path to an MLX LoRA adapter (ignored for non-MLX backends). */
+  adapter_path?: string | null;
+  /** Phase 7 — absolute path or HF repo of an MLX draft model for speculative decoding. */
+  draft_model_path?: string | null;
 }
 
 export interface ValidateModelResponse {
@@ -79,6 +83,8 @@ export interface LoadModelResponse {
   is_lora: boolean;
   is_gguf?: boolean;
   is_mlx?: boolean;
+  /** Phase 6 — the active MLX load has a LoRA adapter fused on top of the base model. */
+  is_mlx_lora?: boolean;
   is_audio?: boolean;
   audio_type?: string | null;
   has_audio_input?: boolean;
