@@ -151,6 +151,12 @@ type ChatRuntimeStore = {
   hfToken: string;
   modelsError: string | null;
   activeGgufVariant: string | null;
+  // Phase 3/7/8 — model-settings controls that previously gated on
+  // ``isGguf`` (KV cache dtype, speculative decoding, context-length
+  // slider) also want to show for MLX. Track whether the active backend
+  // is the MLX peer so the settings sheet can gate on ``isGguf ||
+  // isMlx``. Set on LoadResponse / status restore and cleared on unload.
+  activeIsMlx: boolean;
   ggufContextLength: number | null;
   ggufMaxContextLength: number | null;
   ggufNativeContextLength: number | null;
@@ -226,6 +232,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   hfToken: loadString(HF_TOKEN_KEY, ""),
   modelsError: null,
   activeGgufVariant: null,
+  activeIsMlx: false,
   ggufContextLength: null,
   ggufMaxContextLength: null,
   ggufNativeContextLength: null,
@@ -322,6 +329,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
         checkpoint: "",
       },
       activeGgufVariant: null,
+      activeIsMlx: false,
       ggufContextLength: null,
       ggufMaxContextLength: null,
       ggufNativeContextLength: null,

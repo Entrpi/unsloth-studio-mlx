@@ -229,6 +229,10 @@ async def load_model(
                 supports_reasoning = mlx_backend.supports_reasoning,
                 reasoning_always_on = mlx_backend.reasoning_always_on,
                 supports_tools = False,
+                # Phase 8: surface the effective KV-cache dtype. On the
+                # "already loaded" short-circuit the backend state is
+                # authoritative — don't echo the request field.
+                cache_type_kv = mlx_backend.cache_type_kv,
                 chat_template = mlx_backend.chat_template,
                 speculative_type = None,
             )
@@ -461,6 +465,9 @@ async def load_model(
                 model_identifier = config.identifier,
                 hf_token = request.hf_token,
                 n_ctx = request.max_seq_length,
+                # Phase 8: forward the UI's KV-dtype label. ``None`` or
+                # ``"f16"`` / ``"bf16"`` → unquantized (unchanged behaviour).
+                cache_type_kv = request.cache_type_kv,
             )
             if not success:
                 raise HTTPException(
@@ -494,7 +501,10 @@ async def load_model(
                 supports_reasoning = mlx_backend.supports_reasoning,
                 reasoning_always_on = mlx_backend.reasoning_always_on,
                 supports_tools = False,
-                cache_type_kv = None,
+                # Phase 8: surface the effective KV-cache dtype so the UI
+                # can reflect what the backend actually applied (e.g. a
+                # q5_1 request rounds down to q4_0).
+                cache_type_kv = mlx_backend.cache_type_kv,
                 chat_template = mlx_backend.chat_template,
                 speculative_type = None,
             )

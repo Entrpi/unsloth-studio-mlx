@@ -295,6 +295,9 @@ export function useChatModelRuntime() {
           supportsReasoning,
           reasoningAlwaysOn,
           supportsTools,
+          // Phase 3/7/8: track MLX-active so the settings sheet can
+          // gate KV / speculative / context UI on ``isGguf || isMlx``.
+          activeIsMlx: Boolean(statusRes.is_mlx),
           ggufContextLength: currentGgufContextLength,
           ggufMaxContextLength,
           ggufNativeContextLength,
@@ -506,6 +509,8 @@ export function useChatModelRuntime() {
             const reasoningAlwaysOn = loadResponse.reasoning_always_on ?? false;
             const ggufMaxContextLength = reportedMaxCtx;
             useChatRuntimeStore.setState({
+              // Phase 3/7/8: MLX load also gates settings-sheet controls.
+              activeIsMlx: Boolean(loadResponse.is_mlx),
               ggufContextLength: nativeCtx,
               ggufMaxContextLength,
               ggufNativeContextLength: reportedNativeCtx,

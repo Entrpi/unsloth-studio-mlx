@@ -492,6 +492,14 @@ export function ChatSettingsPanel({
 }: ChatSettingsPanelProps) {
   const isMobile = useIsMobile();
   const isGguf = useChatRuntimeStore((s) => s.activeGgufVariant) != null;
+  // Phase 3/7/8: MLX backends get the same model-settings controls as
+  // GGUF (KV cache dtype, speculative decoding, context-length slider).
+  // ``isGgufOrMlx`` is the parallel gate — the visual shape matches
+  // ``isGguf`` exactly and we reuse the ``gguf*`` runtime-store fields
+  // (populated from config.json for MLX and from GGUF metadata
+  // otherwise; see use-chat-model-runtime.ts).
+  const isMlx = useChatRuntimeStore((s) => s.activeIsMlx);
+  const isGgufOrMlx = isGguf || isMlx;
   const speculativeType = useChatRuntimeStore((s) => s.speculativeType);
   const setSpeculativeType = useChatRuntimeStore((s) => s.setSpeculativeType);
   const loadedSpeculativeType = useChatRuntimeStore(
@@ -924,7 +932,7 @@ export function ChatSettingsPanel({
           defaultOpen={true}
         >
           <div className="flex flex-col gap-3 py-1">
-            {isGguf && (
+            {isGgufOrMlx && (
               <>
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
@@ -1068,7 +1076,7 @@ export function ChatSettingsPanel({
                 )}
               </>
             )}
-            {!isGguf && params.checkpoint && (
+            {!isGgufOrMlx && params.checkpoint && (
               <>
                 <div className="flex items-center justify-between gap-3">
                   <div className="min-w-0">
@@ -1158,7 +1166,7 @@ export function ChatSettingsPanel({
               onChange={set("presencePenalty")}
               displayValue={params.presencePenalty === 0 ? "Off" : undefined}
             />
-            {!isGguf && (
+            {!isGgufOrMlx && (
               <ParamSlider
                 label="Max Seq Length"
                 value={params.maxSeqLength}
@@ -1172,11 +1180,11 @@ export function ChatSettingsPanel({
               label="Max Tokens"
               value={params.maxTokens}
               min={64}
-              max={isGguf && ggufContextLength ? ggufContextLength : 32768}
+              max={isGgufOrMlx && ggufContextLength ? ggufContextLength : 32768}
               step={64}
               onChange={set("maxTokens")}
               displayValue={
-                isGguf &&
+                isGgufOrMlx &&
                 ggufContextLength &&
                 params.maxTokens >= ggufContextLength
                   ? "Max"
