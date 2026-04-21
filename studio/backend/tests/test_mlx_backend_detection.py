@@ -170,6 +170,30 @@ def test_detect_mlx_adapter_not_a_directory(tmp_path: Path) -> None:
     assert _detect_mlx_adapter(f) is False
 
 
+def test_detect_mlx_adapter_real_fixture() -> None:
+    """Chunk H — point ``_detect_mlx_adapter`` at the vendored real
+    adapter fixture (trained via ``mlx_lm.lora`` against Bonsai 1.7B
+    2-bit; see ``docs/chunk-h-lora/training.log``). The detector must
+    classify a real-world adapter the same way it classifies the
+    synthetic bytes used above, proving the plural-``adapters`` key
+    convention survives round-tripping through the mlx-lm trainer.
+
+    Gated on the fixture's presence so the unit suite still runs cleanly
+    in a fresh checkout where the adapter hasn't been regenerated yet.
+    """
+    fixture = (
+        Path(__file__).parent / "fixtures" / "lora_adapter"
+    )
+    if not (fixture / "adapters.safetensors").is_file() or not (
+        fixture / "adapter_config.json"
+    ).is_file():
+        pytest.skip(
+            "Chunk H LoRA fixture not present — regenerate via "
+            "mlx_lm.lora (see docs/chunk-h-lora/training.log)"
+        )
+    assert _detect_mlx_adapter(fixture) is True
+
+
 # ── Phase 3 — remote HF MLX detection ───────────────────────────────
 
 
