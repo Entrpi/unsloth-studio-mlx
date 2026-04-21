@@ -83,7 +83,31 @@ def test_backend_generate_raises_when_cold() -> None:
         next(gen)
 
 
-def test_backend_load_model_raises_in_skeleton() -> None:
+def test_backend_load_model_rejects_bad_path() -> None:
+    """On the platform, load_model should reject a non-existent dir
+    with a RuntimeError (not NotImplementedError, not silent False)."""
+    import platform as _platform
+
     b = _fresh_backend()
-    with pytest.raises(NotImplementedError):
-        b.load_model(local_path = "/nonexistent", model_identifier = "dummy")
+    if (
+        _platform.system() == "Darwin"
+        and _platform.machine() == "arm64"
+    ):
+        with pytest.raises(RuntimeError, match = "not a directory"):
+            b.load_model(
+                local_path = "/nonexistent/path/to/mlx",
+                model_identifier = "dummy",
+            )
+    else:
+        # Off-platform: load_model raises before it even inspects the path.
+        with pytest.raises(RuntimeError, match = "not available on this platform"):
+            b.load_model(
+                local_path = "/nonexistent/path/to/mlx",
+                model_identifier = "dummy",
+            )
+
+
+def test_backend_unload_when_cold_returns_false() -> None:
+    """Unloading a backend that was never loaded is a no-op that returns False."""
+    b = _fresh_backend()
+    assert b.unload_model() is False

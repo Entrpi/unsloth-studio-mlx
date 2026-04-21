@@ -150,10 +150,123 @@ class MlxLmBackend:
         hf_token: Optional[str] = None,
         n_ctx: Optional[int] = None,
     ) -> bool:
-        raise NotImplementedError("load_model is implemented in step 3")
+        """Load an MLX checkpoint.
+
+        Args:
+            local_path: Directory containing ``config.json`` and the MLX
+                weight shards. For Phase 1 this must be a local path;
+                remote-HF MLX download is not wired.
+            model_identifier: Public-facing id the UI and /models/list
+                surface. Typically the original ``org/repo`` or local
+                path the user selected.
+            hf_token: Accepted for interface symmetry with the GGUF
+                backend; ignored for local loads.
+            n_ctx: Optional cap on the effective context length. If
+                provided, ``context_length`` is ``min(config.max_pos, n_ctx)``.
+
+        Returns:
+            True on success. Returns False on a failed load (and logs
+            the exception) so the route can surface a clean 500.
+        """
+        if not self._platform_ok():
+            raise RuntimeError(
+                "mlx_lm is not available on this platform "
+                "(requires macOS on Apple Silicon)"
+            )
+
+        with self._lock:
+            if self.is_loaded:
+                logger.warning(
+                    "MlxLmBackend.load_model called while a model is already "
+                    "loaded; unloading first"
+                )
+                self._unload_locked()
+
+            path = Path(local_path)
+            if not path.is_dir():
+                raise RuntimeError(
+                    f"MLX model path is not a directory: {local_path}"
+                )
+
+            # Lazy import — keeps the module importable on non-Darwin CI.
+            try:
+                from mlx_lm import load as _mlx_load  # type: ignore
+            except ImportError as e:
+                raise RuntimeError(
+                    f"mlx_lm is not installed in this Python env: {e}"
+                ) from e
+
+            t0 = time.time()
+            try:
+                model, tokenizer = _mlx_load(str(path))
+            except Exception as e:
+                logger.error(f"mlx_lm.load failed for {local_path}: {e}")
+                return False
+            load_s = time.time() - t0
+
+            # Read max_position_embeddings from config.json; cap by n_ctx
+            # if supplied.
+            native_ctx: Optional[int] = None
+            try:
+                with open(path / "config.json", "r", encoding = "utf-8") as f:
+                    cfg = json.load(f)
+                val = cfg.get("max_position_embeddings")
+                if isinstance(val, int) and val > 0:
+                    native_ctx = val
+            except (OSError, ValueError):
+                pass
+
+            effective_ctx: Optional[int] = native_ctx
+            if n_ctx is not None and n_ctx > 0:
+                effective_ctx = (
+                    min(native_ctx, n_ctx) if native_ctx else n_ctx
+                )
+
+            self._model = model
+            self._tokenizer = tokenizer
+            self._model_identifier = model_identifier
+            self._local_path = str(path)
+            self._context_length = effective_ctx
+
+            logger.info(
+                f"MLX model loaded in {load_s:.2f}s: "
+                f"identifier={model_identifier} path={path} "
+                f"context_length={effective_ctx}"
+            )
+            return True
+
+    def _unload_locked(self) -> bool:
+        """Internal unload. Caller must hold ``self._lock``."""
+        if self._model is None and self._tokenizer is None:
+            return False
+
+        self._model = None
+        self._tokenizer = None
+        self._model_identifier = None
+        self._local_path = None
+        self._context_length = None
+
+        gc.collect()
+        # mx.metal.clear_cache() may not exist in every MLX build.
+        try:
+            import mlx.core as mx  # type: ignore
+
+            metal = getattr(mx, "metal", None)
+            if metal is not None:
+                clear = getattr(metal, "clear_cache", None)
+                if callable(clear):
+                    try:
+                        clear()
+                    except Exception as e:
+                        logger.debug(f"mx.metal.clear_cache() failed: {e}")
+        except ImportError:
+            pass
+
+        return True
 
     def unload_model(self) -> bool:
-        raise NotImplementedError("unload_model is implemented in step 3")
+        with self._lock:
+            return self._unload_locked()
 
     def generate_chat_completion(
         self,
