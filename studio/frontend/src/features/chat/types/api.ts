@@ -7,6 +7,7 @@ export interface BackendModelDetails {
   is_vision?: boolean;
   is_lora?: boolean;
   is_gguf?: boolean;
+  is_mlx?: boolean;
   is_audio?: boolean;
   audio_type?: string | null;
   has_audio_input?: boolean;
@@ -50,6 +51,7 @@ export interface ValidateModelResponse {
   identifier?: string | null;
   display_name?: string | null;
   is_gguf?: boolean;
+  is_mlx?: boolean;
   is_lora?: boolean;
   is_vision?: boolean;
   requires_trust_remote_code?: boolean;
@@ -76,6 +78,7 @@ export interface LoadModelResponse {
   is_vision: boolean;
   is_lora: boolean;
   is_gguf?: boolean;
+  is_mlx?: boolean;
   is_audio?: boolean;
   audio_type?: string | null;
   has_audio_input?: boolean;
@@ -107,6 +110,7 @@ export interface InferenceStatusResponse {
   active_model: string | null;
   is_vision: boolean;
   is_gguf?: boolean;
+  is_mlx?: boolean;
   gguf_variant?: string | null;
   is_audio?: boolean;
   audio_type?: string | null;

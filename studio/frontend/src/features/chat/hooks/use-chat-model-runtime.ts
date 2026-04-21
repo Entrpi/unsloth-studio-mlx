@@ -61,16 +61,25 @@ function describeModel(model: {
   is_lora?: boolean;
   is_vision?: boolean;
   is_gguf?: boolean;
+  is_mlx?: boolean;
   is_audio?: boolean;
   has_audio_input?: boolean;
 }): string | undefined {
   const tags: string[] = [];
   if (model.is_gguf) tags.push("GGUF");
+  if (model.is_mlx) tags.push("MLX");
   if (model.is_lora) tags.push("LoRA");
   if (model.is_vision) tags.push("Vision");
   if (model.is_audio) tags.push("Audio");
   if (model.has_audio_input) tags.push("Audio Input");
-  if (!model.is_lora && !model.is_vision && !model.is_gguf && !model.is_audio && !model.has_audio_input)
+  if (
+    !model.is_lora &&
+    !model.is_vision &&
+    !model.is_gguf &&
+    !model.is_mlx &&
+    !model.is_audio &&
+    !model.has_audio_input
+  )
     tags.push("Base");
   return tags.join(" · ");
 }
@@ -81,6 +90,7 @@ function toChatModelSummary(model: {
   is_lora?: boolean;
   is_vision?: boolean;
   is_gguf?: boolean;
+  is_mlx?: boolean;
   is_audio?: boolean;
   audio_type?: string | null;
   has_audio_input?: boolean;
@@ -92,6 +102,7 @@ function toChatModelSummary(model: {
     isLora: Boolean(model.is_lora),
     isVision: Boolean(model.is_vision),
     isGguf: Boolean(model.is_gguf),
+    isMlx: Boolean(model.is_mlx),
     isAudio: Boolean(model.is_audio),
     audioType: model.audio_type ?? null,
     hasAudioInput: Boolean(model.has_audio_input),
@@ -136,9 +147,9 @@ function mergeRecommendedInference(
   modelId: string,
 ): InferenceParams {
   const inference = response.inference;
-  // GGUF: use actual context length from GGUF metadata, fallback to 131072
-  // Non-GGUF: 4096
-  const defaultMaxTokens = response.is_gguf
+  // GGUF / MLX: use actual context length from model metadata, fallback to 131072
+  // Other: 4096
+  const defaultMaxTokens = response.is_gguf || response.is_mlx
     ? (response.context_length ?? 131072)
     : 4096;
   return {
@@ -245,6 +256,7 @@ export function useChatModelRuntime() {
             is_vision: statusRes.is_vision,
             is_lora: false,
             is_gguf: statusRes.is_gguf,
+            is_mlx: statusRes.is_mlx,
             is_audio: statusRes.is_audio,
             audio_type: statusRes.audio_type,
             has_audio_input: statusRes.has_audio_input,
@@ -266,13 +278,16 @@ export function useChatModelRuntime() {
         const supportsReasoning = statusRes.supports_reasoning ?? false;
         const reasoningAlwaysOn = statusRes.reasoning_always_on ?? false;
         const supportsTools = statusRes.supports_tools ?? false;
-        const currentGgufContextLength = statusRes.is_gguf
+        // GGUF and MLX both populate context_length from model metadata;
+        // treat them identically for derivation of slider caps.
+        const _hasNativeCtx = statusRes.is_gguf || statusRes.is_mlx;
+        const currentGgufContextLength = _hasNativeCtx
           ? (statusRes.context_length ?? null)
           : null;
-        const ggufMaxContextLength = statusRes.is_gguf
+        const ggufMaxContextLength = _hasNativeCtx
           ? (statusRes.max_context_length ?? null)
           : null;
-        const ggufNativeContextLength = statusRes.is_gguf
+        const ggufNativeContextLength = _hasNativeCtx
           ? (statusRes.native_context_length ?? null)
           : null;
         const currentSpecType = statusRes.speculative_type ?? null;
@@ -475,13 +490,14 @@ export function useChatModelRuntime() {
             }
             const loadedKv = loadResponse.cache_type_kv ?? null;
             const loadedSpec = loadResponse.speculative_type ?? null;
-            const nativeCtx = loadResponse.is_gguf
+            const _hasNativeCtx = loadResponse.is_gguf || loadResponse.is_mlx;
+            const nativeCtx = _hasNativeCtx
               ? (loadResponse.context_length ?? 131072)
               : null;
-            const reportedMaxCtx = loadResponse.is_gguf
+            const reportedMaxCtx = _hasNativeCtx
               ? (loadResponse.max_context_length ?? null)
               : null;
-            const reportedNativeCtx = loadResponse.is_gguf
+            const reportedNativeCtx = _hasNativeCtx
               ? (loadResponse.native_context_length ?? null)
               : null;
             // A successful reload has applied settings, so clear pending custom
