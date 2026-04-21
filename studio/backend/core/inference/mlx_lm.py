@@ -240,6 +240,15 @@ class MlxLmBackend:
         # its native ``adapter_path`` kwarg. ``None`` means "base model
         # only"; a non-None value means an adapter is layered on top.
         self._adapter_path: Optional[str] = None
+        # Phase 7 — speculative decoding. ``_draft_model`` holds a second
+        # ``nn.Module`` loaded from a separate (typically smaller)
+        # checkpoint; ``stream_generate(draft_model=...)`` uses it to
+        # propose tokens which the base model verifies. The draft
+        # tokenizer is kept for vocab-size symmetry checks.
+        self._draft_model: Any = None
+        self._draft_tokenizer: Any = None
+        self._draft_path: Optional[str] = None
+        self._num_draft_tokens: int = 3
         # Phase 4 — reasoning / <think> state. Populated at load time by
         # ``_detect_reasoning``; reset by ``_unload_locked``.
         self._chat_template: Optional[str] = None
@@ -351,7 +360,17 @@ class MlxLmBackend:
 
     @property
     def speculative_type(self) -> Optional[str]:
-        return None
+        """``"mlx-draft-model"`` when a draft model is loaded, else None.
+
+        Distinct from the GGUF ``"ngram-simple"`` / ``"ngram-mod"`` values
+        so the UI / telemetry can tell them apart — MLX uses a real
+        draft model, not n-gram speculation.
+        """
+        return "mlx-draft-model" if self._draft_model is not None else None
+
+    @property
+    def draft_model_path(self) -> Optional[str]:
+        return self._draft_path
 
     def detect_audio_type(self) -> Optional[str]:
         """MLX backend never serves audio/TTS codecs. Always None."""
@@ -367,6 +386,62 @@ class MlxLmBackend:
     def _platform_ok() -> bool:
         """True iff the host can run MLX (Apple Silicon macOS)."""
         return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+    @staticmethod
+    def _draft_mem_preflight(draft_dir: Path) -> None:
+        """Phase 7 — refuse to load a draft that would push combined RAM
+        usage past 75% of total unified memory.
+
+        The estimate is deliberately conservative: we sum the safetensors
+        shards in the draft directory and treat that as "at least this
+        much new allocation" — MLX's lazy loading actually uses less
+        peak memory, but for the purpose of refusing-on-low-RAM the
+        upper bound is what we want.
+
+        Raises ``RuntimeError`` on refusal. Callers wrap in try/except
+        and fail the load gracefully.
+        """
+        try:
+            import psutil  # type: ignore
+        except ImportError:
+            # Without psutil we can't preflight; skip silently. Preflight
+            # is a safety net, not a hard prerequisite.
+            return
+
+        if not draft_dir.is_dir():
+            return
+
+        draft_bytes = 0
+        try:
+            for p in draft_dir.iterdir():
+                if p.is_file() and p.suffix == ".safetensors":
+                    try:
+                        draft_bytes += p.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            return
+
+        if draft_bytes == 0:
+            return
+
+        vm = psutil.virtual_memory()
+        total = getattr(vm, "total", 0) or 0
+        available = getattr(vm, "available", 0) or 0
+        if total <= 0:
+            return
+
+        # "Combined footprint" ≈ (total - available) + draft_bytes. If
+        # that exceeds 75% of total, refuse.
+        combined = (total - available) + draft_bytes
+        limit = int(total * 0.75)
+        if combined > limit:
+            raise RuntimeError(
+                "draft model would exceed 75% of available memory; refusing "
+                f"to load (draft={draft_bytes / 1e9:.1f} GB, "
+                f"combined_footprint={combined / 1e9:.1f} GB, "
+                f"limit={limit / 1e9:.1f} GB on a {total / 1e9:.1f} GB box)"
+            )
 
     def _detect_reasoning(
         self, tokenizer: Any, model_identifier: str
@@ -439,6 +514,7 @@ class MlxLmBackend:
         n_ctx: Optional[int] = None,
         cache_type_kv: Optional[str] = None,
         adapter_path: Optional[str] = None,
+        draft_model_path: Optional[str] = None,
     ) -> bool:
         """Load an MLX checkpoint.
 
@@ -467,6 +543,15 @@ class MlxLmBackend:
                 adapter onto the base model at load time. The base must
                 match the adapter's target architecture; otherwise
                 mlx-lm raises and this function returns False.
+            draft_model_path: Phase 7 — absolute path to a smaller MLX
+                checkpoint to use for speculative decoding. When
+                provided, the backend loads a second model via
+                ``mlx_lm.load`` and keeps it alongside the base; every
+                ``stream_generate`` call passes it as ``draft_model=``.
+                Memory-preflighted: refused if combined footprint would
+                exceed 75% of total unified memory. A tokenizer
+                vocab-size mismatch is logged as a warning but not
+                fatal — mlx-lm requires same-tokenizer draft models.
 
         Returns:
             True on success. Returns False on a failed load (and logs
@@ -540,6 +625,57 @@ class MlxLmBackend:
                     min(native_ctx, n_ctx) if native_ctx else n_ctx
                 )
 
+            # Phase 7 — optionally load a draft model for speculative
+            # decoding. We do this BEFORE setting ``self._model`` so a
+            # failed preflight / load doesn't leave the backend in a
+            # half-loaded state.
+            draft_model: Any = None
+            draft_tokenizer: Any = None
+            resolved_draft: Optional[str] = None
+            if draft_model_path:
+                draft_dir = Path(draft_model_path)
+                if not draft_dir.is_dir():
+                    logger.error(
+                        f"MLX draft model path is not a directory: "
+                        f"{draft_model_path}"
+                    )
+                    return False
+                try:
+                    self._draft_mem_preflight(draft_dir)
+                except RuntimeError as e:
+                    logger.error(f"MLX draft memory preflight failed: {e}")
+                    return False
+                try:
+                    t_d = time.time()
+                    draft_model, draft_tokenizer = _mlx_load(str(draft_dir))
+                    logger.info(
+                        f"MLX draft model loaded in {time.time() - t_d:.2f}s "
+                        f"from {draft_dir}"
+                    )
+                except Exception as e:
+                    logger.error(f"mlx_lm.load failed for draft {draft_dir}: {e}")
+                    return False
+                resolved_draft = str(draft_dir)
+
+                # Warn on vocab-size mismatch; mlx-lm's speculative decoding
+                # requires identical tokenizers. Users typically pair
+                # checkpoints in the same family (e.g. Bonsai-8B + Bonsai-1.7B).
+                try:
+                    base_vocab = getattr(tokenizer, "vocab_size", None)
+                    draft_vocab = getattr(draft_tokenizer, "vocab_size", None)
+                    if (
+                        base_vocab is not None
+                        and draft_vocab is not None
+                        and base_vocab != draft_vocab
+                    ):
+                        logger.warning(
+                            f"MLX draft/base vocab_size mismatch "
+                            f"(base={base_vocab} draft={draft_vocab}); "
+                            f"speculative decoding may behave unexpectedly."
+                        )
+                except Exception:
+                    pass
+
             self._model = model
             self._tokenizer = tokenizer
             self._model_identifier = model_identifier
@@ -547,6 +683,10 @@ class MlxLmBackend:
             self._context_length = effective_ctx
             # Phase 6 — record the adapter path (None for base-only loads).
             self._adapter_path = resolved_adapter
+            # Phase 7 — record the draft refs.
+            self._draft_model = draft_model
+            self._draft_tokenizer = draft_tokenizer
+            self._draft_path = resolved_draft
 
             # Phase 8: map the UI KV-dtype label to mlx-lm's
             # (kv_bits, kv_group_size) pair and stash for the generate
@@ -579,7 +719,11 @@ class MlxLmBackend:
 
     def _unload_locked(self) -> bool:
         """Internal unload. Caller must hold ``self._lock``."""
-        if self._model is None and self._tokenizer is None:
+        if (
+            self._model is None
+            and self._tokenizer is None
+            and self._draft_model is None
+        ):
             return False
 
         self._model = None
@@ -589,6 +733,11 @@ class MlxLmBackend:
         self._context_length = None
         # Phase 6 — reset LoRA adapter state.
         self._adapter_path = None
+        # Phase 7 — drop the draft refs alongside the base. Both live on
+        # one backend; one unload pays off both.
+        self._draft_model = None
+        self._draft_tokenizer = None
+        self._draft_path = None
         # Phase 4: clear reasoning state. A subsequent load_model of a
         # different model must not inherit the previous model's flags.
         self._chat_template = None
@@ -753,6 +902,16 @@ class MlxLmBackend:
             sg_kwargs["kv_bits"] = int(self._kv_bits)
             sg_kwargs["kv_group_size"] = int(self._kv_group_size)
             sg_kwargs["quantized_kv_start"] = int(self._quantized_kv_start)
+
+        # Phase 7 — speculative decoding. When a draft model was loaded
+        # alongside the base, forward it as the first positional
+        # equivalent kwarg that stream_generate accepts natively
+        # (confirmed on 0.31.2: ``draft_model`` is an explicit parameter
+        # on ``stream_generate``). ``num_draft_tokens`` is accepted by
+        # ``speculative_generate_step`` via ``**kwargs`` forwarding.
+        if self._draft_model is not None:
+            sg_kwargs["draft_model"] = self._draft_model
+            sg_kwargs["num_draft_tokens"] = int(self._num_draft_tokens)
 
         # Normalize stop strings: accept str | list[str] | None; strip empties.
         stop_strings: List[str] = []

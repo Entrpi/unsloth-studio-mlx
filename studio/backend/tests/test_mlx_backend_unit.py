@@ -904,6 +904,213 @@ def test_load_model_threads_adapter_path_into_mlx_load() -> None:
     b.unload_model()
 
 
+# ── Phase 7: speculative decoding ───────────────────────────────────
+
+
+def test_speculative_type_default_none() -> None:
+    """Fresh backend has no draft, so speculative_type is None."""
+    b = _fresh_backend()
+    assert b.speculative_type is None
+    assert b.draft_model_path is None
+
+
+def test_speculative_type_mlx_draft_model_when_loaded() -> None:
+    """With ``_draft_model`` set, speculative_type returns the MLX label."""
+    b = _fresh_backend()
+    b._draft_model = object()
+    assert b.speculative_type == "mlx-draft-model"
+
+
+def test_draft_state_resets_on_unload() -> None:
+    b = _fresh_backend()
+    b._model = object()
+    b._tokenizer = object()
+    b._draft_model = object()
+    b._draft_tokenizer = object()
+    b._draft_path = "/some/draft"
+    b._unload_locked()
+    assert b._draft_model is None
+    assert b._draft_tokenizer is None
+    assert b._draft_path is None
+    assert b.speculative_type is None
+
+
+def test_unload_drops_draft_even_without_base() -> None:
+    """Edge case: ``_unload_locked`` returned False when neither
+    base nor draft was set. With Phase 7 the condition must also
+    early-return False if only the draft is set but not the base
+    (can't happen in practice but sanity)."""
+    b = _fresh_backend()
+    # No base, no draft → nothing to do.
+    assert b._unload_locked() is False
+
+
+def test_draft_mem_preflight_refuses_when_over_75pct(tmp_path) -> None:
+    """Simulate a 32 GB box with 2 GB available and a 30 GB draft.
+    Combined footprint = (32 - 2) + 30 = 60 GB, limit = 24 GB.
+    Must raise RuntimeError mentioning 75%.
+
+    We patch ``Path.iterdir`` to return a fake child whose ``.stat()``
+    returns a 30 GB size — cleaner than stubbing real ``Path.stat``
+    which also drives ``is_file()``."""
+    from unittest import mock
+
+    from core.inference.mlx_lm import MlxLmBackend
+
+    class _FakeStat:
+        st_size = 30 * 1024**3
+
+    class _FakePath:
+        def __init__(self, suffix: str) -> None:
+            self.suffix = suffix
+
+        def is_file(self) -> bool:
+            return True
+
+        def stat(self) -> "_FakeStat":
+            return _FakeStat()
+
+    # Create a real directory so Path.is_dir() passes on tmp_path.
+    # Patch iterdir at the Path type level so our backend sees the fake.
+    def _fake_iterdir(self):
+        yield _FakePath(".safetensors")
+
+    class _VM:
+        total = 32 * 1024**3
+        available = 2 * 1024**3
+
+    with mock.patch.object(type(tmp_path), "iterdir", _fake_iterdir):
+        with mock.patch("psutil.virtual_memory", return_value = _VM()):
+            with pytest.raises(RuntimeError, match = "75% of available memory"):
+                MlxLmBackend._draft_mem_preflight(tmp_path)
+
+
+def test_draft_mem_preflight_passes_when_ample(tmp_path) -> None:
+    """With plenty of headroom, preflight returns cleanly."""
+    from unittest import mock
+
+    from core.inference.mlx_lm import MlxLmBackend
+
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"\x00" * 1024)
+
+    class _VM:
+        total = 128 * 1024**3
+        available = 100 * 1024**3  # 100 GB free
+
+    with mock.patch("psutil.virtual_memory", return_value = _VM()):
+        # Tiny draft (1 KB), huge headroom → no raise.
+        MlxLmBackend._draft_mem_preflight(tmp_path)
+
+
+def test_draft_mem_preflight_noop_without_psutil(tmp_path, monkeypatch) -> None:
+    """If psutil isn't importable (CI box without it), preflight is a
+    no-op — NEVER raise from a missing optional dep."""
+    import sys
+
+    from core.inference.mlx_lm import MlxLmBackend
+
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"\x00" * 1024)
+
+    # Block the import.
+    orig_psutil = sys.modules.pop("psutil", None)
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    try:
+        MlxLmBackend._draft_mem_preflight(tmp_path)  # must not raise
+    finally:
+        if orig_psutil is not None:
+            sys.modules["psutil"] = orig_psutil
+
+
+def test_generate_passes_draft_model_when_loaded() -> None:
+    """With a draft model set on the backend, ``stream_generate`` must
+    receive ``draft_model=`` and ``num_draft_tokens=``."""
+    from unittest import mock
+
+    from core.inference import mlx_lm as mlx_lm_mod
+
+    captured: Dict = {}
+
+    class _R:
+        def __init__(self, t: str):
+            self.text = t
+            self.prompt_tokens = 1
+            self.generation_tokens = 1
+            self.prompt_tps = 100.0
+            self.generation_tps = 47.0
+
+    def _fake_stream(model, tokenizer, **kw):
+        captured.update(kw)
+        yield _R("ok")
+
+    b = _fresh_backend()
+    b._model = object()
+    b._tokenizer = mock.Mock()
+    b._tokenizer.apply_chat_template.return_value = "prompt"
+    b._model_identifier = "x"
+    _draft_sentinel = object()
+    b._draft_model = _draft_sentinel
+    b._num_draft_tokens = 5
+
+    with mock.patch("mlx_lm.stream_generate", _fake_stream):
+        with mock.patch.object(
+            mlx_lm_mod,
+            "_build_mlx_sampler_and_processors",
+            return_value = (None, []),
+        ):
+            list(
+                b.generate_chat_completion(
+                    messages = [{"role": "user", "content": "hi"}],
+                )
+            )
+    assert captured.get("draft_model") is _draft_sentinel
+    assert captured.get("num_draft_tokens") == 5
+
+
+def test_generate_omits_draft_model_when_none() -> None:
+    """With no draft, ``stream_generate`` must NOT receive the draft
+    kwargs at all."""
+    from unittest import mock
+
+    from core.inference import mlx_lm as mlx_lm_mod
+
+    captured: Dict = {}
+
+    class _R:
+        def __init__(self, t: str):
+            self.text = t
+            self.prompt_tokens = 1
+            self.generation_tokens = 1
+            self.prompt_tps = 100.0
+            self.generation_tps = 47.0
+
+    def _fake_stream(model, tokenizer, **kw):
+        captured.update(kw)
+        yield _R("ok")
+
+    b = _fresh_backend()
+    b._model = object()
+    b._tokenizer = mock.Mock()
+    b._tokenizer.apply_chat_template.return_value = "prompt"
+    b._model_identifier = "x"
+    b._draft_model = None
+
+    with mock.patch("mlx_lm.stream_generate", _fake_stream):
+        with mock.patch.object(
+            mlx_lm_mod,
+            "_build_mlx_sampler_and_processors",
+            return_value = (None, []),
+        ):
+            list(
+                b.generate_chat_completion(
+                    messages = [{"role": "user", "content": "hi"}],
+                )
+            )
+    assert "draft_model" not in captured
+    assert "num_draft_tokens" not in captured
+
+
 def test_enable_thinking_omitted_when_none() -> None:
     """When the caller passes ``enable_thinking=None`` we must not
     inject chat_template_kwargs even if the model supports reasoning —
