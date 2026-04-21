@@ -512,3 +512,161 @@ done
 # Final load response carries hf_variant (exposed via backend property,
 # not yet routed to LoadResponse — follow-up).
 ```
+
+---
+
+## Chunk C (Phase 5) — Tool calling
+
+Wires MLX into the full tool-calling stack so external clients
+(opencode, Claude Code via OpenAI-compat, Cursor, Continue) and
+Studio's own agentic chat mode can drive MLX-backed models on the
+same terms they already drive GGUF-backed models.
+
+### New surface
+
+| Layer | New entry point |
+|---|---|
+| Shared parser | `studio/backend/core/inference/_tool_call_parser.py` — `parse_tool_calls_from_text(text, model_family="auto")` + `strip_tool_markup`. Lifted from the inline GGUF implementation. |
+| MLX backend | `MlxLmBackend.generate_chat_completion_with_tools(...)` — event shape matches the GGUF backend (`status` / `content` / `tool_start` / `tool_end` / `metadata`). |
+| MLX backend | `supports_tools` property now returns the chat-template probe result (True for Qwen3 / Bonsai / Hermes / Mistral-instruct dialects). |
+| Schema | `FunctionCall`, `ToolCall`, `ToolCallDelta`, `ToolCallFunctionDelta` Pydantic models + `ChoiceDelta.tool_calls` + `ChunkChoice.finish_reason = "tool_calls"`. `ChatMessage.reasoning_content` added. |
+| Route helper | `_extract_content_parts(..., preserve_tool_history=True)` keeps `role='tool'` / `assistant.tool_calls` / `reasoning_content` on the backend message list. |
+| OpenAI route | `_mlx_agentic_stream` / `_mlx_agentic_non_streaming` (Studio `enable_tools=true`); `_mlx_openai_passthrough_stream` / `_mlx_openai_passthrough_non_streaming` (standard OpenAI `tools=[...]`). |
+| Anthropic route | MLX-aware branching in `/v1/messages`. Reuses `AnthropicStreamEmitter` for agentic flow and `AnthropicPassthroughEmitter` for client-side pass-through. |
+
+### Detection: what Bonsai actually emits
+
+Tested against `/Users/ent/.lmstudio/models/prism-ml/Ternary-Bonsai-8B-mlx-2bit`:
+
+- `apply_chat_template` accepts the `tools` kwarg (so the fallback
+  prompt-injection path is rarely exercised in practice).
+- Tool calls come out in the Qwen3 JSON dialect:
+  ```
+  <tool_call>
+  {"name": "get_weather", "arguments": {"city": "Paris"}}
+  </tool_call>
+  ```
+  The closing tag is present on most turns but the parser handles its
+  absence (the GGUF backend's auto-heal also covers this).
+- Tool results are rendered back into the template as a
+  `<tool_response>...</tool_response>` block inside a user turn.
+
+### Tests
+
+| Suite | Count | Path |
+|---|---:|---|
+| Shared parser | 28 | `tests/test_tool_call_parser.py` |
+| Schema round-trip + `_extract_content_parts(preserve_tool_history=…)` | 19 | `tests/test_mlx_tool_schemas.py` |
+| MLX tool-loop units | 18 (inside a larger 82-test file) | `tests/test_mlx_backend_unit.py::Test*Tool*` |
+| MLX OpenAI SSE shape | 6 | `tests/test_mlx_openai_passthrough.py` |
+| MLX Anthropic SSE shape | 5 | `tests/test_mlx_anthropic_passthrough.py` |
+| GGUF tool regression | 97 (existing, re-ran green) | `tests/test_openai_tool_passthrough.py` + `tests/test_anthropic_messages.py` |
+| Bonsai real-model integration | 2 | `tests/test_mlx_backend_lifecycle.py::test_bonsai_*tool*` |
+
+### Smoke-test curls
+
+All three paths below reuse the existing Bonsai 8B MLX checkpoint.
+Load it first with a plain local-path `POST /api/inference/load` (the
+Phase 5 changes don't touch the load payload).
+
+**1. OpenAI `/v1/chat/completions` with client-side `tools=[...]`:**
+
+```bash
+curl -sN http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "Ternary-Bonsai-8B-mlx-2bit",
+    "messages": [{"role":"user","content":"What is the weather in Paris? Use the get_weather function."}],
+    "stream": true,
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Return current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }]
+  }'
+# Expect: delta.tool_calls fragments carrying id+name then arguments,
+# followed by finish_reason="tool_calls" and data: [DONE].
+```
+
+**2. Anthropic `/v1/messages` with `tools=[...]`:**
+
+```bash
+curl -sN http://127.0.0.1:8000/v1/messages \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "Ternary-Bonsai-8B-mlx-2bit",
+    "max_tokens": 256,
+    "messages": [{"role":"user","content":"What is the weather in Paris? Use the get_weather function."}],
+    "stream": true,
+    "tools": [{
+      "name": "get_weather",
+      "description": "Return current weather for a city",
+      "input_schema": {
+        "type": "object",
+        "properties": {"city": {"type":"string"}},
+        "required": ["city"]
+      }
+    }]
+  }'
+# Expect: message_start / content_block_start with tool_use /
+# content_block_delta with input_json_delta fragments / message_stop.
+```
+
+**3. Studio-internal `enable_tools=true` (built-in web_search / python / terminal):**
+
+```bash
+curl -sN http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "Ternary-Bonsai-8B-mlx-2bit",
+    "messages": [{"role":"user","content":"Use python to compute 2**100."}],
+    "stream": true,
+    "enable_tools": true,
+    "enabled_tools": ["python"]
+  }'
+# Expect: Studio-specific tool_status / tool_start / tool_end custom
+# SSE events interleaved with standard content deltas. Final
+# finish_reason="stop" once the agentic loop concludes.
+```
+
+### Deviations from the roadmap
+
+- **`backend_kind` enum**: left deferred as the roadmap allows (Phase 6
+  opportunistic). All Phase 5 code paths branch on the existing boolean
+  flags; no change.
+- **Parser dialect hint**: the shared parser auto-detects both dialects
+  by default. Callers can still force the JSON or XML dialect via
+  `model_family="qwen"` / `"xml"` / etc. but no current caller does —
+  Bonsai always takes the JSON path.
+- **Parallel tool calls in a single turn**: supported in the parser
+  (multiple `<tool_call>` blocks produce multiple `tool_calls`) but
+  Bonsai usually emits one at a time. Not exercised in integration
+  tests because the model doesn't tend to do it.
+- **`_mlx_openai_passthrough_stream` buffering**: uses a 64-char
+  buffer cap before flushing a speculative XML prefix as plain
+  content. The GGUF side uses 32; the larger MLX value accommodates
+  Bonsai's longer tool-call XML prefix that appears when the model
+  starts thinking out loud.
+- **Arguments streaming**: client-side pass-through emits arguments as
+  one chunk per call rather than character-by-character. The OpenAI SDK
+  accepts both shapes (it assembles via string concatenation
+  internally) and single-chunk emission is noticeably simpler to get
+  right.
+
+### Known follow-ups for Chunk D
+
+- Tool-call cancellation: the `cancel_event` is honoured at iteration
+  boundaries but not mid-tool execution (inherits the GGUF behaviour).
+- The MLX route's preserve-tool-history branch doesn't yet synthesise
+  XML for assistant turns that only carry `tool_calls` with empty
+  content; current behaviour ends up with an empty assistant
+  string — rendering correctness depends on the chat template.
+  Verified to work with Bonsai but not proven out for Hermes / Mistral
+  templates that don't re-serialise `tool_calls` cleanly.
