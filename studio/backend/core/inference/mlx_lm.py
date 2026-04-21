@@ -38,7 +38,7 @@ import platform
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 from loggers import get_logger
 
@@ -46,6 +46,58 @@ logger = get_logger(__name__)
 
 # Sentinel for a metadata event at the end of the generator stream.
 MetadataEvent = Dict[str, Any]
+
+
+# ── Phase 8 — Quantized KV cache ─────────────────────────────────────
+# Map the frontend's existing KV dtype dropdown strings (same values the
+# GGUF path has always accepted — f16 / bf16 / q8_0 / q5_1 / q4_1 / q4_0)
+# to the mlx-lm ``(kv_bits, kv_group_size)`` pair. Unquantized modes
+# (``f16`` / ``bf16``) map to ``(None, 64)`` which means "don't pass the
+# kwargs" — matches the behaviour of omitting ``kv_bits`` in
+# ``mlx_lm.generate.generate_step``.
+#
+# Note: MLX has no native 5-bit KV path; ``q5_1`` is rounded **down** to
+# 4 bits rather than up to 8 because that's how the GGUF side behaves
+# when its chosen bits-per-value is unavailable, and because rounding up
+# would silently give the user a heavier cache than they asked for.
+def _cache_type_kv_to_mlx(value: Optional[str]) -> Tuple[Optional[int], int]:
+    """Map a UI KV-dtype string to an MLX ``(kv_bits, kv_group_size)`` pair.
+
+    ``None`` and the unquantized labels return ``(None, 64)`` so the
+    caller can detect "no quantization" by checking ``kv_bits is None``.
+    The group-size default of 64 matches the upstream
+    ``quantize_kv_cache`` default.
+
+    Args:
+        value: UI dropdown value. Accepts: ``None``, ``"f16"``, ``"bf16"``,
+            ``"q8_0"``, ``"q5_1"``, ``"q4_1"``, ``"q4_0"``. Case-insensitive.
+
+    Returns:
+        ``(kv_bits, kv_group_size)``. ``kv_bits`` is ``None`` for the
+        unquantized dtypes and an ``int`` for the quantized ones.
+    """
+    if value is None:
+        return None, 64
+    v = str(value).strip().lower()
+    if v in ("", "f16", "bf16", "fp16"):
+        return None, 64
+    if v == "q8_0":
+        return 8, 64
+    if v == "q5_1":
+        # mlx has no 5-bit KV path; round down to 4 rather than upgrade to
+        # 8 so the user's "smaller cache" intent is preserved.
+        logger.warning(
+            "KV cache dtype 'q5_1' is not natively supported by mlx-lm; "
+            "rounding down to 4-bit (q4_0 equivalent)."
+        )
+        return 4, 64
+    if v in ("q4_0", "q4_1"):
+        return 4, 64
+    # Unknown label: treat as no quantization and log once.
+    logger.warning(
+        f"Unknown KV cache dtype '{value}'; falling back to unquantized."
+    )
+    return None, 64
 
 
 def _build_mlx_sampler_and_processors(
@@ -190,6 +242,15 @@ class MlxLmBackend:
         self._supports_reasoning: bool = False
         self._reasoning_always_on: bool = False
         self._reasoning_default: bool = True
+        # Phase 8 — quantized KV cache settings. Set by ``load_model`` from
+        # the ``cache_type_kv`` request field (mirrors GGUF behaviour where
+        # KV quantization is a load-time decision because ``stream_generate``
+        # only reads the kwargs when building the prompt cache). ``None``
+        # means "do not pass kv_bits to stream_generate" (== unquantized).
+        self._kv_bits: Optional[int] = None
+        self._kv_group_size: int = 64
+        self._quantized_kv_start: int = 0
+        self._cache_type_kv_label: Optional[str] = None
         self._lock = threading.Lock()
 
     # ── Properties ────────────────────────────────────────────────
@@ -258,7 +319,21 @@ class MlxLmBackend:
 
     @property
     def cache_type_kv(self) -> Optional[str]:
-        return None
+        """UI-facing KV-cache dtype label.
+
+        - ``None`` when KV quantization is off (the default).
+        - ``"q8_0"`` when loaded with ``kv_bits=8``.
+        - ``"q4_0"`` when loaded with ``kv_bits=4``.
+        - ``f"q{kv_bits}_0"`` for any other bit value (defensive fallback
+          for a future mlx-lm that supports, say, 2-bit KV).
+        """
+        if self._kv_bits is None:
+            return None
+        if self._kv_bits == 8:
+            return "q8_0"
+        if self._kv_bits == 4:
+            return "q4_0"
+        return f"q{int(self._kv_bits)}_0"
 
     @property
     def speculative_type(self) -> Optional[str]:
@@ -348,6 +423,7 @@ class MlxLmBackend:
         model_identifier: str,
         hf_token: Optional[str] = None,
         n_ctx: Optional[int] = None,
+        cache_type_kv: Optional[str] = None,
     ) -> bool:
         """Load an MLX checkpoint.
 
@@ -362,6 +438,13 @@ class MlxLmBackend:
                 backend; ignored for local loads.
             n_ctx: Optional cap on the effective context length. If
                 provided, ``context_length`` is ``min(config.max_pos, n_ctx)``.
+            cache_type_kv: Optional UI dtype label for the KV cache —
+                one of ``"f16" | "bf16" | "q8_0" | "q5_1" | "q4_1" | "q4_0"``.
+                ``None`` / ``"f16"`` / ``"bf16"`` keep the cache
+                unquantized. Phase 8 passes the mapped ``kv_bits`` /
+                ``kv_group_size`` into ``stream_generate`` on each
+                generation tick; MLX applies the quantization when it
+                builds the prompt cache.
 
         Returns:
             True on success. Returns False on a failed load (and logs
@@ -427,6 +510,16 @@ class MlxLmBackend:
             self._local_path = str(path)
             self._context_length = effective_ctx
 
+            # Phase 8: map the UI KV-dtype label to mlx-lm's
+            # (kv_bits, kv_group_size) pair and stash for the generate
+            # loop. Unquantized → kv_bits=None so stream_generate never
+            # sees the kwarg (preserves identical behaviour to Chunk A).
+            kv_bits, kv_group = _cache_type_kv_to_mlx(cache_type_kv)
+            self._kv_bits = kv_bits
+            self._kv_group_size = kv_group
+            self._quantized_kv_start = 0
+            self._cache_type_kv_label = cache_type_kv
+
             # Phase 4: introspect reasoning support from the tokenizer's
             # chat template. Errors are non-fatal — a model without a
             # template just gets supports_reasoning=False.
@@ -440,7 +533,8 @@ class MlxLmBackend:
                 f"identifier={model_identifier} path={path} "
                 f"context_length={effective_ctx} "
                 f"reasoning={self._supports_reasoning} "
-                f"always_on={self._reasoning_always_on}"
+                f"always_on={self._reasoning_always_on} "
+                f"cache_type_kv={self.cache_type_kv}"
             )
             return True
 
@@ -460,6 +554,13 @@ class MlxLmBackend:
         self._supports_reasoning = False
         self._reasoning_always_on = False
         self._reasoning_default = True
+        # Phase 8: reset KV-cache state to "unquantized default" so a
+        # subsequent load without cache_type_kv doesn't inherit the
+        # previous model's quantization.
+        self._kv_bits = None
+        self._kv_group_size = 64
+        self._quantized_kv_start = 0
+        self._cache_type_kv_label = None
 
         gc.collect()
         # mx.metal.clear_cache() may not exist in every MLX build.
@@ -600,6 +701,17 @@ class MlxLmBackend:
             sg_kwargs["sampler"] = sampler
         if processors:
             sg_kwargs["logits_processors"] = processors
+
+        # Phase 8 — quantized KV cache. Pass kv_bits / kv_group_size /
+        # quantized_kv_start **only when kv_bits is set**. Upstream
+        # ``stream_generate`` forwards via ``**kwargs`` into
+        # ``generate_step`` (and ``speculative_generate_step``), which
+        # accept these kwargs on 0.31.2. Omitting them when None
+        # preserves the exact behaviour of Phase 1 / Chunk A.
+        if self._kv_bits is not None:
+            sg_kwargs["kv_bits"] = int(self._kv_bits)
+            sg_kwargs["kv_group_size"] = int(self._kv_group_size)
+            sg_kwargs["quantized_kv_start"] = int(self._quantized_kv_start)
 
         # Normalize stop strings: accept str | list[str] | None; strip empties.
         stop_strings: List[str] = []

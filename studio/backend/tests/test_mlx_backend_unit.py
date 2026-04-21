@@ -576,6 +576,207 @@ def test_enable_thinking_forwarded_when_supported() -> None:
     assert kwargs.get("chat_template_kwargs") == {"enable_thinking": False}
 
 
+# ── Phase 8: quantized KV cache ─────────────────────────────────────
+
+
+def test_cache_type_kv_none_is_unquantized() -> None:
+    from core.inference.mlx_lm import _cache_type_kv_to_mlx
+
+    kv_bits, kv_group = _cache_type_kv_to_mlx(None)
+    assert kv_bits is None
+    assert kv_group == 64
+
+
+def test_cache_type_kv_f16_bf16_are_unquantized() -> None:
+    """f16 / bf16 map to "no quantization" — i.e. kv_bits is None."""
+    from core.inference.mlx_lm import _cache_type_kv_to_mlx
+
+    assert _cache_type_kv_to_mlx("f16") == (None, 64)
+    assert _cache_type_kv_to_mlx("bf16") == (None, 64)
+    assert _cache_type_kv_to_mlx("FP16") == (None, 64)  # case-insensitive
+
+
+def test_cache_type_kv_q8_maps_to_8bit() -> None:
+    from core.inference.mlx_lm import _cache_type_kv_to_mlx
+
+    assert _cache_type_kv_to_mlx("q8_0") == (8, 64)
+
+
+def test_cache_type_kv_q4_variants_map_to_4bit() -> None:
+    from core.inference.mlx_lm import _cache_type_kv_to_mlx
+
+    assert _cache_type_kv_to_mlx("q4_0") == (4, 64)
+    assert _cache_type_kv_to_mlx("q4_1") == (4, 64)
+
+
+def test_cache_type_kv_q5_rounds_down_to_q4(capsys) -> None:
+    """mlx-lm has no 5-bit KV path; round down rather than upgrade.
+
+    Studio uses structlog, so standard ``caplog`` doesn't see the
+    records — warnings are emitted to stdout via a console renderer.
+    Capture stdout to assert the warning surfaced.
+    """
+    from core.inference.mlx_lm import _cache_type_kv_to_mlx
+
+    kv_bits, kv_group = _cache_type_kv_to_mlx("q5_1")
+    assert kv_bits == 4
+    assert kv_group == 64
+    captured = capsys.readouterr()
+    assert "q5_1" in captured.out
+
+
+def test_cache_type_kv_unknown_falls_back_unquantized(capsys) -> None:
+    """Any unknown label must fall back to unquantized with a warning —
+    never raise, so a stray client value doesn't brick load."""
+    from core.inference.mlx_lm import _cache_type_kv_to_mlx
+
+    kv_bits, kv_group = _cache_type_kv_to_mlx("xyz")
+    assert kv_bits is None
+    assert kv_group == 64
+    captured = capsys.readouterr()
+    # The warning must mention the offending label. We don't assert the
+    # exact phrasing so a future log-message refinement doesn't break
+    # the test.
+    assert "xyz" in captured.out
+
+
+def test_cache_type_kv_property_none_when_unquantized() -> None:
+    b = _fresh_backend()
+    # Fresh backend is unquantized.
+    assert b.cache_type_kv is None
+    # Explicit None on the internal field.
+    b._kv_bits = None
+    assert b.cache_type_kv is None
+
+
+def test_cache_type_kv_property_q8_for_8bit() -> None:
+    b = _fresh_backend()
+    b._kv_bits = 8
+    assert b.cache_type_kv == "q8_0"
+
+
+def test_cache_type_kv_property_q4_for_4bit() -> None:
+    b = _fresh_backend()
+    b._kv_bits = 4
+    assert b.cache_type_kv == "q4_0"
+
+
+def test_cache_type_kv_property_other_bits_defensive() -> None:
+    """For any unexpected bit count we still return a consistent label."""
+    b = _fresh_backend()
+    b._kv_bits = 2
+    assert b.cache_type_kv == "q2_0"
+
+
+def test_kv_state_resets_on_unload() -> None:
+    b = _fresh_backend()
+    b._model = object()
+    b._tokenizer = object()
+    b._kv_bits = 4
+    b._kv_group_size = 128
+    b._quantized_kv_start = 256
+    b._cache_type_kv_label = "q4_0"
+    b._unload_locked()
+    assert b._kv_bits is None
+    assert b._kv_group_size == 64
+    assert b._quantized_kv_start == 0
+    assert b._cache_type_kv_label is None
+    assert b.cache_type_kv is None
+
+
+def test_generate_passes_kv_bits_when_quantized() -> None:
+    """With ``_kv_bits`` set, ``stream_generate`` must receive the
+    ``kv_bits``/``kv_group_size``/``quantized_kv_start`` kwargs."""
+    from unittest import mock
+
+    from core.inference import mlx_lm as mlx_lm_mod
+
+    captured_kwargs: Dict = {}
+
+    class _R:
+        def __init__(self, t: str):
+            self.text = t
+            self.prompt_tokens = 1
+            self.generation_tokens = 1
+            self.prompt_tps = 100.0
+            self.generation_tps = 47.0
+
+    def _fake_stream(model, tokenizer, **kw):
+        captured_kwargs.update(kw)
+        yield _R("ok")
+
+    b = _fresh_backend()
+    b._model = object()
+    b._tokenizer = mock.Mock()
+    b._tokenizer.apply_chat_template.return_value = "prompt"
+    b._model_identifier = "x"
+    b._kv_bits = 8
+    b._kv_group_size = 32
+    b._quantized_kv_start = 128
+
+    with mock.patch("mlx_lm.stream_generate", _fake_stream):
+        with mock.patch.object(
+            mlx_lm_mod,
+            "_build_mlx_sampler_and_processors",
+            return_value = (None, []),
+        ):
+            list(
+                b.generate_chat_completion(
+                    messages = [{"role": "user", "content": "hi"}],
+                )
+            )
+    assert captured_kwargs.get("kv_bits") == 8
+    assert captured_kwargs.get("kv_group_size") == 32
+    assert captured_kwargs.get("quantized_kv_start") == 128
+
+
+def test_generate_omits_kv_bits_when_unquantized() -> None:
+    """With ``_kv_bits=None`` the kwargs must NOT be present at all.
+
+    This preserves the exact Chunk A stream_generate call shape — zero
+    behavioural change when KV quantization is off.
+    """
+    from unittest import mock
+
+    from core.inference import mlx_lm as mlx_lm_mod
+
+    captured_kwargs: Dict = {}
+
+    class _R:
+        def __init__(self, t: str):
+            self.text = t
+            self.prompt_tokens = 1
+            self.generation_tokens = 1
+            self.prompt_tps = 100.0
+            self.generation_tps = 47.0
+
+    def _fake_stream(model, tokenizer, **kw):
+        captured_kwargs.update(kw)
+        yield _R("ok")
+
+    b = _fresh_backend()
+    b._model = object()
+    b._tokenizer = mock.Mock()
+    b._tokenizer.apply_chat_template.return_value = "prompt"
+    b._model_identifier = "x"
+    b._kv_bits = None
+
+    with mock.patch("mlx_lm.stream_generate", _fake_stream):
+        with mock.patch.object(
+            mlx_lm_mod,
+            "_build_mlx_sampler_and_processors",
+            return_value = (None, []),
+        ):
+            list(
+                b.generate_chat_completion(
+                    messages = [{"role": "user", "content": "hi"}],
+                )
+            )
+    assert "kv_bits" not in captured_kwargs
+    assert "kv_group_size" not in captured_kwargs
+    assert "quantized_kv_start" not in captured_kwargs
+
+
 def test_enable_thinking_omitted_when_none() -> None:
     """When the caller passes ``enable_thinking=None`` we must not
     inject chat_template_kwargs even if the model supports reasoning —
