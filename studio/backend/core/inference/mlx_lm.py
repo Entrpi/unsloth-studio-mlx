@@ -1535,6 +1535,7 @@ class MlxLmBackend:
 
         # Lazy imports to keep the module importable on non-Darwin CI.
         from core.inference._tool_call_parser import (
+            TOOL_XML_SIGNALS,
             parse_tool_calls_from_text,
             strip_tool_markup,
         )
@@ -1607,7 +1608,50 @@ class MlxLmBackend:
                 turn_text = event
                 # Stream cleaned tokens to the caller so the UI sees
                 # streaming before the tool-call resolves.
-                cleaned = strip_tool_markup(turn_text) if auto_heal_tool_calls else turn_text
+                #
+                # Two-stage clean:
+                #   1. ``strip_tool_markup`` removes fully-closed
+                #      ``<tool_call>...</tool_call>`` / ``<function=...>...</function>``
+                #      / ``<|tool_call>...<tool_call|>`` blocks.
+                #   2. Any trailing substring starting from an unclosed
+                #      tool-call signal (``<tool_call>``, ``<function=``,
+                #      ``<|tool_call>``) is held back until either the
+                #      close tag lands (stage 1 then eats it) or the turn
+                #      ends (the final-strip pass below uses ``final=True``
+                #      to greedy-match dangling openers). Matches GGUF's
+                #      speculative-buffer pattern (see
+                #      ``llama_cpp.py:_S_STREAMING``/``_S_BUFFERING``) but
+                #      without the full state machine — MLX turns are
+                #      single-producer so a trailing-signal scan is
+                #      sufficient.
+                #
+                # This fixes a UI regression where Bonsai (and any
+                # Qwen3-dialect model that occasionally mis-emits the
+                # close tag) leaked raw ``<tool_call>{...}<tool_call>``
+                # into the rendered chat bubble before the tool chip
+                # appeared.
+                cleaned = (
+                    strip_tool_markup(turn_text)
+                    if auto_heal_tool_calls
+                    else turn_text
+                )
+                if auto_heal_tool_calls:
+                    # After ``strip_tool_markup`` removed every closed
+                    # block, anything left containing a signal prefix is
+                    # definitionally an unclosed opener. Truncate at the
+                    # EARLIEST signal — we can't know whether the tail
+                    # is more markup or plain text until the close tag
+                    # (or turn end) resolves it. ``find`` not ``rfind``
+                    # so nested/back-to-back openers stay hidden.
+                    earliest_signal = -1
+                    for sig in TOOL_XML_SIGNALS:
+                        idx = cleaned.find(sig)
+                        if idx >= 0 and (
+                            earliest_signal < 0 or idx < earliest_signal
+                        ):
+                            earliest_signal = idx
+                    if earliest_signal >= 0:
+                        cleaned = cleaned[:earliest_signal]
                 yield {"type": "content", "text": cleaned}
 
             if cancel_event is not None and cancel_event.is_set():

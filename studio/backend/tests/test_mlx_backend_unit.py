@@ -2018,6 +2018,114 @@ class TestAgenticLoopMultiTurn:
         assert [e["result"] for e in ends] == ['{"t1": 1}', '{"t2": 2}']
 
 
+class TestContentStreamHoldback:
+    """Regression coverage for leaked tool-call markup in the streamed
+    content events. The mid-turn ``strip_tool_markup`` only catches
+    CLOSED blocks; partial / open-open variants used to leak through to
+    the SSE route, which rendered raw ``<tool_call>...`` text in the
+    chat bubble before the tool chip appeared. The fix holds back every
+    trailing substring starting from a ``TOOL_XML_SIGNALS`` prefix until
+    the close tag resolves it (stripped by ``strip_tool_markup``) or
+    the turn ends (greedy-matched by the ``final=True`` pass).
+    """
+
+    def test_closed_tool_block_never_leaks_into_content(self):
+        from unittest import mock
+
+        b = _stub_backend_for_tools()
+        # Model emits closed markup followed by plain text continuation.
+        turn_text = (
+            '<tool_call>{"name": "web_search", "arguments": {"q": "x"}}</tool_call>'
+        )
+        with mock.patch(
+            "core.inference.tools.execute_tool", return_value="{}"
+        ):
+            events = _run_tool_loop(
+                b,
+                turns_text=[turn_text, "done."],
+                tools=[{"type": "function", "function": {"name": "web_search"}}],
+            )
+        contents = [e["text"] for e in events if e.get("type") == "content"]
+        # No content event should carry any of the dialect signals.
+        for text in contents:
+            assert "<tool_call>" not in text, (
+                f"closed tool-call leaked into content event: {text!r}"
+            )
+            assert "<function=" not in text
+            assert "<|tool_call>" not in text
+
+    def test_unclosed_tool_open_holds_back_mid_stream(self):
+        from unittest import mock
+
+        b = _stub_backend_for_tools()
+        # First turn emits a closed call (for parser to execute), but
+        # mid-stream the first chunk includes just the opening marker.
+        # _run_tool_loop splits each turn's text into halves; the first
+        # half is ``<tool_call>{"name": "w``, which is exactly the
+        # mid-generation state the hold-back targets.
+        turn_text = (
+            '<tool_call>{"name": "web_search", "arguments": {"q": "x"}}</tool_call>'
+        )
+        with mock.patch(
+            "core.inference.tools.execute_tool", return_value="{}"
+        ):
+            events = _run_tool_loop(
+                b,
+                turns_text=[turn_text, "final."],
+                tools=[{"type": "function", "function": {"name": "web_search"}}],
+            )
+        # Every content event up to the tool_start must strip the
+        # opener — the stripped-to-empty case is fine.
+        boundary = next(
+            i for i, e in enumerate(events) if e.get("type") == "tool_start"
+        )
+        pre_tool_contents = [
+            e["text"] for e in events[:boundary] if e.get("type") == "content"
+        ]
+        for text in pre_tool_contents:
+            assert "<tool_call>" not in text, (
+                f"mid-stream leak before tool executed: {text!r}"
+            )
+
+    def test_malformed_open_open_does_not_leak(self):
+        """Bonsai / Qwen3 occasionally emit ``<tool_call>...<tool_call>``
+        (two openers, no close). The parser's brace-walker still
+        extracts the JSON body and executes the tool, but the close-tag
+        regex never matches. Before the fix, the mid-stream strip
+        didn't catch it either — raw markup rendered in the chat.
+        After the fix, the hold-back keeps everything from the first
+        opener hidden until the turn ends, at which point the
+        ``final=True`` strip greedy-matches ``<tool_call>.*$``.
+        """
+        from unittest import mock
+
+        b = _stub_backend_for_tools()
+        # Open-open instead of open-close. Parser still parses the
+        # inner JSON by brace-count; cleanup must still scrub.
+        turn_text = (
+            'Thinking.\n<tool_call>{"name": "web_search", '
+            '"arguments": {"q": "x"}} <tool_call>'
+        )
+        with mock.patch(
+            "core.inference.tools.execute_tool", return_value="{}"
+        ):
+            events = _run_tool_loop(
+                b,
+                turns_text=[turn_text, "final."],
+                tools=[{"type": "function", "function": {"name": "web_search"}}],
+            )
+        # tool_start must fire — proves the parser still extracted the
+        # call despite the malformed close.
+        types = [e.get("type") for e in events if isinstance(e, dict)]
+        assert "tool_start" in types
+        # And no content event contains the raw opener.
+        for e in events:
+            if e.get("type") == "content":
+                assert "<tool_call>" not in e["text"], (
+                    f"open-open leak: {e['text']!r}"
+                )
+
+
 class TestAgenticLoopMaxIterations:
     def test_cap_triggers_final_nudge(self):
         from unittest import mock
