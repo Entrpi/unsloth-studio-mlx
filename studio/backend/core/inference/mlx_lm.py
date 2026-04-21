@@ -998,24 +998,46 @@ class MlxLmBackend:
                     return False
                 resolved_draft = str(draft_dir)
 
-                # Warn on vocab-size mismatch; mlx-lm's speculative decoding
-                # requires identical tokenizers. Users typically pair
-                # checkpoints in the same family (e.g. Bonsai-8B + Bonsai-1.7B).
-                try:
-                    base_vocab = getattr(tokenizer, "vocab_size", None)
-                    draft_vocab = getattr(draft_tokenizer, "vocab_size", None)
-                    if (
-                        base_vocab is not None
-                        and draft_vocab is not None
-                        and base_vocab != draft_vocab
-                    ):
-                        logger.warning(
-                            f"MLX draft/base vocab_size mismatch "
-                            f"(base={base_vocab} draft={draft_vocab}); "
-                            f"speculative decoding may behave unexpectedly."
+                # Chunk E (E5): hard-refuse on tokenizer mismatch.
+                # Speculative decoding demands that base and draft share
+                # the same vocabulary. A mismatch silently produces
+                # garbage output — worse than a clear error — so we
+                # refuse the load entirely and drop back to base-only
+                # (by returning False so the route surfaces a 500).
+                base_vocab = getattr(tokenizer, "vocab_size", None)
+                draft_vocab = getattr(draft_tokenizer, "vocab_size", None)
+                if (
+                    base_vocab is not None
+                    and draft_vocab is not None
+                    and base_vocab != draft_vocab
+                ):
+                    self._load_phase = None
+                    msg = (
+                        f"speculative decoding requires matching tokenizers; "
+                        f"base vocab_size={base_vocab}, "
+                        f"draft vocab_size={draft_vocab}"
+                    )
+                    logger.error(f"MLX draft/base tokenizer mismatch: {msg}")
+                    raise RuntimeError(msg)
+
+                # Sentinel-token check: BOS / EOS / PAD ids must match too.
+                # HuggingFace tokenizers expose these as ``bos_token_id`` etc.;
+                # if either side is missing the attribute we skip that
+                # sentinel rather than fail (some minimal tokenizers omit
+                # PAD legitimately).
+                for sentinel in ("bos_token_id", "eos_token_id", "pad_token_id"):
+                    b_id = getattr(tokenizer, sentinel, None)
+                    d_id = getattr(draft_tokenizer, sentinel, None)
+                    if b_id is None or d_id is None:
+                        continue
+                    if b_id != d_id:
+                        self._load_phase = None
+                        msg = (
+                            f"speculative decoding requires matching tokenizers; "
+                            f"base {sentinel}={b_id}, draft {sentinel}={d_id}"
                         )
-                except Exception:
-                    pass
+                        logger.error(f"MLX draft/base sentinel mismatch: {msg}")
+                        raise RuntimeError(msg)
 
             self._model = model
             self._tokenizer = tokenizer

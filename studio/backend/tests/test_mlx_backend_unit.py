@@ -1024,6 +1024,170 @@ def test_draft_mem_preflight_noop_without_psutil(tmp_path, monkeypatch) -> None:
             sys.modules["psutil"] = orig_psutil
 
 
+# ── Chunk E (E5): hard-refuse tokenizer mismatch on speculative ────
+
+
+def _setup_base_and_draft_dirs(tmp_path):
+    """Create a plausible base MLX dir + a draft dir with a safetensors
+    shard so the draft-path + preflight checks pass."""
+    import json as _json
+
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "config.json").write_text(
+        _json.dumps(
+            {
+                "quantization": {"bits": 2, "group_size": 128},
+                "max_position_embeddings": 4096,
+            }
+        )
+    )
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    # Small shard so _draft_mem_preflight sees a trivial footprint.
+    (draft / "model.safetensors").write_bytes(b"\x00" * 1024)
+    return base, draft
+
+
+def test_draft_vocab_mismatch_refusal(tmp_path) -> None:
+    """Base vocab_size != draft vocab_size must raise RuntimeError and
+    leave the backend unloaded."""
+    import importlib.util
+    import platform as _platform
+
+    if not (
+        _platform.system() == "Darwin"
+        and _platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_lm") is not None
+    ):
+        pytest.skip("mlx_lm not available on this platform")
+
+    from unittest import mock
+
+    base, draft = _setup_base_and_draft_dirs(tmp_path)
+
+    class _Tokenizer:
+        def __init__(self, vocab_size: int):
+            self.vocab_size = vocab_size
+            self.bos_token_id = 1
+            self.eos_token_id = 2
+            self.pad_token_id = 0
+            self.chat_template = None
+
+        def apply_chat_template(self, *a, **kw):
+            return "prompt"
+
+    call_count = {"n": 0}
+
+    def _fake_mlx_load(path, *args, **kwargs):
+        # First call → base (vocab 32000). Second call → draft (vocab 32001).
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return object(), _Tokenizer(32000)
+        return object(), _Tokenizer(32001)
+
+    b = _fresh_backend()
+    with mock.patch("mlx_lm.load", _fake_mlx_load):
+        with pytest.raises(RuntimeError, match = "matching tokenizers"):
+            b.load_model(
+                local_path = str(base),
+                model_identifier = "fake",
+                draft_model_path = str(draft),
+            )
+    # Backend must be left in the unloaded state.
+    assert b.is_loaded is False
+    assert b._draft_model is None
+    assert b._model is None
+
+
+def test_draft_sentinel_mismatch_refusal(tmp_path) -> None:
+    """Same vocab_size but different eos_token_id also hard-refuses."""
+    import importlib.util
+    import platform as _platform
+
+    if not (
+        _platform.system() == "Darwin"
+        and _platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_lm") is not None
+    ):
+        pytest.skip("mlx_lm not available on this platform")
+
+    from unittest import mock
+
+    base, draft = _setup_base_and_draft_dirs(tmp_path)
+
+    class _Tokenizer:
+        def __init__(self, eos_id: int):
+            self.vocab_size = 32000
+            self.bos_token_id = 1
+            self.eos_token_id = eos_id
+            self.pad_token_id = 0
+            self.chat_template = None
+
+        def apply_chat_template(self, *a, **kw):
+            return "prompt"
+
+    call_count = {"n": 0}
+
+    def _fake_mlx_load(path, *args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return object(), _Tokenizer(2)
+        return object(), _Tokenizer(7)  # different EOS
+
+    b = _fresh_backend()
+    with mock.patch("mlx_lm.load", _fake_mlx_load):
+        with pytest.raises(RuntimeError, match = "eos_token_id"):
+            b.load_model(
+                local_path = str(base),
+                model_identifier = "fake",
+                draft_model_path = str(draft),
+            )
+    assert b.is_loaded is False
+
+
+def test_draft_tokenizer_match_succeeds(tmp_path) -> None:
+    """Matching tokenizers → load completes, draft attached."""
+    import importlib.util
+    import platform as _platform
+
+    if not (
+        _platform.system() == "Darwin"
+        and _platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_lm") is not None
+    ):
+        pytest.skip("mlx_lm not available on this platform")
+
+    from unittest import mock
+
+    base, draft = _setup_base_and_draft_dirs(tmp_path)
+
+    class _Tokenizer:
+        vocab_size = 32000
+        bos_token_id = 1
+        eos_token_id = 2
+        pad_token_id = 0
+        chat_template = None
+
+        def apply_chat_template(self, *a, **kw):
+            return "prompt"
+
+    def _fake_mlx_load(path, *args, **kwargs):
+        return object(), _Tokenizer()
+
+    b = _fresh_backend()
+    with mock.patch("mlx_lm.load", _fake_mlx_load):
+        ok = b.load_model(
+            local_path = str(base),
+            model_identifier = "fake",
+            draft_model_path = str(draft),
+        )
+    assert ok is True
+    assert b._draft_model is not None
+    assert b.speculative_type == "mlx-draft-model"
+    b.unload_model()
+
+
 def test_generate_passes_draft_model_when_loaded() -> None:
     """With a draft model set on the backend, ``stream_generate`` must
     receive ``draft_model=`` and ``num_draft_tokens=``."""
