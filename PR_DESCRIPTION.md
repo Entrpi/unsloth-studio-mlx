@@ -909,3 +909,65 @@ Non-goals: replacing LFM2.5-Audio as the default ASR. Whisper is opt-in; the pri
 - 248 MLX tests pass + 2 xfail (E8's documented non-Bonsai template gaps).
 - 0 regressions from Chunks A–D.
 - `/tmp/mlxtest/bin/pytest tests/test_mlx_*.py tests/test_tool_call_parser.py tests/test_native_context_length.py` completes in ~3 min.
+
+---
+
+# Chunk F — Final cleanup
+
+Closes the last two deferred follow-ups. After this chunk the roadmap work is a clean PR candidate.
+
+## Items landed
+
+| # | Item | Status |
+|---|---|---|
+| F1 | Resolve the 2 E8 xfails (Qwen3.5 template + args dict) + synthesise `<tool_call>` content for templates without a `tool_calls` iterator | landed |
+| F2 | Mark `is_gguf` / `is_mlx` / `is_mlx_vlm` / `is_mlx_audio` / `is_mlx_lora` as `deprecated=True` on the Pydantic schemas; migrate frontend chat reads to `backend_kind` | landed |
+
+## F1 — Template-aware tool-call routing + argument dict decode
+
+`_extract_content_parts(preserve_tool_history=True)` now accepts an optional `chat_template` kwarg and routes per template idiom:
+
+- **Camp (a) — templates that iterate `message.tool_calls`** (Qwen3.5, Bonsai, Gemma-4): ship `tool_calls` natively. Opportunistically `json.loads` the OpenAI JSON-string `arguments` into a dict. Qwen3.5's template specifically needs a mapping for `tool_call.arguments | items`; Bonsai / Gemma accept both forms so the upgrade is safe across the whole native-iteration set. This flips both Chunk-E xfails green.
+- **Camp (b) — templates without `tool_calls` iteration** (Hermes / Ministral / some Llama-3.1 fine-tunes): synthesise `<tool_call>{...}</tool_call>` JSON-in-tags content into the assistant turn's content field. Dialect matches the shared parser (`core.inference._tool_call_parser.parse_tool_calls_from_text`) so round-tripping reconstructs the original `ToolCall` shape — a new unit test exercises this round-trip.
+
+Heuristic: plain substring scan of the template for `message.tool_calls` / `message['tool_calls']` / `message["tool_calls"]`. Cheap, no Jinja parsing. False-positives keep the native path — the safer side.
+
+## F2 — `BackendKind` boolean deprecation
+
+`is_gguf` / `is_mlx` / `is_mlx_vlm` / `is_mlx_audio` / `is_mlx_lora` are now marked `deprecated=True` on every Pydantic schema that carries them:
+- `LoadResponse`
+- `InferenceStatusResponse`
+- `ValidateModelResponse`
+- `ModelDetails`
+
+Pydantic v2 surfaces the deprecation as a `DeprecationWarning` on field reads AND a `{"deprecated": true}` flag in the generated JSON schema / OpenAPI docs. The booleans remain populated on every response — no external API consumer is broken by this change; removal is a future chunk.
+
+`backend_kind` on `LoadResponse` / `InferenceStatusResponse` is now documented as the primary source of truth. It's `BackendKind | None` — `None` is returned only on cold-start (`/status` before any load); every successful load populates the enum deterministically.
+
+### Frontend migration
+
+Every `isGguf` / `isMlx` / `isMlxVlm` / `isMlxAudio` read in `studio/frontend/src/features/chat/**` now routes through `backend_kind` first and falls back to the deprecated boolean. Two small helpers in `use-chat-model-runtime.ts` centralise the routing:
+
+```ts
+resolveBackendKind(source)     // → BackendKind | null
+kindHasNativeContextLength(kind) // → boolean  (GGUF / any MLX variant)
+```
+
+`ChatModelSummary` gains a new `backendKind?: BackendKind | null` field; the deprecated booleans are still written so in-flight consumers keep working.
+
+JSDoc `@deprecated` comments were added to every legacy boolean on `types/api.ts`, `types/runtime.ts`, and the relevant fields on `chat-runtime-store.ts`.
+
+## Test results after Chunk F
+
+- **260 MLX tests pass, 0 xfail.** Delta from Chunk E: +8 tests from the new deprecation suite, +2 new F1 tests (content-synthesis round-trip + template-iteration heuristic), +2 xfails converted to passes.
+- 28 tool-call parser tests continue to pass — GGUF tool-call path unchanged.
+- `npm run typecheck` in `studio/frontend` clean.
+- No regressions in the ~250 existing MLX tests from Chunks A–E.
+
+## New deprecation-contract tests
+
+`studio/backend/tests/test_mlx_backend_kind_deprecation.py`:
+- Every legacy boolean field has `deprecated=True` in the generated JSON schema.
+- `backend_kind` itself is NOT deprecated (it's the replacement).
+- Reading a deprecated field on an instance raises `DeprecationWarning`; construction stays silent; reading `backend_kind` stays silent.
+- Every `BackendKind` literal variant is accepted by Pydantic; invalid variants are rejected.
