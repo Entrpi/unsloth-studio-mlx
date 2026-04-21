@@ -1661,10 +1661,112 @@ def _decode_audio_base64(b64: str) -> np.ndarray:
     return waveform.squeeze(0).numpy()
 
 
+# ── F1 helpers: template-aware tool-call rendering ──────────────────
+#
+# Chunk F (F1) — chat templates in the wild split into two camps when
+# preserving a prior assistant turn that carries ``tool_calls``:
+#
+#  (a) **Native iterators** — Qwen3 / Bonsai / Gemma-4 iterate
+#      ``message.tool_calls`` directly in Jinja and render the markup
+#      themselves. The extractor's job is to ship the ``tool_calls``
+#      kwarg in a shape the template understands. Qwen3.5's template
+#      specifically does ``tool_call.arguments|items`` which requires
+#      ``arguments`` to be a *mapping*, but the OpenAI wire format
+#      delivers it as a JSON string. To make Qwen3.5 render correctly
+#      without breaking Bonsai/Gemma (which handle both forms), we
+#      opportunistically ``json.loads`` ``arguments`` into a dict.
+#
+#  (b) **Content-only renderers** — Hermes / Ministral / some Llama-3.1
+#      fine-tunes have chat templates that don't reference
+#      ``message.tool_calls`` at all. Passing a ``tool_calls`` kwarg to
+#      those templates silently drops the tool call on the floor. For
+#      those, we synthesise a ``<tool_call>{"name":..., "arguments":...}
+#      </tool_call>`` JSON-in-tags block and park it in the assistant
+#      turn's ``content`` field — the same dialect the shared parser
+#      (:mod:`core.inference._tool_call_parser`) reads, so round-tripping
+#      preserves the ToolCall shape.
+#
+# The heuristic that separates (a) from (b) is a cheap substring scan of
+# ``tokenizer.chat_template`` for either ``message.tool_calls`` or
+# ``message['tool_calls']``. When the template is not provided (legacy
+# callers), we fall back to camp (a) — that's the historical behaviour
+# and preserves the Chunk C Bonsai flow.
+
+
+def _template_iterates_tool_calls(chat_template: Optional[str]) -> bool:
+    """Heuristic: does this Jinja chat template iterate
+    ``message.tool_calls`` / ``message['tool_calls']``?
+
+    Returns True when either attribute or index access on
+    ``message.tool_calls`` appears in the template string. The check is
+    a plain substring scan — no Jinja parsing — because:
+
+    * every template we've inspected uses one of the two canonical
+      idioms (``for tool_call in message.tool_calls`` or
+      ``if message['tool_calls']``), and
+    * false-positives here are the safer side: we keep passing
+      ``tool_calls`` natively and the template will still render
+      correctly if it happens to support it.
+
+    Returns False when ``chat_template`` is None / empty so callers can
+    treat that as "unknown". The extractor itself (``_extract_content_
+    parts``) then decides what to do with the ``unknown`` case — it
+    defaults to the native-kwarg shape to preserve Chunk C's behaviour.
+    """
+    if not chat_template:
+        return False
+    return (
+        "message.tool_calls" in chat_template
+        or "message['tool_calls']" in chat_template
+        or 'message["tool_calls"]' in chat_template
+    )
+
+
+def _synthesize_tool_call_content(tool_calls: list[dict]) -> str:
+    """Render ``tool_calls`` as the JSON-inside-``<tool_call>`` dialect.
+
+    This is the inverse of
+    :func:`core.inference._tool_call_parser.parse_tool_calls_from_text`
+    for the JSON-body dialect, so round-tripping through the shared
+    parser reproduces the same ``ToolCall`` shape. Each call becomes::
+
+        <tool_call>
+        {"name": "<tool>", "arguments": <parsed-json-or-string>}
+        </tool_call>
+
+    ``arguments`` is emitted as a parsed JSON object when it decodes
+    cleanly, otherwise as the raw string (wrapped in quotes for
+    validity). Multiple calls are stacked with a single newline between
+    them. The output contains no trailing whitespace — the caller is
+    free to prepend text content if the turn also carried natural-
+    language reasoning.
+    """
+    parts: list[str] = []
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        name = fn.get("name") or ""
+        raw_args = fn.get("arguments")
+        if isinstance(raw_args, str):
+            try:
+                args_obj = json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                # Fall back: emit the raw string as-is so a human reader
+                # (and the best-effort parser) still has the payload.
+                args_obj = raw_args
+        elif isinstance(raw_args, dict):
+            args_obj = raw_args
+        else:
+            args_obj = {}
+        body = {"name": name, "arguments": args_obj}
+        parts.append("<tool_call>\n" + json.dumps(body) + "\n</tool_call>")
+    return "\n".join(parts)
+
+
 def _extract_content_parts(
     messages: list,
     *,
     preserve_tool_history: bool = False,
+    chat_template: Optional[str] = None,
 ) -> tuple[str, list[dict], "Optional[str]"]:
     """
     Parse OpenAI-format messages into components the inference backend expects.
@@ -1681,12 +1783,29 @@ def _extract_content_parts(
             prior assistant's tool_calls and the subsequent tool
             results) back into ``apply_chat_template``. Default False
             preserves Phase-1 behaviour for non-tool chat paths.
+        chat_template: Optional ``tokenizer.chat_template`` string for
+            the active backend. When provided AND
+            ``preserve_tool_history=True``, used to decide whether to
+            ship ``tool_calls`` natively (camp (a) above) or synthesise
+            ``<tool_call>`` content (camp (b)). When None, falls back to
+            the native-kwarg shape — historical behaviour.
 
     Returns:
         system_prompt:  The system message text (empty string if none provided).
         chat_messages:  Non-system messages with content flattened to strings.
         image_base64:   Base64 data of the *first* image found, or ``None``.
     """
+    # Pre-compute the template-iterates-tool_calls flag once so the hot
+    # per-message loop doesn't re-scan the template string. When no
+    # template is provided (legacy callers, tests), default to the
+    # native-kwarg camp — that preserves Chunk C's Bonsai path where
+    # the helper's signature was just ``preserve_tool_history=True``.
+    if not preserve_tool_history:
+        _template_native_tool_calls = True  # non-preserve never synthesises
+    elif chat_template is None:
+        _template_native_tool_calls = True  # unknown → historical default
+    else:
+        _template_native_tool_calls = _template_iterates_tool_calls(chat_template)
     system_prompt = ""
     chat_messages: list[dict] = []
     first_image_b64: Optional[str] = None
@@ -1751,13 +1870,58 @@ def _extract_content_parts(
                 # Normalize ToolCall instances back to dicts so the
                 # tokenizer's apply_chat_template sees plain JSON-like
                 # structures (Jinja can't render Pydantic models).
+                # Additionally, opportunistically decode ``arguments``
+                # from the OpenAI JSON-string wire format into a dict:
+                # Qwen3.5's template does ``tool_call.arguments|items``
+                # which *requires* a mapping. Bonsai / Gemma-4 templates
+                # handle both forms, so upgrading to a dict is a safe
+                # default across every known native-iteration template.
+                # F1: see _template_iterates_tool_calls above.
                 norm: list[dict] = []
                 for tc in msg.tool_calls:
                     if hasattr(tc, "model_dump"):
-                        norm.append(tc.model_dump(exclude_none = True))
+                        tc_dict = tc.model_dump(exclude_none = True)
                     elif isinstance(tc, dict):
-                        norm.append(tc)
-                entry["tool_calls"] = norm
+                        tc_dict = dict(tc)
+                    else:
+                        continue
+                    fn = tc_dict.get("function")
+                    if isinstance(fn, dict):
+                        args = fn.get("arguments")
+                        if isinstance(args, str):
+                            # Opportunistic JSON decode. On failure,
+                            # keep the raw string — some fine-tunes
+                            # emit non-JSON payloads and the template
+                            # passes them through verbatim.
+                            try:
+                                parsed = json.loads(args)
+                                if isinstance(parsed, (dict, list)):
+                                    fn["arguments"] = parsed
+                            except (json.JSONDecodeError, TypeError, ValueError):
+                                pass
+                    norm.append(tc_dict)
+
+                if _template_native_tool_calls:
+                    # Camp (a): template iterates message.tool_calls —
+                    # ship the list natively so the template renders
+                    # its own markup.
+                    entry["tool_calls"] = norm
+                else:
+                    # Camp (b): template ignores tool_calls — synthesise
+                    # <tool_call> content so the assistant turn still
+                    # carries the call visibly when apply_chat_template
+                    # only renders ``message.content``. When the turn
+                    # also carried free-form text we prepend it with a
+                    # blank line separator.
+                    synth = _synthesize_tool_call_content(norm)
+                    existing = entry.get("content") or ""
+                    if existing.strip():
+                        entry["content"] = existing + "\n\n" + synth
+                    else:
+                        entry["content"] = synth
+                    # Intentionally DO NOT set entry["tool_calls"] — we
+                    # want the template to see only the content field
+                    # so the block lands in the rendered prompt.
             if msg.reasoning_content:
                 entry["reasoning_content"] = msg.reasoning_content
 
@@ -2705,8 +2869,14 @@ async def openai_chat_completions(
         # keeps Phase-1's lean message shape.
         _mlx_using_tools = payload.enable_tools or _mlx_wants_client_tools
         if _mlx_using_tools:
+            # F1: pass the active backend's chat_template so the
+            # extractor can route between native tool_calls kwargs and
+            # synthesised <tool_call> content based on the template's
+            # iteration idiom.
             _tool_system, _tool_msgs, _ = _extract_content_parts(
-                payload.messages, preserve_tool_history = True
+                payload.messages,
+                preserve_tool_history = True,
+                chat_template = mlx_backend.chat_template,
             )
             mlx_messages = []
             if _tool_system:

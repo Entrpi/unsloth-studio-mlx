@@ -56,41 +56,24 @@ _CANDIDATES = [
     #   <tool_call><function=NAME><parameter=KEY>VALUE</parameter>...
     # The Qwen template does ``tool_call.arguments|items`` which requires
     # ``arguments`` to be a mapping. OpenAI's wire format delivers a JSON
-    # string, and ToolCall.model_dump faithfully preserves that. Bonsai
-    # and Gemma's templates branch on ``is string`` / ``is mapping`` so
-    # they handle both forms; Qwen's doesn't. This is a documented gap:
-    # ``_extract_content_parts`` is faithful to OpenAI's shape, and Qwen's
-    # template expects a pre-parsed dict. Tracked as an xfail here so
-    # the rendering contract is still exercised and any future extractor
-    # update (e.g. opportunistic json.loads on ``arguments``) flips this
-    # test green without us silently losing coverage.
+    # string, and ToolCall.model_dump faithfully preserves that.
+    #
+    # Chunk F (F1): ``_extract_content_parts(preserve_tool_history=True)``
+    # now opportunistically ``json.loads`` the ``arguments`` string into
+    # a dict so Qwen3.5's ``|items`` filter works. Bonsai/Gemma handle
+    # both forms so the upgrade is safe across the native-iteration
+    # templates. This flipped the two Qwen3.5 xfails green.
     pytest.param(
         "qwen3.5-4b",
         _LMSTUDIO_ROOT / "mlx-community" / "Qwen3.5-4B-MLX-4bit",
         "<tool_call>",
         id = "qwen3.5-4b",
-        marks = pytest.mark.xfail(
-            reason = (
-                "Qwen 3.5 template expects tool_call.arguments to be a "
-                "mapping; OpenAI wire format delivers a JSON string. "
-                "Extractor-shape vs template-expectation mismatch. "
-                "See Chunk E PR_DESCRIPTION: E8 for the documented gap."
-            ),
-            strict = False,
-        ),
     ),
     pytest.param(
         "qwen3.5-35b-a3b",
         _LMSTUDIO_ROOT / "mlx-community" / "Qwen3.5-35B-A3B-4bit",
         "<tool_call>",
         id = "qwen3.5-35b-a3b",
-        marks = pytest.mark.xfail(
-            reason = (
-                "Same template family as qwen3.5-4b — see that xfail for "
-                "details. Grouped here for family-coverage clarity."
-            ),
-            strict = False,
-        ),
     ),
     # Gemma 4 — different idiom: ``<|tool_call>call:NAME{...}<tool_call|>``.
     # Template handles both string and dict forms of arguments.
@@ -195,20 +178,29 @@ def test_tool_history_renders_tool_calls_block(
         pytest.skip(f"{family}: tokenizer has no chat_template")
 
     # Build conversation and run it through the same extractor the
-    # production route uses.
+    # production route uses. Chunk F (F1): pass the tokenizer's
+    # chat_template so the extractor routes between native ``tool_calls``
+    # and synthesised ``<tool_call>`` content the same way the route
+    # does in production.
     msgs = _build_tool_call_history()
     _sys, chat_messages, _img = _extract_content_parts(
-        msgs, preserve_tool_history = True
+        msgs,
+        preserve_tool_history = True,
+        chat_template = getattr(tokenizer, "chat_template", None),
     )
 
-    # Sanity check: the extractor kept the tool_calls block on the
-    # assistant turn (this is the bit Chunk C specifically worried
-    # about — if the extractor drops tool_calls when content is None,
-    # no template can render what isn't there).
+    # Sanity check: the extractor kept SOME representation of the tool
+    # call on the assistant turn — either as a native ``tool_calls``
+    # list (templates that iterate it) or as synthesised ``<tool_call>``
+    # content (templates that don't). Chunk C worried specifically
+    # about silent drops when ``content`` is None, and Chunk F (F1)
+    # added the second branch.
     assistant_entries = [m for m in chat_messages if m.get("role") == "assistant"]
     assert assistant_entries, "extractor dropped the assistant turn"
-    assert assistant_entries[0].get("tool_calls"), (
-        "extractor dropped tool_calls on assistant turn with content=None"
+    _a = assistant_entries[0]
+    assert _a.get("tool_calls") or "<tool_call>" in (_a.get("content") or ""), (
+        "extractor dropped both tool_calls and synthesised content on "
+        "assistant turn with content=None"
     )
 
     # Tools schema that the model was notionally prompted with — pass
@@ -269,7 +261,9 @@ def test_extract_preserves_tool_calls_with_none_content():
     """Fast sanity check with no tokenizer dependency: the extractor
     must retain ``tool_calls`` on the assistant turn even when
     ``content`` is None (not just empty string). Chunk C flagged this
-    as the risk path."""
+    as the risk path. No ``chat_template`` passed, so the extractor
+    defaults to the native-kwarg shape (camp (a)) — the historical
+    behaviour."""
     msgs = _build_tool_call_history()
     _sys, chat_messages, _img = _extract_content_parts(
         msgs, preserve_tool_history = True
@@ -280,4 +274,82 @@ def test_extract_preserves_tool_calls_with_none_content():
     )
     tc = assistant["tool_calls"][0]
     assert tc["function"]["name"] == "get_weather"
-    assert "Paris" in tc["function"]["arguments"]
+    # Chunk F (F1): arguments is now opportunistically decoded into a
+    # dict. The resulting shape is dict-or-string; either form must
+    # still mention "Paris".
+    args = tc["function"]["arguments"]
+    if isinstance(args, dict):
+        assert args.get("city") == "Paris"
+    else:
+        assert "Paris" in args
+
+
+def test_content_synthesis_roundtrips_through_tool_call_parser():
+    """Chunk F (F1): templates that don't iterate ``message.tool_calls``
+    get ``<tool_call>`` JSON content synthesised into the assistant
+    turn. The synthesised block MUST round-trip through the shared
+    parser so reconstruction is lossless — callers that later scrape
+    ``parse_tool_calls_from_text`` over the prompt recover the same
+    ``ToolCall`` shape the extractor fed in."""
+    from core.inference._tool_call_parser import parse_tool_calls_from_text
+
+    msgs = _build_tool_call_history()
+    # Pass a chat_template that does NOT reference message.tool_calls —
+    # the Hermes/Ministral camp — so the extractor takes the content-
+    # synthesis branch.
+    minimal_template = (
+        "{% for message in messages %}"
+        "{{ message.role }}:{{ message.content }}\n"
+        "{% endfor %}"
+    )
+    _sys, chat_messages, _img = _extract_content_parts(
+        msgs,
+        preserve_tool_history = True,
+        chat_template = minimal_template,
+    )
+    assistant = next(m for m in chat_messages if m.get("role") == "assistant")
+    # Synthesis branch: no native tool_calls, content carries the block.
+    assert "tool_calls" not in assistant, (
+        "template doesn't iterate tool_calls — extractor should NOT "
+        "pass them natively"
+    )
+    synth_content = assistant["content"]
+    assert "<tool_call>" in synth_content and "</tool_call>" in synth_content
+
+    # Round-trip: parse the synthesised markup back.
+    parsed = parse_tool_calls_from_text(synth_content)
+    assert len(parsed) == 1, f"expected 1 parsed call, got {len(parsed)}"
+    p = parsed[0]
+    assert p["function"]["name"] == "get_weather"
+    # Parser normalises arguments back to a JSON string; parse that.
+    import json as _json
+    args = _json.loads(p["function"]["arguments"])
+    assert args == {"city": "Paris"}
+
+
+def test_template_iterates_tool_calls_heuristic():
+    """The template-iterates-tool_calls heuristic is a plain substring
+    scan but the exact idioms it recognises are load-bearing for F1's
+    routing. Lock the expected matches here so a future refactor
+    can't silently regress the split between native-kwarg and content-
+    synthesis camps."""
+    from routes.inference import _template_iterates_tool_calls
+
+    # Attribute access — Qwen3.5 / Bonsai style.
+    assert _template_iterates_tool_calls(
+        "{% for tc in message.tool_calls %}...{% endfor %}"
+    )
+    # Bracket-string access — some Llama-3.1 / Gemma-4 variants.
+    assert _template_iterates_tool_calls(
+        "{% if message['tool_calls'] %}...{% endif %}"
+    )
+    assert _template_iterates_tool_calls(
+        '{% if message["tool_calls"] %}...{% endif %}'
+    )
+    # Empty / None → False (safer default).
+    assert not _template_iterates_tool_calls(None)
+    assert not _template_iterates_tool_calls("")
+    # Template without tool_calls at all → False.
+    assert not _template_iterates_tool_calls(
+        "{% for m in messages %}{{ m.role }}:{{ m.content }}{% endfor %}"
+    )
