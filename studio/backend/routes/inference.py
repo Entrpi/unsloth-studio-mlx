@@ -236,7 +236,9 @@ async def load_model(
                 # authoritative — don't echo the request field.
                 cache_type_kv = mlx_backend.cache_type_kv,
                 chat_template = mlx_backend.chat_template,
-                speculative_type = None,
+                # Phase 7: surface speculative-active state even on the
+                # already-loaded path.
+                speculative_type = mlx_backend.speculative_type,
             )
 
         if request.gguf_variant:
@@ -476,6 +478,8 @@ async def load_model(
                 cache_type_kv = request.cache_type_kv,
                 # Phase 6: forward the LoRA adapter path when provided.
                 adapter_path = _mlx_adapter_path,
+                # Phase 7: forward the draft model path for speculative.
+                draft_model_path = request.draft_model_path,
             )
             if not success:
                 raise HTTPException(
@@ -516,7 +520,8 @@ async def load_model(
                 # q5_1 request rounds down to q4_0).
                 cache_type_kv = mlx_backend.cache_type_kv,
                 chat_template = mlx_backend.chat_template,
-                speculative_type = None,
+                # Phase 7: "mlx-draft-model" when a draft was loaded, else None.
+                speculative_type = mlx_backend.speculative_type,
             )
 
         # ── Standard path: load via Unsloth/transformers ──────────
@@ -883,7 +888,9 @@ async def get_status(
                 context_length = mlx_backend.context_length,
                 max_context_length = mlx_backend.max_context_length,
                 native_context_length = mlx_backend.native_context_length,
-                speculative_type = None,
+                # Phase 7: surface "mlx-draft-model" in status so the UI
+                # can reflect the active speculative mode.
+                speculative_type = mlx_backend.speculative_type,
             )
 
         # If a GGUF model is loaded via llama-server, report that
