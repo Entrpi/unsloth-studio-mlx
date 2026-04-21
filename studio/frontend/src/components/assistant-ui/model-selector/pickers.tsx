@@ -436,6 +436,31 @@ function isGgufRepo(id: string, hintedIsGguf?: boolean): boolean {
   return Boolean(hintedIsGguf) || hasGgufSuffix(id);
 }
 
+// ── Detect MLX repos by naming convention ─────────────────────────────────
+//
+// MLX checkpoints don't have a universal suffix the way GGUF does, but
+// three conventions cover ~all mlx-community / lmstudio-community /
+// inferencerlabs uploads we care about:
+//   1. "-mlx-Nbit" / "-MLX-Nbit" quant suffix (e.g. Ternary-Bonsai-8B-mlx-2bit,
+//      Qwen3.5-4B-MLX-4bit, Qwen3.5-35B-A3B-MLX-5.5bit).
+//   2. "mlx-community/" org prefix — the community org publishes bf16 and
+//      non-quantized MLX weights without the "-mlx-" marker.
+//   3. "-MLX-" anywhere mid-slug (e.g. GLM-4.6V-Flash-MLX-8bit).
+// The picker can't afford to probe config.json for each row, so a naming
+// heuristic is the practical signal. False negatives (unusual names) fall
+// back to the generic "Local" label; false positives are essentially
+// impossible given these patterns aren't shared with other formats.
+function isMlxRepo(id: string | undefined, path?: string): boolean {
+  if (!id) return false;
+  if (/-mlx-\d+(?:\.\d+)?bit\b/i.test(id)) return true;
+  if (/-MLX-\d+(?:\.\d+)?bit\b/.test(id)) return true;
+  if (/^mlx-community\//i.test(id)) return true;
+  // Catch paths under the canonical lmstudio org dirs when the id is
+  // just a local repo name without the org prefix.
+  if (path && /\/mlx-community\//i.test(path)) return true;
+  return false;
+}
+
 /** Extract param count label from model name (e.g. "Qwen3-0.6B" -> "0.6B"). */
 function extractParamLabel(id: string): string | undefined {
   // Match patterns like "0.6B", "1B", "4B", "3.5B", "70B", "1.5B" etc.
@@ -1007,7 +1032,12 @@ export function HubModelPicker({
                     <ModelRow
                       label={m.model_id ?? m.display_name}
                       meta={
-                        isGguf || m.path.toLowerCase().endsWith(".gguf") ? "GGUF" : "Local"
+                        isGguf || m.path.toLowerCase().endsWith(".gguf")
+                          ? "GGUF"
+                          : isMlxRepo(m.id, m.path) ||
+                              isMlxRepo(m.display_name, m.path)
+                            ? "MLX"
+                            : "Local"
                       }
                       selected={value === m.id}
                       onClick={() => {
@@ -1206,7 +1236,14 @@ export function HubModelPicker({
                   <div key={m.id}>
                     <ModelRow
                       label={m.model_id ?? m.display_name}
-                      meta={isGguf ? "GGUF" : "Local"}
+                      meta={
+                        isGguf
+                          ? "GGUF"
+                          : isMlxRepo(m.id, m.path) ||
+                              isMlxRepo(m.display_name, m.path)
+                            ? "MLX"
+                            : "Local"
+                      }
                       selected={value === m.id}
                       onClick={() => {
                         if (isDirectGguf) {
@@ -1319,7 +1356,13 @@ export function HubModelPicker({
                       meta={
                         isKnownGgufRepo(id)
                           ? "GGUF"
-                          : (vram?.detail ?? extractParamLabel(id))
+                          : isMlxRepo(id)
+                            ? (() => {
+                                const size =
+                                  vram?.detail ?? extractParamLabel(id);
+                                return size ? `MLX · ${size}` : "MLX";
+                              })()
+                            : (vram?.detail ?? extractParamLabel(id))
                       }
                       selected={value === id}
                       onClick={() => {
@@ -1373,7 +1416,13 @@ export function HubModelPicker({
                         meta={
                           isSearchGguf
                             ? "GGUF"
-                            : (metricsById.get(id) ?? extractParamLabel(id))
+                            : isMlxRepo(id)
+                              ? (() => {
+                                  const size =
+                                    metricsById.get(id) ?? extractParamLabel(id);
+                                  return size ? `MLX · ${size}` : "MLX";
+                                })()
+                              : (metricsById.get(id) ?? extractParamLabel(id))
                         }
                         selected={value === id}
                         onClick={() => {
