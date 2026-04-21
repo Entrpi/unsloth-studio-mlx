@@ -12,6 +12,9 @@ actually loaded + streamed tokens against:
 - Hermes-3 Llama-3.2 3B (bf16) — Nous Research fine-tune.
 - Ministral-3 3B Instruct (4-bit) — Mistral 2512.
 - Llama-3.2 3B Instruct (4-bit) — Meta baseline.
+- Gemma-4 E4B Instruct (4-bit) — Google Gemma-4 dense. Added after
+  the initial H-2 landing to close the last Gemma-4 cell that only
+  had a tokenizer probe against 31B and zero weights-loaded coverage.
 
 For each: load → 1-token-chat → assert cumulative text contract +
 metadata event → unload. These are gate tests: they prove the MLX
@@ -57,6 +60,16 @@ _FAMILIES = [
         "llama-3.2-3b",
         _LMSTUDIO_ROOT / "mlx-community" / "Llama-3.2-3B-Instruct-4bit",
         id = "llama-3.2-3b",
+    ),
+    # Chunk H-2 (Gemma-4 matrix closure): Gemma-4 E4B dense. The 31B
+    # sibling had template-probe coverage but never loaded weights;
+    # E4B at ~4.9 GB is small enough to ship in the default fast suite
+    # so the "Gemma-4 actually drives on hardware" claim is real rather
+    # than inferred. Uses the same Gemma-4 chat template family as 31B.
+    pytest.param(
+        "gemma-4-e4b",
+        _LMSTUDIO_ROOT / "mlx-community" / "gemma-4-e4b-it-4bit",
+        id = "gemma-4-e4b",
     ),
 ]
 
