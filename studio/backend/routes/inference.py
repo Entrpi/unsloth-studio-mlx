@@ -176,6 +176,88 @@ def get_mlx_lm_backend():
     return _mlx_lm_backend
 
 
+# Phase 9 (Chunk D) — MLX vision-language backend. Same lazy-singleton
+# pattern as ``get_mlx_lm_backend`` — ``mlx-vlm`` imports transitively
+# pull in ``mlx``, ``transformers``, and PIL and are Darwin-only.
+_mlx_vlm_backend: Optional["MlxVlmBackend"] = None  # noqa: F821
+
+
+def get_mlx_vlm_backend():
+    """Return the process-wide ``MlxVlmBackend`` singleton."""
+    global _mlx_vlm_backend
+    if _mlx_vlm_backend is None:
+        from core.inference.mlx_vlm import MlxVlmBackend
+
+        _mlx_vlm_backend = MlxVlmBackend()
+    return _mlx_vlm_backend
+
+
+# Phase 10 (Chunk D) — MLX audio backend (TTS / ASR / omni). Same
+# lazy-singleton pattern; ``mlx-audio`` pulls in numba / librosa /
+# soundfile which are heavy imports.
+_mlx_audio_backend: Optional["MlxAudioBackend"] = None  # noqa: F821
+
+
+def get_mlx_audio_backend():
+    """Return the process-wide ``MlxAudioBackend`` singleton."""
+    global _mlx_audio_backend
+    if _mlx_audio_backend is None:
+        from core.inference.mlx_audio import MlxAudioBackend
+
+        _mlx_audio_backend = MlxAudioBackend()
+    return _mlx_audio_backend
+
+
+def _unload_all_mlx_peers(
+    *,
+    keep: Optional[str] = None,
+) -> None:
+    """Unload all MLX / GGUF peer backends except the one named in *keep*.
+
+    Chunk D peer-unload helper. Registered backends:
+
+    - ``"mlx"``     — :func:`get_mlx_lm_backend`
+    - ``"mlx_vlm"`` — :func:`get_mlx_vlm_backend`
+    - ``"mlx_audio"`` — :func:`get_mlx_audio_backend`
+    - ``"gguf"``    — :func:`get_llama_cpp_backend`
+    - ``"unsloth"`` — :func:`get_inference_backend`
+
+    Per the roadmap (Section 4.6), the peer-unload loop is pulled into
+    a helper here rather than continuing to inline every branch for
+    every new backend. This runs synchronously — callers from async
+    context should still wrap in ``asyncio.to_thread`` when the peer
+    unload is known to be slow (GGUF llama-server teardown is ~1 s
+    worst case).
+    """
+    if keep != "mlx":
+        b = get_mlx_lm_backend()
+        if b.is_loaded:
+            logger.info("Unloading MLX text model (peer-unload)")
+            b.unload_model()
+    if keep != "mlx_vlm":
+        b = get_mlx_vlm_backend()
+        if b.is_loaded:
+            logger.info("Unloading MLX-VLM model (peer-unload)")
+            b.unload_model()
+    if keep != "mlx_audio":
+        b = get_mlx_audio_backend()
+        if b.is_loaded:
+            logger.info("Unloading MLX-Audio model (peer-unload)")
+            b.unload_model()
+    if keep != "gguf":
+        b = get_llama_cpp_backend()
+        if b.is_loaded:
+            logger.info("Unloading GGUF model (peer-unload)")
+            b.unload_model()
+    if keep != "unsloth":
+        b = get_inference_backend()
+        if b.active_model_name:
+            logger.info(
+                f"Unloading Unsloth model '{b.active_model_name}' (peer-unload)"
+            )
+            b.unload_model(b.active_model_name)
+
+
 @router.post("/load", response_model = LoadResponse)
 async def load_model(
     request: LoadRequest,
@@ -243,6 +325,8 @@ async def load_model(
                 # Phase 7: surface speculative-active state even on the
                 # already-loaded path.
                 speculative_type = mlx_backend.speculative_type,
+                # Chunk D: collapsed backend enum.
+                backend_kind = "mlx+lora" if mlx_backend.is_lora else "mlx",
             )
 
         if request.gguf_variant:
@@ -288,6 +372,7 @@ async def load_model(
                     reasoning_always_on = llama_backend.reasoning_always_on,
                     chat_template = llama_backend.chat_template,
                     speculative_type = llama_backend.speculative_type,
+                    backend_kind = "gguf",
                 )
         else:
             if (
@@ -322,6 +407,7 @@ async def load_model(
                         inference_config.get("trust_remote_code", False)
                     ),
                     chat_template = _chat_template,
+                    backend_kind = "unsloth",
                 )
 
         # Create config using clean factory method
@@ -350,19 +436,13 @@ async def load_model(
                 )
 
             llama_backend = get_llama_cpp_backend()
-            unsloth_backend = get_inference_backend()
-            mlx_peer = get_mlx_lm_backend()
 
-            # Unload any active Unsloth model first to free VRAM
-            if unsloth_backend.active_model_name:
-                logger.info(
-                    f"Unloading Unsloth model '{unsloth_backend.active_model_name}' before loading GGUF"
-                )
-                unsloth_backend.unload_model(unsloth_backend.active_model_name)
-            # Unload any active MLX model before loading GGUF (unified mem)
-            if mlx_peer.is_loaded:
-                logger.info("Unloading MLX model before loading GGUF")
-                await asyncio.to_thread(mlx_peer.unload_model)
+            # Chunk D: peer-unload via the shared helper. Unloads Unsloth,
+            # MLX text, MLX-VLM, and MLX-Audio so GGUF gets the full
+            # unified-memory budget.
+            await asyncio.to_thread(
+                _unload_all_mlx_peers, keep = "gguf"
+            )
 
             # Route to HF mode or local mode based on config
             # Run in a thread so the event loop stays free for progress
@@ -444,6 +524,129 @@ async def load_model(
                 cache_type_kv = llama_backend.cache_type_kv,
                 chat_template = llama_backend.chat_template,
                 speculative_type = llama_backend.speculative_type,
+                backend_kind = "gguf",
+            )
+
+        # ── MLX-VLM path: load via mlx_vlm (Apple Silicon only) ────
+        # Phase 9 (Chunk D). Runs BEFORE the ``config.is_mlx`` branch
+        # because a VLM checkpoint can also carry the ``quantization``
+        # block that would otherwise route it through ``MlxLmBackend``.
+        if config.is_mlx_vlm:
+            if effective_gpu_ids is not None:
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "gpu_ids is not supported for MLX-VLM models.",
+                )
+            mlx_vlm_backend = get_mlx_vlm_backend()
+
+            # Unload every other peer — VLM consumes unified memory
+            # alongside the visual encoder.
+            await asyncio.to_thread(
+                _unload_all_mlx_peers, keep = "mlx_vlm"
+            )
+
+            success = await asyncio.to_thread(
+                mlx_vlm_backend.load_model,
+                local_path = config.mlx_vlm_path or config.path,
+                model_identifier = config.identifier,
+                hf_token = request.hf_token,
+                n_ctx = request.max_seq_length,
+            )
+            if not success:
+                raise HTTPException(
+                    status_code = 500,
+                    detail = f"Failed to load MLX-VLM model: {config.display_name}",
+                )
+
+            logger.info(f"Loaded MLX-VLM model via mlx_vlm: {config.identifier}")
+            inference_config = load_inference_config(config.identifier)
+
+            return LoadResponse(
+                status = "loaded",
+                model = config.identifier,
+                display_name = config.display_name,
+                is_vision = True,
+                is_lora = False,
+                is_gguf = False,
+                is_mlx = False,
+                is_mlx_vlm = True,
+                is_mlx_lora = False,
+                is_audio = False,
+                audio_type = None,
+                has_audio_input = False,
+                inference = inference_config,
+                requires_trust_remote_code = bool(
+                    inference_config.get("trust_remote_code", False)
+                ),
+                context_length = mlx_vlm_backend.context_length,
+                max_context_length = mlx_vlm_backend.max_context_length,
+                native_context_length = mlx_vlm_backend.native_context_length,
+                supports_reasoning = mlx_vlm_backend.supports_reasoning,
+                reasoning_always_on = mlx_vlm_backend.reasoning_always_on,
+                supports_tools = mlx_vlm_backend.supports_tools,
+                cache_type_kv = mlx_vlm_backend.cache_type_kv,
+                chat_template = mlx_vlm_backend.chat_template,
+                speculative_type = mlx_vlm_backend.speculative_type,
+                backend_kind = "mlx+vlm",
+            )
+
+        # ── MLX-Audio path: load via mlx_audio (Apple Silicon only) ─
+        # Phase 10 (Chunk D). Runs BEFORE the ``config.is_mlx`` branch.
+        if config.is_mlx_audio:
+            if effective_gpu_ids is not None:
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "gpu_ids is not supported for MLX-Audio models.",
+                )
+            mlx_audio_backend = get_mlx_audio_backend()
+
+            await asyncio.to_thread(
+                _unload_all_mlx_peers, keep = "mlx_audio"
+            )
+
+            success = await asyncio.to_thread(
+                mlx_audio_backend.load_model,
+                local_path = config.mlx_audio_path or config.path,
+                model_identifier = config.identifier,
+                hf_token = request.hf_token,
+            )
+            if not success:
+                raise HTTPException(
+                    status_code = 500,
+                    detail = f"Failed to load MLX-Audio model: {config.display_name}",
+                )
+
+            logger.info(f"Loaded MLX-Audio model via mlx_audio: {config.identifier}")
+            inference_config = load_inference_config(config.identifier)
+
+            _audio_caps = mlx_audio_backend.detect_audio_type()
+
+            return LoadResponse(
+                status = "loaded",
+                model = config.identifier,
+                display_name = config.display_name,
+                is_vision = False,
+                is_lora = False,
+                is_gguf = False,
+                is_mlx = False,
+                is_mlx_vlm = False,
+                is_mlx_audio = True,
+                is_mlx_lora = False,
+                is_audio = True,
+                audio_type = _audio_caps,
+                has_audio_input = mlx_audio_backend.has_audio_input,
+                inference = inference_config,
+                requires_trust_remote_code = False,
+                context_length = mlx_audio_backend.context_length,
+                max_context_length = mlx_audio_backend.context_length,
+                native_context_length = mlx_audio_backend.context_length,
+                supports_reasoning = False,
+                reasoning_always_on = False,
+                supports_tools = False,
+                cache_type_kv = None,
+                chat_template = None,
+                speculative_type = None,
+                backend_kind = "mlx+audio",
             )
 
         # ── MLX path: load via mlx_lm (Apple Silicon only) ─────────
@@ -455,17 +658,13 @@ async def load_model(
                 )
 
             mlx_backend = get_mlx_lm_backend()
-            unsloth_backend = get_inference_backend()
 
-            # Unload any active peer backends first (mirrors GGUF behavior).
-            if unsloth_backend.active_model_name:
-                logger.info(
-                    f"Unloading Unsloth model '{unsloth_backend.active_model_name}' before loading MLX"
-                )
-                unsloth_backend.unload_model(unsloth_backend.active_model_name)
-            if llama_backend.is_loaded:
-                logger.info("Unloading GGUF model before loading MLX model")
-                await asyncio.to_thread(llama_backend.unload_model)
+            # Chunk D: peer-unload via the shared helper. Unloads GGUF,
+            # Unsloth, MLX-VLM, and MLX-Audio — whichever happens to be
+            # loaded — in one pass.
+            await asyncio.to_thread(
+                _unload_all_mlx_peers, keep = "mlx"
+            )
 
             # Phase 6 — an explicit request.adapter_path wins over the
             # ModelConfig-derived one (e.g. when the user points at a
@@ -529,22 +728,19 @@ async def load_model(
                 chat_template = mlx_backend.chat_template,
                 # Phase 7: "mlx-draft-model" when a draft was loaded, else None.
                 speculative_type = mlx_backend.speculative_type,
+                # Chunk D: collapsed backend enum.
+                backend_kind = "mlx+lora" if mlx_backend.is_lora else "mlx",
             )
 
         # ── Standard path: load via Unsloth/transformers ──────────
         backend = get_inference_backend()
 
-        # Unload any active GGUF model first
-        llama_backend = get_llama_cpp_backend()
-        if llama_backend.is_loaded:
-            logger.info("Unloading GGUF model before loading Unsloth model")
-            llama_backend.unload_model()
-
-        # Unload any active MLX model first
-        mlx_backend_peer = get_mlx_lm_backend()
-        if mlx_backend_peer.is_loaded:
-            logger.info("Unloading MLX model before loading Unsloth model")
-            await asyncio.to_thread(mlx_backend_peer.unload_model)
+        # Chunk D: peer-unload via the shared helper. Unloads GGUF,
+        # MLX text, MLX-VLM, and MLX-Audio so the Unsloth/transformers
+        # load gets the full unified-memory budget.
+        await asyncio.to_thread(
+            _unload_all_mlx_peers, keep = "unsloth"
+        )
 
         # Shut down any export subprocess to free VRAM
         try:
@@ -668,6 +864,7 @@ async def load_model(
                 inference_config.get("trust_remote_code", False)
             ),
             chat_template = _chat_template,
+            backend_kind = "unsloth",
         )
 
     except HTTPException:
