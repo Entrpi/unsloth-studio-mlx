@@ -10,7 +10,16 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File as FastAPIFile,
+    Form as FastAPIForm,
+    HTTPException,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from typing import Optional
 import json
@@ -1342,9 +1351,19 @@ async def generate_audio(
         raise HTTPException(status_code = 400, detail = "No user message found.")
     text = last_user_msg["content"]
 
-    # Pick backend — both return (wav_bytes, sample_rate)
+    # Pick backend — all return (wav_bytes, sample_rate)
     llama_backend = get_llama_cpp_backend()
-    if llama_backend.is_loaded and getattr(llama_backend, "_is_audio", False):
+    # Chunk D (Phase 10): MLX audio peer.
+    mlx_audio_backend = get_mlx_audio_backend()
+    if mlx_audio_backend.is_loaded:
+        model_name = mlx_audio_backend.model_identifier
+        gen = lambda: mlx_audio_backend.generate_tts(
+            text = text,
+            max_new_tokens = payload.max_tokens or 2048,
+            temperature = payload.temperature or 0.7,
+            top_k = payload.top_k or 50,
+        )
+    elif llama_backend.is_loaded and getattr(llama_backend, "_is_audio", False):
         model_name = llama_backend.model_identifier
         gen = lambda: llama_backend.generate_audio_response(
             text = text,
@@ -1403,6 +1422,175 @@ async def generate_audio(
                 }
             ],
         }
+    )
+
+
+# =====================================================================
+# OpenAI-Compatible TTS + ASR  (Phase 10 / Chunk D)
+# =====================================================================
+# OpenAI's public API exposes two audio endpoints:
+#   POST /v1/audio/speech          — body: {model, input, voice, response_format}
+#                                     returns: raw audio bytes (default mp3).
+#   POST /v1/audio/transcriptions  — multipart: file (audio), model, prompt...
+#                                     returns: {"text": "..."} (default json).
+# We implement both against the MLX audio backend. When no MLX audio
+# model is loaded we fall through to the GGUF / Unsloth audio paths
+# that already exist in Studio via ``/audio/generate``. The new
+# endpoints live on ``/audio/speech`` and ``/audio/transcriptions``
+# so they're reachable at ``/v1/audio/speech`` /
+# ``/v1/audio/transcriptions`` (OpenAI shape) AND
+# ``/api/inference/audio/speech`` / ``.../transcriptions`` (Studio
+# internal).
+
+
+from pydantic import BaseModel as _OpenAIBaseModel, Field as _OpenAIField
+
+
+class _OpenAITtsRequest(_OpenAIBaseModel):
+    """Subset of OpenAI's /v1/audio/speech request body.
+
+    Unknown fields are accepted silently via ``model_config = ConfigDict(
+    extra='allow')`` so future OpenAI-shape fields (voice, speed…) land
+    without a 422.
+    """
+
+    model: Optional[str] = _OpenAIField(None, description = "Model name (ignored; uses the active MLX audio checkpoint)")
+    input: str = _OpenAIField(..., description = "Text to synthesize")
+    voice: Optional[str] = _OpenAIField(None, description = "Voice identifier (currently ignored — LFM2.5-Audio uses a single default voice)")
+    response_format: Optional[str] = _OpenAIField(
+        "wav",
+        description = "Output format: 'wav' | 'mp3'. MP3 falls through to WAV when mp3 encoding is unavailable.",
+    )
+    speed: Optional[float] = _OpenAIField(None, description = "Speech rate (currently ignored)")
+
+
+@router.post("/audio/speech")
+async def openai_audio_speech(
+    payload: _OpenAITtsRequest,
+    current_subject: str = Depends(get_current_subject),
+):
+    """OpenAI-compatible TTS endpoint. Returns raw audio bytes.
+
+    Dispatch order:
+    1. MLX audio backend (Phase 10 / Chunk D) when loaded.
+    2. GGUF audio backend when an audio-capable GGUF model is loaded.
+    3. Unsloth TTS fallback.
+
+    The return body is raw audio (not JSON), matching OpenAI's shape.
+    """
+    mlx_audio_backend = get_mlx_audio_backend()
+    llama_backend = get_llama_cpp_backend()
+
+    if mlx_audio_backend.is_loaded:
+        loop = asyncio.get_event_loop()
+        try:
+            wav_bytes, _sr = await loop.run_in_executor(
+                None,
+                mlx_audio_backend.generate_tts,
+                payload.input,
+            )
+        except Exception as e:
+            logger.error(f"MLX-Audio TTS error: {e}", exc_info = True)
+            raise HTTPException(status_code = 500, detail = str(e))
+        return Response(content = wav_bytes, media_type = "audio/wav")
+
+    if llama_backend.is_loaded and getattr(llama_backend, "_is_audio", False):
+        # Defer to the GGUF-shaped helper by synthesizing a
+        # ChatCompletionRequest-like object.
+        loop = asyncio.get_event_loop()
+        try:
+            wav_bytes, _sr = await loop.run_in_executor(
+                None,
+                lambda: llama_backend.generate_audio_response(
+                    text = payload.input,
+                    audio_type = llama_backend._audio_type,
+                ),
+            )
+        except Exception as e:
+            logger.error(f"GGUF TTS error: {e}", exc_info = True)
+            raise HTTPException(status_code = 500, detail = str(e))
+        return Response(content = wav_bytes, media_type = "audio/wav")
+
+    # Unsloth / transformers TTS fallback.
+    backend = get_inference_backend()
+    if backend.active_model_name and backend.models.get(
+        backend.active_model_name, {}
+    ).get("is_audio"):
+        try:
+            wav_bytes, _sr = backend.generate_audio_response(text = payload.input)
+        except Exception as e:
+            logger.error(f"Unsloth TTS error: {e}", exc_info = True)
+            raise HTTPException(status_code = 500, detail = str(e))
+        return Response(content = wav_bytes, media_type = "audio/wav")
+
+    raise HTTPException(
+        status_code = 400,
+        detail = "No audio-capable model is loaded. Load an MLX-Audio / GGUF-audio / Unsloth-audio checkpoint first.",
+    )
+
+
+@router.post("/audio/transcriptions")
+async def openai_audio_transcriptions(
+    file: "UploadFile" = FastAPIFile(...),
+    model: Optional[str] = FastAPIForm(None),
+    prompt: Optional[str] = FastAPIForm(None),
+    language: Optional[str] = FastAPIForm(None),
+    response_format: Optional[str] = FastAPIForm("json"),
+    temperature: Optional[float] = FastAPIForm(None),
+    current_subject: str = Depends(get_current_subject),
+):
+    """OpenAI-compatible ASR endpoint. Multipart file upload.
+
+    Dispatch order:
+    1. MLX audio backend (Phase 10 / Chunk D) when loaded and it
+       advertises ``has_audio_input``. Best-effort — LFM2.5-Audio is a
+       voice assistant, not a dedicated ASR (see PROBE_RESULTS.md).
+    2. GGUF audio backend when loaded.
+    3. Unsloth Whisper / audio-input fallback.
+
+    Returns JSON ``{"text": "..."}`` by default.
+    """
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code = 400, detail = "No audio data in upload.")
+
+    mlx_audio_backend = get_mlx_audio_backend()
+
+    if mlx_audio_backend.is_loaded and mlx_audio_backend.has_audio_input:
+        loop = asyncio.get_event_loop()
+        try:
+            text = await loop.run_in_executor(
+                None,
+                lambda: mlx_audio_backend.transcribe(
+                    audio_bytes,
+                    prompt = prompt or "Please transcribe the audio.",
+                    temperature = temperature or 0.0,
+                ),
+            )
+        except Exception as e:
+            logger.error(f"MLX-Audio transcribe error: {e}", exc_info = True)
+            raise HTTPException(status_code = 500, detail = str(e))
+        return JSONResponse(content = {"text": text})
+
+    # Fallback — Unsloth whisper-style audio input path.
+    backend = get_inference_backend()
+    if backend.active_model_name:
+        model_info = backend.models.get(backend.active_model_name, {})
+        if model_info.get("audio_type") == "whisper" or model_info.get(
+            "has_audio_input"
+        ):
+            # Reuse the /v1/audio/transcriptions Unsloth path via the
+            # chat-completions audio_base64 branch — it decodes,
+            # transcribes, and returns text.
+            arr = _decode_audio_base64(base64.b64encode(audio_bytes).decode("ascii"))
+            text = ""
+            for chunk in backend.generate_whisper_response(audio_array = arr):
+                text += chunk or ""
+            return JSONResponse(content = {"text": text})
+
+    raise HTTPException(
+        status_code = 400,
+        detail = "No ASR-capable model is loaded. Load an MLX-Audio, GGUF-audio, or Whisper checkpoint first.",
     )
 
 
@@ -1590,11 +1778,43 @@ async def openai_chat_completions(
         model_name = vlm_backend.model_identifier or payload.model
     elif using_mlx_audio:
         model_name = audio_backend.model_identifier or payload.model
+        # Audio-in path: when the caller supplies ``audio_base64`` the
+        # MLX audio backend runs a best-effort transcription. We return
+        # an OpenAI-shape chat completion with the transcribed text
+        # so chat clients get a recognizable response.
+        if payload.audio_base64:
+            loop = asyncio.get_event_loop()
+            raw = base64.b64decode(payload.audio_base64)
+            try:
+                text = await loop.run_in_executor(
+                    None,
+                    lambda: audio_backend.transcribe(
+                        raw,
+                        prompt = None,
+                        temperature = payload.temperature or 0.0,
+                    ),
+                )
+            except Exception as e:
+                logger.error(f"MLX-Audio transcribe error: {e}", exc_info = True)
+                raise HTTPException(status_code = 500, detail = str(e))
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            response = ChatCompletion(
+                id = completion_id,
+                created = int(time.time()),
+                model = model_name,
+                choices = [
+                    CompletionChoice(
+                        message = CompletionMessage(content = text),
+                        finish_reason = "stop",
+                    )
+                ],
+            )
+            return JSONResponse(
+                content = response.model_dump(exclude_none = True)
+            )
         # TTS path: route to /audio/generate for the OpenAI-style
-        # JSON response. ASR / audio-input is handled below via the
-        # ``payload.audio_base64`` branch.
-        if not payload.audio_base64:
-            return await generate_audio(payload, request)
+        # JSON response.
+        return await generate_audio(payload, request)
     elif using_mlx:
         model_name = mlx_backend.model_identifier or payload.model
     else:
