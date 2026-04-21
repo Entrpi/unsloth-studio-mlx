@@ -966,6 +966,24 @@ async def unload_model(
             logger.info(f"Unloaded MLX model: {request.model_path}")
             return UnloadResponse(status = "unloaded", model = request.model_path)
 
+        # Chunk D: check the MLX-VLM peer.
+        mlx_vlm_backend = get_mlx_vlm_backend()
+        if mlx_vlm_backend.is_loaded and (
+            mlx_vlm_backend.model_identifier == request.model_path
+        ):
+            await asyncio.to_thread(mlx_vlm_backend.unload_model)
+            logger.info(f"Unloaded MLX-VLM model: {request.model_path}")
+            return UnloadResponse(status = "unloaded", model = request.model_path)
+
+        # Chunk D: check the MLX-Audio peer.
+        mlx_audio_backend = get_mlx_audio_backend()
+        if mlx_audio_backend.is_loaded and (
+            mlx_audio_backend.model_identifier == request.model_path
+        ):
+            await asyncio.to_thread(mlx_audio_backend.unload_model)
+            logger.info(f"Unloaded MLX-Audio model: {request.model_path}")
+            return UnloadResponse(status = "unloaded", model = request.model_path)
+
         # Otherwise, unload from Unsloth backend
         backend = get_inference_backend()
         backend.unload_model(request.model_path)
@@ -1062,6 +1080,67 @@ async def get_status(
     try:
         llama_backend = get_llama_cpp_backend()
         mlx_backend = get_mlx_lm_backend()
+        mlx_vlm_backend = get_mlx_vlm_backend()
+        mlx_audio_backend = get_mlx_audio_backend()
+
+        # Chunk D — MLX-VLM peer has precedence over plain MLX so a
+        # vision chat reports ``is_mlx_vlm=True`` even if someone had a
+        # text MLX model loaded earlier (shouldn't happen because
+        # peer-unload is mandatory, but defensive).
+        if mlx_vlm_backend.is_loaded:
+            _vlm_id = mlx_vlm_backend.model_identifier
+            _inf_cfg = load_inference_config(_vlm_id) if _vlm_id else None
+            return InferenceStatusResponse(
+                active_model = _vlm_id,
+                is_vision = True,
+                is_gguf = False,
+                is_mlx = False,
+                is_mlx_vlm = True,
+                is_audio = False,
+                audio_type = None,
+                has_audio_input = False,
+                loading = [],
+                loaded = [_vlm_id] if _vlm_id else [],
+                inference = _inf_cfg,
+                requires_trust_remote_code = bool(
+                    (_inf_cfg or {}).get("trust_remote_code", False)
+                ),
+                supports_reasoning = mlx_vlm_backend.supports_reasoning,
+                reasoning_always_on = mlx_vlm_backend.reasoning_always_on,
+                supports_tools = mlx_vlm_backend.supports_tools,
+                context_length = mlx_vlm_backend.context_length,
+                max_context_length = mlx_vlm_backend.max_context_length,
+                native_context_length = mlx_vlm_backend.native_context_length,
+                speculative_type = None,
+                backend_kind = "mlx+vlm",
+            )
+
+        # Chunk D — MLX-Audio peer status.
+        if mlx_audio_backend.is_loaded:
+            _aid = mlx_audio_backend.model_identifier
+            _inf_cfg = load_inference_config(_aid) if _aid else None
+            return InferenceStatusResponse(
+                active_model = _aid,
+                is_vision = False,
+                is_gguf = False,
+                is_mlx = False,
+                is_mlx_audio = True,
+                is_audio = True,
+                audio_type = mlx_audio_backend.detect_audio_type(),
+                has_audio_input = mlx_audio_backend.has_audio_input,
+                loading = [],
+                loaded = [_aid] if _aid else [],
+                inference = _inf_cfg,
+                requires_trust_remote_code = False,
+                supports_reasoning = False,
+                reasoning_always_on = False,
+                supports_tools = False,
+                context_length = mlx_audio_backend.context_length,
+                max_context_length = mlx_audio_backend.context_length,
+                native_context_length = mlx_audio_backend.context_length,
+                speculative_type = None,
+                backend_kind = "mlx+audio",
+            )
 
         # If an MLX model is loaded, report that first (it is mutually
         # exclusive with the GGUF backend but we check it first because
@@ -1098,6 +1177,8 @@ async def get_status(
                 # Phase 7: surface "mlx-draft-model" in status so the UI
                 # can reflect the active speculative mode.
                 speculative_type = mlx_backend.speculative_type,
+                # Chunk D: collapsed backend enum.
+                backend_kind = "mlx+lora" if mlx_backend.is_lora else "mlx",
             )
 
         # If a GGUF model is loaded via llama-server, report that
@@ -1124,6 +1205,7 @@ async def get_status(
                 max_context_length = llama_backend.max_context_length,
                 native_context_length = llama_backend.native_context_length,
                 speculative_type = llama_backend.speculative_type,
+                backend_kind = "gguf",
             )
 
         # Otherwise, report Unsloth backend status
@@ -1164,6 +1246,7 @@ async def get_status(
                 (inference_config or {}).get("trust_remote_code", False)
             ),
             supports_reasoning = supports_reasoning,
+            backend_kind = "unsloth" if backend.active_model_name else None,
         )
 
     except Exception as e:
@@ -1195,7 +1278,7 @@ async def get_load_progress(
         # route unloads the other peer before starting a new load.
         mlx_backend = get_mlx_lm_backend()
         mlx_progress = mlx_backend.load_progress()
-        if mlx_progress is not None:
+        if mlx_progress is not None and mlx_progress.get("phase") is not None:
             # Strip MLX-only "warnings" key before handing to the
             # GGUF-shaped response model — the GGUF schema has no
             # warnings field and we don't want to break existing
@@ -1207,6 +1290,18 @@ async def get_load_progress(
                 if k in ("phase", "bytes_loaded", "bytes_total", "fraction")
             }
             return LoadProgressResponse(**filtered)
+
+        # Chunk D — check the MLX-VLM / MLX-Audio peers.
+        for peer in (get_mlx_vlm_backend(), get_mlx_audio_backend()):
+            if hasattr(peer, "load_progress"):
+                prog = peer.load_progress()
+                if prog and prog.get("phase") is not None:
+                    filtered = {
+                        k: v
+                        for k, v in prog.items()
+                        if k in ("phase", "bytes_loaded", "bytes_total", "fraction")
+                    }
+                    return LoadProgressResponse(**filtered)
 
         llama_backend = get_llama_cpp_backend()
         progress = llama_backend.load_progress()
@@ -1477,13 +1572,28 @@ async def openai_chat_completions(
     """
     llama_backend = get_llama_cpp_backend()
     mlx_backend = get_mlx_lm_backend()
+    # Chunk D peers.
+    vlm_backend = get_mlx_vlm_backend()
+    audio_backend = get_mlx_audio_backend()
+
     using_gguf = llama_backend.is_loaded
     using_mlx = mlx_backend.is_loaded
+    using_vlm = vlm_backend.is_loaded
+    using_mlx_audio = audio_backend.is_loaded
 
     # ── Determine which backend is active ─────────────────────
     if using_gguf:
         model_name = llama_backend.model_identifier or payload.model
         if getattr(llama_backend, "_is_audio", False):
+            return await generate_audio(payload, request)
+    elif using_vlm:
+        model_name = vlm_backend.model_identifier or payload.model
+    elif using_mlx_audio:
+        model_name = audio_backend.model_identifier or payload.model
+        # TTS path: route to /audio/generate for the OpenAI-style
+        # JSON response. ASR / audio-input is handled below via the
+        # ``payload.audio_base64`` branch.
+        if not payload.audio_base64:
             return await generate_audio(payload, request)
     elif using_mlx:
         model_name = mlx_backend.model_identifier or payload.model
@@ -2134,14 +2244,172 @@ async def openai_chat_completions(
                 logger.error(f"Error during GGUF completion: {e}", exc_info = True)
                 raise HTTPException(status_code = 500, detail = str(e))
 
+    # ── MLX-VLM path: stream via mlx_vlm.stream_generate ──────
+    # Phase 9 (Chunk D). Image-bearing multimodal chats route here.
+    if using_vlm:
+        image_b64 = extracted_image_b64 or payload.image_base64
+
+        # Build message list with system prompt prepended. VLM models
+        # don't support Studio's built-in tool-agentic loop yet (Phase 9
+        # non-goal); tool_calls passthrough from clients is accepted
+        # but the content/parsing is done client-side.
+        vlm_messages: List[Dict[str, Any]] = []
+        if system_prompt:
+            vlm_messages.append({"role": "system", "content": system_prompt})
+        vlm_messages.extend(chat_messages)
+
+        cancel_event = threading.Event()
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+
+        _vlm_stop: Optional[list[str]] = None
+        if payload.stop is not None:
+            if isinstance(payload.stop, str):
+                _vlm_stop = [payload.stop]
+            elif isinstance(payload.stop, list):
+                _vlm_stop = [s for s in payload.stop if isinstance(s, str) and s]
+
+        def vlm_generate():
+            return vlm_backend.generate_chat_completion(
+                messages = vlm_messages,
+                image_b64 = image_b64,
+                temperature = payload.temperature,
+                top_p = payload.top_p,
+                top_k = payload.top_k,
+                min_p = payload.min_p,
+                max_tokens = payload.max_tokens,
+                repetition_penalty = payload.repetition_penalty,
+                presence_penalty = payload.presence_penalty,
+                stop = _vlm_stop,
+                cancel_event = cancel_event,
+                enable_thinking = payload.enable_thinking,
+            )
+
+        _vlm_sentinel = object()
+
+        if payload.stream:
+
+            async def vlm_stream_chunks():
+                try:
+                    first_chunk = ChatCompletionChunk(
+                        id = completion_id,
+                        created = created,
+                        model = model_name,
+                        choices = [
+                            ChunkChoice(
+                                delta = ChoiceDelta(role = "assistant"),
+                                finish_reason = None,
+                            )
+                        ],
+                    )
+                    yield f"data: {first_chunk.model_dump_json(exclude_none = True)}\n\n"
+
+                    gen = vlm_generate()
+                    prev_text = ""
+                    _vlm_usage = None
+                    _vlm_timings = None
+                    _vlm_finish = "stop"
+                    while True:
+                        if await request.is_disconnected():
+                            cancel_event.set()
+                            break
+                        chunk = await asyncio.to_thread(
+                            next, gen, _vlm_sentinel
+                        )
+                        if chunk is _vlm_sentinel:
+                            break
+                        if isinstance(chunk, dict) and chunk.get("type") == "metadata":
+                            _vlm_usage = chunk.get("usage")
+                            _vlm_timings = chunk.get("timings")
+                            _vlm_finish = chunk.get("finish_reason") or "stop"
+                            continue
+                        if isinstance(chunk, str):
+                            delta = chunk[len(prev_text):]
+                            prev_text = chunk
+                            if delta:
+                                out = ChatCompletionChunk(
+                                    id = completion_id,
+                                    created = created,
+                                    model = model_name,
+                                    choices = [
+                                        ChunkChoice(
+                                            delta = ChoiceDelta(content = delta),
+                                            finish_reason = None,
+                                        )
+                                    ],
+                                )
+                                yield f"data: {out.model_dump_json(exclude_none = True)}\n\n"
+                    final_chunk = ChatCompletionChunk(
+                        id = completion_id,
+                        created = created,
+                        model = model_name,
+                        choices = [
+                            ChunkChoice(
+                                delta = ChoiceDelta(),
+                                finish_reason = _vlm_finish,
+                            )
+                        ],
+                    )
+                    yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
+                    yield "data: [DONE]\n\n"
+                except asyncio.CancelledError:
+                    cancel_event.set()
+                    raise
+                except Exception as e:
+                    logger.error(
+                        f"Error during MLX-VLM streaming: {e}", exc_info = True
+                    )
+                    yield f"data: {json.dumps({'error': {'message': _friendly_error(e), 'type': 'server_error'}})}\n\n"
+
+            return StreamingResponse(
+                vlm_stream_chunks(),
+                media_type = "text/event-stream",
+                headers = {
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        else:
+            # Non-streaming: accumulate then return one JSON body.
+            full_text = ""
+            usage: Optional[dict] = None
+            _finish = "stop"
+            try:
+                for chunk in vlm_generate():
+                    if isinstance(chunk, dict) and chunk.get("type") == "metadata":
+                        usage = chunk.get("usage")
+                        _finish = chunk.get("finish_reason") or "stop"
+                        continue
+                    if isinstance(chunk, str):
+                        full_text = chunk
+            except Exception as e:
+                logger.error(f"MLX-VLM non-stream error: {e}", exc_info = True)
+                raise HTTPException(status_code = 500, detail = str(e))
+            response = ChatCompletion(
+                id = completion_id,
+                created = created,
+                model = model_name,
+                choices = [
+                    CompletionChoice(
+                        message = CompletionMessage(content = full_text),
+                        finish_reason = _finish,
+                    )
+                ],
+                usage = usage,
+            )
+            return JSONResponse(content = response.model_dump(exclude_none = True))
+
     # ── MLX path: stream via mlx_lm.stream_generate ───────────
     if using_mlx:
-        # Reject images: MLX has no vision backend yet (Phase 9).
+        # Reject images: MLX text backend has no vision support. The
+        # vision-bearing chats are handled by the ``using_vlm`` branch
+        # above — this is the text-only MLX path.
         image_b64 = extracted_image_b64 or payload.image_base64
         if image_b64:
             raise HTTPException(
                 status_code = 400,
-                detail = "MLX backend does not support image inputs in this build.",
+                detail = "MLX text backend does not support image inputs. Load a VLM checkpoint instead.",
             )
 
         # Tool-calling: three possible paths, identical to the GGUF branch.
