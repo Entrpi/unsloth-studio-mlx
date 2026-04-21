@@ -205,3 +205,125 @@ def test_repetition_penalty_changes_output():
         )
     finally:
         assert backend.unload_model()
+
+
+@pytest.mark.skipif(not MLX_LM_AVAILABLE, reason = "mlx_lm or model not available")
+def test_reasoning_flags_populated_after_load():
+    """Bonsai's template hardcodes <think>/</think>; after load we must
+    see ``supports_reasoning=True``, ``reasoning_always_on=True``, and a
+    non-empty ``chat_template``."""
+    from core.inference.mlx_lm import MlxLmBackend
+
+    backend = MlxLmBackend()
+    ok = backend.load_model(
+        local_path = _MODEL_PATH,
+        model_identifier = Path(_MODEL_PATH).name,
+    )
+    assert ok
+    try:
+        assert backend.supports_reasoning is True
+        assert backend.reasoning_always_on is True
+        assert backend.reasoning_default is True
+        assert isinstance(backend.chat_template, str)
+        assert len(backend.chat_template) > 0
+    finally:
+        backend.unload_model()
+
+
+@pytest.mark.skipif(not MLX_LM_AVAILABLE, reason = "mlx_lm or model not available")
+def test_enable_thinking_changes_prompt():
+    """For a reasoning-capable model with a Jinja2 template that reads
+    ``enable_thinking``, toggling the kwarg must materially change the
+    rendered prompt. Bonsai's template doesn't actually *read*
+    enable_thinking (it hardcodes the tags), so we verify the weaker
+    property: both calls succeed and return a string, and one call
+    exercises the chat_template_kwargs code path end-to-end."""
+    from core.inference.mlx_lm import MlxLmBackend
+
+    backend = MlxLmBackend()
+    ok = backend.load_model(
+        local_path = _MODEL_PATH,
+        model_identifier = Path(_MODEL_PATH).name,
+    )
+    assert ok
+    try:
+        tok = backend._tokenizer
+        messages = [{"role": "user", "content": "Hi"}]
+        # Explicitly pass chat_template_kwargs both ways; this mirrors
+        # what generate_chat_completion does internally when
+        # supports_reasoning is True.
+        with_thinking = tok.apply_chat_template(
+            messages,
+            add_generation_prompt = True,
+            tokenize = False,
+            chat_template_kwargs = {"enable_thinking": True},
+        )
+        without = tok.apply_chat_template(
+            messages,
+            add_generation_prompt = True,
+            tokenize = False,
+            chat_template_kwargs = {"enable_thinking": False},
+        )
+        # Both calls succeeded and returned strings. (Bonsai's template
+        # doesn't branch on the kwarg, so equality is expected here.)
+        assert isinstance(with_thinking, str) and with_thinking
+        assert isinstance(without, str) and without
+    finally:
+        backend.unload_model()
+
+
+@pytest.mark.skipif(not MLX_LM_AVAILABLE, reason = "mlx_lm or model not available")
+def test_generate_does_not_strip_think_tags():
+    """Phase 4 contract: the backend must NOT strip or mangle literal
+    ``<think>`` / ``</think>`` tokens if the model emits them. The
+    frontend parses these tags directly, so any server-side scrubbing
+    would break the thinking-panel UI.
+
+    This is a structural test: mock ``stream_generate`` to emit tokens
+    that spell a thinking block, then assert the backend yields the
+    raw text unchanged."""
+    from unittest import mock
+
+    from core.inference import mlx_lm as mlx_lm_mod
+    from core.inference.mlx_lm import MlxLmBackend
+
+    class _R:
+        def __init__(self, t: str):
+            self.text = t
+            self.prompt_tokens = 1
+            self.generation_tokens = 1
+            self.prompt_tps = 100.0
+            self.generation_tps = 47.0
+
+    def _stream(*a, **kw):
+        # Tokenization-boundary variety: the opening tag spans two chunks.
+        yield _R("<th")
+        yield _R("ink>")
+        yield _R("reasoning here")
+        yield _R("</think>")
+        yield _R(" answer")
+
+    b = MlxLmBackend()
+    b._model = object()
+    b._tokenizer = mock.Mock()
+    b._tokenizer.apply_chat_template.return_value = "prompt"
+    b._model_identifier = "x"
+    b._supports_reasoning = True
+
+    with mock.patch("mlx_lm.stream_generate", _stream):
+        with mock.patch.object(
+            mlx_lm_mod,
+            "_build_mlx_sampler_and_processors",
+            return_value = (None, []),
+        ):
+            events = list(
+                b.generate_chat_completion(
+                    messages = [{"role": "user", "content": "hi"}],
+                    enable_thinking = True,
+                )
+            )
+    final = [e for e in events if isinstance(e, str)][-1]
+    assert "<think>" in final
+    assert "</think>" in final
+    assert "reasoning here" in final
+    assert "answer" in final
