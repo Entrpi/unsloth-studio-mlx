@@ -1129,13 +1129,17 @@ async def openai_chat_completions(
     - Other models → Unsloth/transformers via InferenceBackend
     """
     llama_backend = get_llama_cpp_backend()
+    mlx_backend = get_mlx_lm_backend()
     using_gguf = llama_backend.is_loaded
+    using_mlx = mlx_backend.is_loaded
 
     # ── Determine which backend is active ─────────────────────
     if using_gguf:
         model_name = llama_backend.model_identifier or payload.model
         if getattr(llama_backend, "_is_audio", False):
             return await generate_audio(payload, request)
+    elif using_mlx:
+        model_name = mlx_backend.model_identifier or payload.model
     else:
         backend = get_inference_backend()
         if not backend.active_model_name:
@@ -1781,6 +1785,187 @@ async def openai_chat_completions(
 
             except Exception as e:
                 logger.error(f"Error during GGUF completion: {e}", exc_info = True)
+                raise HTTPException(status_code = 500, detail = str(e))
+
+    # ── MLX path: stream via mlx_lm.stream_generate ───────────
+    if using_mlx:
+        # Reject images and tool calling: Phase 1 does not support them.
+        image_b64 = extracted_image_b64 or payload.image_base64
+        if image_b64:
+            raise HTTPException(
+                status_code = 400,
+                detail = "MLX backend does not support image inputs in Phase 1.",
+            )
+        if payload.enable_tools or (payload.tools and len(payload.tools) > 0):
+            raise HTTPException(
+                status_code = 400,
+                detail = "MLX backend does not support tool calling in Phase 1.",
+            )
+
+        # Build message list with system prompt prepended.
+        mlx_messages: list[dict] = []
+        if system_prompt:
+            mlx_messages.append({"role": "system", "content": system_prompt})
+        mlx_messages.extend(chat_messages)
+
+        cancel_event = threading.Event()
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+
+        def mlx_generate():
+            return mlx_backend.generate_chat_completion(
+                messages = mlx_messages,
+                temperature = payload.temperature,
+                top_p = payload.top_p,
+                top_k = payload.top_k,
+                min_p = payload.min_p,
+                max_tokens = payload.max_tokens,
+                repetition_penalty = payload.repetition_penalty,
+                presence_penalty = payload.presence_penalty,
+                cancel_event = cancel_event,
+                enable_thinking = payload.enable_thinking,
+            )
+
+        _mlx_sentinel = object()
+
+        if payload.stream:
+
+            async def mlx_stream_chunks():
+                try:
+                    # First chunk: role
+                    first_chunk = ChatCompletionChunk(
+                        id = completion_id,
+                        created = created,
+                        model = model_name,
+                        choices = [
+                            ChunkChoice(
+                                delta = ChoiceDelta(role = "assistant"),
+                                finish_reason = None,
+                            )
+                        ],
+                    )
+                    yield f"data: {first_chunk.model_dump_json(exclude_none = True)}\n\n"
+
+                    gen = mlx_generate()
+                    prev_text = ""
+                    _stream_usage = None
+                    _stream_timings = None
+                    while True:
+                        if await request.is_disconnected():
+                            cancel_event.set()
+                            return
+                        cumulative = await asyncio.to_thread(
+                            next, gen, _mlx_sentinel
+                        )
+                        if cumulative is _mlx_sentinel:
+                            break
+                        if isinstance(cumulative, dict):
+                            if cumulative.get("type") == "metadata":
+                                _stream_usage = cumulative.get("usage")
+                                _stream_timings = cumulative.get("timings")
+                            else:
+                                logger.warning(
+                                    "mlx_stream_chunks: unexpected dict event: %s",
+                                    cumulative,
+                                )
+                            continue
+                        new_text = cumulative[len(prev_text):]
+                        prev_text = cumulative
+                        if not new_text:
+                            continue
+                        chunk = ChatCompletionChunk(
+                            id = completion_id,
+                            created = created,
+                            model = model_name,
+                            choices = [
+                                ChunkChoice(
+                                    delta = ChoiceDelta(content = new_text),
+                                    finish_reason = None,
+                                )
+                            ],
+                        )
+                        yield f"data: {chunk.model_dump_json(exclude_none = True)}\n\n"
+
+                    final_chunk = ChatCompletionChunk(
+                        id = completion_id,
+                        created = created,
+                        model = model_name,
+                        choices = [
+                            ChunkChoice(
+                                delta = ChoiceDelta(),
+                                finish_reason = "stop",
+                            )
+                        ],
+                    )
+                    yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
+                    if _stream_usage or _stream_timings:
+                        usage_obj = CompletionUsage(
+                            prompt_tokens = (_stream_usage or {}).get(
+                                "prompt_tokens", 0
+                            ),
+                            completion_tokens = (_stream_usage or {}).get(
+                                "completion_tokens", 0
+                            ),
+                            total_tokens = (_stream_usage or {}).get(
+                                "total_tokens", 0
+                            ),
+                        )
+                        usage_chunk = ChatCompletionChunk(
+                            id = completion_id,
+                            created = created,
+                            model = model_name,
+                            choices = [],
+                            usage = usage_obj,
+                            timings = _stream_timings,
+                        )
+                        yield f"data: {usage_chunk.model_dump_json(exclude_none = True)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                except asyncio.CancelledError:
+                    cancel_event.set()
+                    raise
+                except Exception as e:
+                    logger.error(
+                        f"Error during MLX streaming: {e}", exc_info = True
+                    )
+                    error_chunk = {
+                        "error": {
+                            "message": _friendly_error(e),
+                            "type": "server_error",
+                        },
+                    }
+                    yield f"data: {json.dumps(error_chunk)}\n\n"
+
+            return StreamingResponse(
+                mlx_stream_chunks(),
+                media_type = "text/event-stream",
+                headers = {
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        else:
+            try:
+                full_text = ""
+                for token in mlx_generate():
+                    if isinstance(token, dict):
+                        continue
+                    full_text = token
+                response = ChatCompletion(
+                    id = completion_id,
+                    created = created,
+                    model = model_name,
+                    choices = [
+                        CompletionChoice(
+                            message = CompletionMessage(content = full_text),
+                            finish_reason = "stop",
+                        )
+                    ],
+                )
+                return JSONResponse(content = response.model_dump())
+            except Exception as e:
+                logger.error(f"Error during MLX completion: {e}", exc_info = True)
                 raise HTTPException(status_code = 500, detail = str(e))
 
     # ── Standard Unsloth path ─────────────────────────────────
