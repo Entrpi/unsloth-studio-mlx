@@ -18,3 +18,13 @@ ddgs
 # Apple-Silicon MLX backend. Marker limits the pin to macOS so pip
 # install on Linux / Windows (where mlx can't build) silently skips it.
 mlx-lm>=0.31.2,<0.32 ; sys_platform == "darwin"
+# Chunk D (Phase 9): MLX vision-language backend via mlx-vlm.
+# Verified against mlx-vlm 0.4.4 (Qwen3.5-VL). Pulls in torch +
+# torchvision transitively for the HF AutoProcessor video shim even
+# though Studio does not use the video path.
+mlx-vlm>=0.4.4,<0.5 ; sys_platform == "darwin"
+# Chunk D (Phase 10): MLX audio backend via mlx-audio (LFM2.5-Audio TTS +
+# best-effort ASR). mlx-audio 0.4.2 hard-pins mlx-lm==0.31.1 in its
+# install_requires but works fine with the >=0.31.2 we pin above — pip
+# emits a dependency-resolver warning that is not load-bearing.
+mlx-audio>=0.4.2,<0.5 ; sys_platform == "darwin"

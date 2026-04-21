@@ -38,6 +38,10 @@ export interface ChatModelSummary {
   isLora: boolean;
   isGguf?: boolean;
   isMlx?: boolean;
+  /** Chunk D (Phase 9): MLX vision-language model via mlx-vlm. */
+  isMlxVlm?: boolean;
+  /** Chunk D (Phase 10): MLX audio model via mlx-audio. */
+  isMlxAudio?: boolean;
   isAudio?: boolean;
   audioType?: string | null;
   hasAudioInput?: boolean;

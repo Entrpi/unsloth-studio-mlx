@@ -1,6 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+/**
+ * Chunk D (Phase 9+10) — additive backend discriminator enum.
+ * Prefer this over the individual is_gguf / is_mlx / is_mlx_vlm /
+ * is_mlx_audio booleans in new UI code. The booleans are preserved on
+ * every response for backwards compatibility.
+ */
+export type BackendKind =
+  | "gguf"
+  | "mlx"
+  | "mlx+lora"
+  | "mlx+vlm"
+  | "mlx+audio"
+  | "unsloth";
+
 export interface BackendModelDetails {
   id: string;
   name?: string | null;
@@ -8,6 +22,10 @@ export interface BackendModelDetails {
   is_lora?: boolean;
   is_gguf?: boolean;
   is_mlx?: boolean;
+  /** Chunk D: MLX vision-language model via mlx-vlm (Phase 9). */
+  is_mlx_vlm?: boolean;
+  /** Chunk D: MLX audio model via mlx-audio (Phase 10). */
+  is_mlx_audio?: boolean;
   is_audio?: boolean;
   audio_type?: string | null;
   has_audio_input?: boolean;
@@ -56,6 +74,10 @@ export interface ValidateModelResponse {
   display_name?: string | null;
   is_gguf?: boolean;
   is_mlx?: boolean;
+  /** Chunk D: MLX vision-language model (mlx-vlm). */
+  is_mlx_vlm?: boolean;
+  /** Chunk D: MLX audio model (mlx-audio). */
+  is_mlx_audio?: boolean;
   is_lora?: boolean;
   is_vision?: boolean;
   requires_trust_remote_code?: boolean;
@@ -85,6 +107,12 @@ export interface LoadModelResponse {
   is_mlx?: boolean;
   /** Phase 6 — the active MLX load has a LoRA adapter fused on top of the base model. */
   is_mlx_lora?: boolean;
+  /** Chunk D (Phase 9) — MLX vision-language model via mlx-vlm. */
+  is_mlx_vlm?: boolean;
+  /** Chunk D (Phase 10) — MLX audio model via mlx-audio. */
+  is_mlx_audio?: boolean;
+  /** Chunk D — collapsed backend enum. Additive companion to the booleans above. */
+  backend_kind?: BackendKind | null;
   is_audio?: boolean;
   audio_type?: string | null;
   has_audio_input?: boolean;
@@ -117,6 +145,12 @@ export interface InferenceStatusResponse {
   is_vision: boolean;
   is_gguf?: boolean;
   is_mlx?: boolean;
+  /** Chunk D (Phase 9) — active model is loaded via mlx-vlm. */
+  is_mlx_vlm?: boolean;
+  /** Chunk D (Phase 10) — active model is loaded via mlx-audio. */
+  is_mlx_audio?: boolean;
+  /** Chunk D — collapsed backend enum. */
+  backend_kind?: BackendKind | null;
   gguf_variant?: string | null;
   is_audio?: boolean;
   audio_type?: string | null;

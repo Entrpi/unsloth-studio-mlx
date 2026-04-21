@@ -157,6 +157,23 @@ type ChatRuntimeStore = {
   // is the MLX peer so the settings sheet can gate on ``isGguf ||
   // isMlx``. Set on LoadResponse / status restore and cleared on unload.
   activeIsMlx: boolean;
+  // Chunk D (Phase 9): active backend is an MLX vision-language model
+  // loaded via mlx-vlm. Drives image-composer visibility + the VLM
+  // backend tag in chat settings.
+  activeIsMlxVlm: boolean;
+  // Chunk D (Phase 10): active backend is an MLX audio model loaded
+  // via mlx-audio. Drives TTS / ASR composer entries.
+  activeIsMlxAudio: boolean;
+  // Chunk D — collapsed backend kind enum. Optional companion to the
+  // booleans above; older restore paths may leave it null.
+  activeBackendKind:
+    | "gguf"
+    | "mlx"
+    | "mlx+lora"
+    | "mlx+vlm"
+    | "mlx+audio"
+    | "unsloth"
+    | null;
   ggufContextLength: number | null;
   ggufMaxContextLength: number | null;
   ggufNativeContextLength: number | null;
@@ -242,6 +259,9 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   modelsError: null,
   activeGgufVariant: null,
   activeIsMlx: false,
+  activeIsMlxVlm: false,
+  activeIsMlxAudio: false,
+  activeBackendKind: null,
   ggufContextLength: null,
   ggufMaxContextLength: null,
   ggufNativeContextLength: null,
@@ -341,6 +361,9 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
       },
       activeGgufVariant: null,
       activeIsMlx: false,
+      activeIsMlxVlm: false,
+      activeIsMlxAudio: false,
+      activeBackendKind: null,
       ggufContextLength: null,
       ggufMaxContextLength: null,
       ggufNativeContextLength: null,

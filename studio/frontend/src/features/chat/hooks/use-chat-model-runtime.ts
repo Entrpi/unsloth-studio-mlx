@@ -62,21 +62,31 @@ function describeModel(model: {
   is_vision?: boolean;
   is_gguf?: boolean;
   is_mlx?: boolean;
+  is_mlx_vlm?: boolean;
+  is_mlx_audio?: boolean;
   is_audio?: boolean;
   has_audio_input?: boolean;
 }): string | undefined {
   const tags: string[] = [];
   if (model.is_gguf) tags.push("GGUF");
-  if (model.is_mlx) tags.push("MLX");
+  if (model.is_mlx_vlm) {
+    tags.push("MLX-VLM");
+  } else if (model.is_mlx_audio) {
+    tags.push("MLX-Audio");
+  } else if (model.is_mlx) {
+    tags.push("MLX");
+  }
   if (model.is_lora) tags.push("LoRA");
-  if (model.is_vision) tags.push("Vision");
-  if (model.is_audio) tags.push("Audio");
+  if (model.is_vision && !model.is_mlx_vlm) tags.push("Vision");
+  if (model.is_audio && !model.is_mlx_audio) tags.push("Audio");
   if (model.has_audio_input) tags.push("Audio Input");
   if (
     !model.is_lora &&
     !model.is_vision &&
     !model.is_gguf &&
     !model.is_mlx &&
+    !model.is_mlx_vlm &&
+    !model.is_mlx_audio &&
     !model.is_audio &&
     !model.has_audio_input
   )
@@ -91,6 +101,8 @@ function toChatModelSummary(model: {
   is_vision?: boolean;
   is_gguf?: boolean;
   is_mlx?: boolean;
+  is_mlx_vlm?: boolean;
+  is_mlx_audio?: boolean;
   is_audio?: boolean;
   audio_type?: string | null;
   has_audio_input?: boolean;
@@ -100,10 +112,18 @@ function toChatModelSummary(model: {
     name: model.name || model.id,
     description: describeModel(model),
     isLora: Boolean(model.is_lora),
-    isVision: Boolean(model.is_vision),
+    // A VLM model counts as "vision" for all UI gating: image composer,
+    // vision badge, etc. The is_mlx_vlm flag still rides so we can
+    // disambiguate from a GGUF vision model when needed.
+    isVision: Boolean(model.is_vision) || Boolean(model.is_mlx_vlm),
     isGguf: Boolean(model.is_gguf),
     isMlx: Boolean(model.is_mlx),
-    isAudio: Boolean(model.is_audio),
+    isMlxVlm: Boolean(model.is_mlx_vlm),
+    isMlxAudio: Boolean(model.is_mlx_audio),
+    // Same treatment for audio: an MLX-Audio model is still "audio" for
+    // gating the TTS composer even though the dedicated backend is
+    // mlx-audio rather than the GGUF audio path.
+    isAudio: Boolean(model.is_audio) || Boolean(model.is_mlx_audio),
     audioType: model.audio_type ?? null,
     hasAudioInput: Boolean(model.has_audio_input),
   };
@@ -149,9 +169,13 @@ function mergeRecommendedInference(
   const inference = response.inference;
   // GGUF / MLX: use actual context length from model metadata, fallback to 131072
   // Other: 4096
-  const defaultMaxTokens = response.is_gguf || response.is_mlx
-    ? (response.context_length ?? 131072)
-    : 4096;
+  const defaultMaxTokens =
+    response.is_gguf ||
+    response.is_mlx ||
+    response.is_mlx_vlm ||
+    response.is_mlx_audio
+      ? (response.context_length ?? 131072)
+      : 4096;
   return {
     ...current,
     checkpoint: modelId,
@@ -257,6 +281,9 @@ export function useChatModelRuntime() {
             is_lora: false,
             is_gguf: statusRes.is_gguf,
             is_mlx: statusRes.is_mlx,
+            is_mlx_vlm: statusRes.is_mlx_vlm,
+            is_mlx_audio: statusRes.is_mlx_audio,
+            backend_kind: statusRes.backend_kind,
             is_audio: statusRes.is_audio,
             audio_type: statusRes.audio_type,
             has_audio_input: statusRes.has_audio_input,
@@ -278,9 +305,14 @@ export function useChatModelRuntime() {
         const supportsReasoning = statusRes.supports_reasoning ?? false;
         const reasoningAlwaysOn = statusRes.reasoning_always_on ?? false;
         const supportsTools = statusRes.supports_tools ?? false;
-        // GGUF and MLX both populate context_length from model metadata;
-        // treat them identically for derivation of slider caps.
-        const _hasNativeCtx = statusRes.is_gguf || statusRes.is_mlx;
+        // GGUF, MLX, MLX-VLM, and MLX-Audio all populate context_length
+        // from model metadata; treat them identically for derivation of
+        // slider caps.
+        const _hasNativeCtx =
+          statusRes.is_gguf ||
+          statusRes.is_mlx ||
+          Boolean(statusRes.is_mlx_vlm) ||
+          Boolean(statusRes.is_mlx_audio);
         const currentGgufContextLength = _hasNativeCtx
           ? (statusRes.context_length ?? null)
           : null;
@@ -298,6 +330,10 @@ export function useChatModelRuntime() {
           // Phase 3/7/8: track MLX-active so the settings sheet can
           // gate KV / speculative / context UI on ``isGguf || isMlx``.
           activeIsMlx: Boolean(statusRes.is_mlx),
+          // Chunk D — track the MLX-VLM + MLX-Audio peers too.
+          activeIsMlxVlm: Boolean(statusRes.is_mlx_vlm),
+          activeIsMlxAudio: Boolean(statusRes.is_mlx_audio),
+          activeBackendKind: statusRes.backend_kind ?? null,
           ggufContextLength: currentGgufContextLength,
           ggufMaxContextLength,
           ggufNativeContextLength,
@@ -498,7 +534,11 @@ export function useChatModelRuntime() {
             }
             const loadedKv = loadResponse.cache_type_kv ?? null;
             const loadedSpec = loadResponse.speculative_type ?? null;
-            const _hasNativeCtx = loadResponse.is_gguf || loadResponse.is_mlx;
+            const _hasNativeCtx =
+              loadResponse.is_gguf ||
+              loadResponse.is_mlx ||
+              Boolean(loadResponse.is_mlx_vlm) ||
+              Boolean(loadResponse.is_mlx_audio);
             const nativeCtx = _hasNativeCtx
               ? (loadResponse.context_length ?? 131072)
               : null;
@@ -516,6 +556,10 @@ export function useChatModelRuntime() {
             useChatRuntimeStore.setState({
               // Phase 3/7/8: MLX load also gates settings-sheet controls.
               activeIsMlx: Boolean(loadResponse.is_mlx),
+              // Chunk D — MLX-VLM / MLX-Audio peer flags.
+              activeIsMlxVlm: Boolean(loadResponse.is_mlx_vlm),
+              activeIsMlxAudio: Boolean(loadResponse.is_mlx_audio),
+              activeBackendKind: loadResponse.backend_kind ?? null,
               ggufContextLength: nativeCtx,
               ggufMaxContextLength,
               ggufNativeContextLength: reportedNativeCtx,
