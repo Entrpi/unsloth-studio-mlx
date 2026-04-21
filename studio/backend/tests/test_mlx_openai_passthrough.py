@@ -286,6 +286,16 @@ class TestMlxOpenaiPassthroughStream:
         assert names == ["get_weather"]
         combined = "".join(args_chunks)
         assert json.loads(combined) == {"city": "Paris"}
+        # Chunk E (E7): tool arguments must be streamed across multiple
+        # fragments (character-by-character in ~8-char chunks) rather
+        # than a single blob, matching llama-server's wire shape. The
+        # example ``{"city": "Paris"}`` (18 chars) yields 3 fragments
+        # at an 8-char chunk size; just assert >= 2 to allow future
+        # chunk-size tuning without breaking the test.
+        assert len(args_chunks) >= 2, (
+            f"Expected argument deltas to be streamed across >=2 fragments, "
+            f"got {len(args_chunks)}: {args_chunks!r}"
+        )
 
         # Finish reason.
         finals = [

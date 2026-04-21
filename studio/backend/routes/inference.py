@@ -5316,27 +5316,41 @@ async def _mlx_openai_passthrough_stream(
                 yield f"data: {header.model_dump_json(exclude_none = True)}\n\n"
 
                 if args:
-                    args_chunk = ChatCompletionChunk(
-                        id = completion_id,
-                        created = created,
-                        model = model_name,
-                        choices = [
-                            ChunkChoice(
-                                delta = ChoiceDelta(
-                                    tool_calls = [
-                                        ToolCallDelta(
-                                            index = i,
-                                            function = ToolCallFunctionDelta(
-                                                arguments = args,
-                                            ),
-                                        )
-                                    ]
-                                ),
-                                finish_reason = None,
-                            )
-                        ],
-                    )
-                    yield f"data: {args_chunk.model_dump_json(exclude_none = True)}\n\n"
+                    # Chunk E (E7): OpenAI clients (and our own browser SDK)
+                    # assemble tool-call arguments incrementally from multiple
+                    # ``delta.tool_calls[0].function.arguments`` fragments
+                    # across many chunks. Previously we emitted the full
+                    # JSON as a single chunk, which works but forces clients
+                    # that render arguments live (e.g. agentic UIs) to wait
+                    # for end-of-turn. Match llama-server's behaviour by
+                    # splitting into small fragments. 8 characters is a
+                    # reasonable tradeoff — small enough to animate, large
+                    # enough to avoid pathological N-chunk overhead for
+                    # long arguments (cf. llama-server's 1-4 char per token).
+                    _ARGS_CHUNK_SIZE = 8
+                    for offset in range(0, len(args), _ARGS_CHUNK_SIZE):
+                        frag = args[offset : offset + _ARGS_CHUNK_SIZE]
+                        args_chunk = ChatCompletionChunk(
+                            id = completion_id,
+                            created = created,
+                            model = model_name,
+                            choices = [
+                                ChunkChoice(
+                                    delta = ChoiceDelta(
+                                        tool_calls = [
+                                            ToolCallDelta(
+                                                index = i,
+                                                function = ToolCallFunctionDelta(
+                                                    arguments = frag,
+                                                ),
+                                            )
+                                        ]
+                                    ),
+                                    finish_reason = None,
+                                )
+                            ],
+                        )
+                        yield f"data: {args_chunk.model_dump_json(exclude_none = True)}\n\n"
 
             # Final chunk: finish_reason=tool_calls.
             final_chunk = ChatCompletionChunk(
