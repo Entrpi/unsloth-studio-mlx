@@ -121,38 +121,23 @@ _CANDIDATES = [
     # Ministral-3-3B-Instruct — Mistral 2512 dialect.
     # Uses ``[AVAILABLE_TOOLS]`` / ``[TOOL_CALLS]`` / ``[TOOL_RESULTS]``.
     # The template DOES iterate ``message.tool_calls`` (camp (a)), but
-    # it ALSO executes ``message['content'] | length > 0`` eagerly when
-    # tool_calls are present — which raises ``TypeError`` on the
-    # ``content=None`` shape our extractor emits for assistant-only-
-    # tool-calls turns. The rendering succeeds end-to-end when content
-    # is coerced to an empty string, but the extractor is intentionally
-    # shape-preserving (Chunk F / Chunk G contract: content=None means
-    # "no text was emitted"). Fixing this requires per-template content-
-    # coercion logic in the extractor — deliberately out of scope for
-    # Chunk H-2 (coverage expansion, not behaviour change). See
-    # docs/chunk-h2-matrix/blockers.md for the full note.
+    # it ALSO executes ``message['content'] | length > 0`` eagerly on
+    # the assistant branch even when ``tool_calls`` is present.
+    #
+    # Chunk H-2 (B1) closure: the extractor's native-iteration branch
+    # now coerces ``content=None`` to ``content=""`` when tool_calls is
+    # populated, so the Ministral template's ``content|length`` call
+    # hits an empty string (safe) instead of None (TypeError). The
+    # 4-turn fixture (user→assistant-tc→tool→user) also tripped
+    # Ministral's strict alternation check, so the shared fixture is
+    # now 3-turn — the canonical OpenAI tool-call round-trip where the
+    # next turn would be the final assistant response. Every other
+    # family renders identically against the 3-turn shape.
     pytest.param(
         "ministral-3-3b",
         _LMSTUDIO_ROOT / "mlx-community" / "Ministral-3-3B-Instruct-2512-4bit",
         "[TOOL_CALLS]",
         id = "ministral-3-3b",
-        marks = pytest.mark.xfail(
-            reason = (
-                "Ministral-3's template enforces strict user/assistant "
-                "alternation on the full conversation and also runs "
-                "``content|length`` unconditionally on the assistant "
-                "branch. Our 4-turn tool fixture (user→assistant-tc→tool→"
-                "user) trips the alternation check on the trailing user "
-                "turn, and reducing to 3 turns trips the content=None "
-                "check. Tracked in docs/chunk-h2-matrix/blockers.md; "
-                "fix belongs in a future Chunk."
-            ),
-            strict = False,
-            # TemplateError from alternation; TypeError from len(None).
-            # AssertionError kept as a fallback in case some transformers
-            # upgrade normalises one path.
-            raises = Exception,
-        ),
     ),
 ]
 
@@ -184,7 +169,16 @@ def _build_tool_call_history() -> list[ChatMessage]:
         user -> "What's the weather in Paris?"
         assistant -> content=None, tool_calls=[get_weather({"city": "Paris"})]
         tool -> "Paris: 15C sunny" (tool_call_id matches)
-        user -> (follow-up)
+
+    Chunk H-2 (B1): previously this fixture included a trailing
+    ``user="Thanks!"`` turn, but Ministral-3's chat template enforces
+    strict user/assistant alternation on content-bearing turns (tool
+    results and assistant-only-tool-calls are exempt from the
+    alternation count), which means ``user → assistant-tc → tool → user``
+    trips its alternation check. The 3-turn shape used here is the
+    canonical OpenAI tool-call round-trip — the NEXT thing generation
+    should produce is the final assistant response — and it renders
+    cleanly across every family in _CANDIDATES including Ministral.
     """
     return [
         ChatMessage(
@@ -211,7 +205,6 @@ def _build_tool_call_history() -> list[ChatMessage]:
             tool_call_id = "call_abc123",
             name = "get_weather",
         ),
-        ChatMessage(role = "user", content = "Thanks!"),
     ]
 
 
