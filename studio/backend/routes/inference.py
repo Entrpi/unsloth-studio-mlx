@@ -89,6 +89,8 @@ from models.inference import (
     ChatMessage,
     ChunkChoice,
     ChoiceDelta,
+    ToolCallDelta,
+    ToolCallFunctionDelta,
     CompletionChoice,
     CompletionMessage,
     CompletionUsage,
@@ -1929,24 +1931,72 @@ async def openai_chat_completions(
 
     # ── MLX path: stream via mlx_lm.stream_generate ───────────
     if using_mlx:
-        # Reject images and tool calling: Phase 1 does not support them.
+        # Reject images: MLX has no vision backend yet (Phase 9).
         image_b64 = extracted_image_b64 or payload.image_base64
         if image_b64:
             raise HTTPException(
                 status_code = 400,
-                detail = "MLX backend does not support image inputs in Phase 1.",
-            )
-        if payload.enable_tools or (payload.tools and len(payload.tools) > 0):
-            raise HTTPException(
-                status_code = 400,
-                detail = "MLX backend does not support tool calling in Phase 1.",
+                detail = "MLX backend does not support image inputs in this build.",
             )
 
-        # Build message list with system prompt prepended.
-        mlx_messages: list[dict] = []
-        if system_prompt:
-            mlx_messages.append({"role": "system", "content": system_prompt})
-        mlx_messages.extend(chat_messages)
+        # Tool-calling: three possible paths, identical to the GGUF branch.
+        #   1. ``enable_tools=true`` → agentic loop with Studio's built-in
+        #      tools (web_search / python / terminal). Requires the model
+        #      to advertise ``supports_tools``.
+        #   2. ``tools=[...]`` client pass-through → parse calls out of
+        #      the model output and emit OpenAI ``tool_calls`` deltas so
+        #      external clients (opencode / Claude Code / Cursor) can
+        #      execute the tools themselves.
+        #   3. Neither → plain chat (the Chunk A/B streaming path).
+        _mlx_has_tool_messages = any(
+            m.role == "tool" or m.tool_calls for m in payload.messages
+        )
+        _mlx_wants_client_tools = (
+            mlx_backend.supports_tools
+            and not payload.enable_tools
+            and (
+                (payload.tools and len(payload.tools) > 0)
+                or _mlx_has_tool_messages
+            )
+        )
+
+        if payload.enable_tools and not mlx_backend.supports_tools:
+            raise HTTPException(
+                status_code = 400,
+                detail = (
+                    "Loaded MLX model does not advertise tool-calling "
+                    "support. Load a tool-capable model "
+                    "(e.g. mlx-community Qwen3 / Bonsai / Hermes)."
+                ),
+            )
+        if payload.tools and not mlx_backend.supports_tools:
+            raise HTTPException(
+                status_code = 400,
+                detail = (
+                    "Client-side tools were requested but the loaded MLX "
+                    "model does not advertise tool-calling support."
+                ),
+            )
+
+        # Build message list with system prompt prepended. When tools
+        # are in play we re-extract with ``preserve_tool_history=True``
+        # so ``role="tool"`` results and assistant ``tool_calls`` reach
+        # the backend for apply_chat_template. The regular chat path
+        # keeps Phase-1's lean message shape.
+        _mlx_using_tools = payload.enable_tools or _mlx_wants_client_tools
+        if _mlx_using_tools:
+            _tool_system, _tool_msgs, _ = _extract_content_parts(
+                payload.messages, preserve_tool_history = True
+            )
+            mlx_messages = []
+            if _tool_system:
+                mlx_messages.append({"role": "system", "content": _tool_system})
+            mlx_messages.extend(_tool_msgs)
+        else:
+            mlx_messages = []
+            if system_prompt:
+                mlx_messages.append({"role": "system", "content": system_prompt})
+            mlx_messages.extend(chat_messages)
 
         cancel_event = threading.Event()
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -1959,6 +2009,104 @@ async def openai_chat_completions(
                 _mlx_stop = [payload.stop]
             elif isinstance(payload.stop, list):
                 _mlx_stop = [s for s in payload.stop if isinstance(s, str) and s]
+
+        # ── MLX server-side tool agentic loop (enable_tools=true) ──
+        if payload.enable_tools:
+            from core.inference.tools import ALL_TOOLS
+
+            if payload.enabled_tools is not None:
+                mlx_tools = [
+                    t
+                    for t in ALL_TOOLS
+                    if t["function"]["name"] in payload.enabled_tools
+                ]
+            else:
+                mlx_tools = ALL_TOOLS
+
+            def mlx_generate_with_tools():
+                return mlx_backend.generate_chat_completion_with_tools(
+                    messages = mlx_messages,
+                    tools = mlx_tools,
+                    tool_choice = payload.tool_choice,
+                    temperature = payload.temperature,
+                    top_p = payload.top_p,
+                    top_k = payload.top_k,
+                    min_p = payload.min_p,
+                    max_tokens = payload.max_tokens,
+                    repetition_penalty = payload.repetition_penalty,
+                    presence_penalty = payload.presence_penalty,
+                    stop = _mlx_stop,
+                    cancel_event = cancel_event,
+                    enable_thinking = payload.enable_thinking,
+                    max_tool_iterations = payload.max_tool_calls_per_message
+                    if payload.max_tool_calls_per_message is not None
+                    else 10,
+                    auto_heal_tool_calls = (
+                        payload.auto_heal_tool_calls
+                        if payload.auto_heal_tool_calls is not None
+                        else True
+                    ),
+                    tool_call_timeout = payload.tool_call_timeout
+                    if payload.tool_call_timeout is not None
+                    else 300,
+                    session_id = payload.session_id,
+                )
+
+            if payload.stream:
+                return StreamingResponse(
+                    _mlx_agentic_stream(
+                        request = request,
+                        cancel_event = cancel_event,
+                        run_gen = mlx_generate_with_tools,
+                        completion_id = completion_id,
+                        created = created,
+                        model_name = model_name,
+                    ),
+                    media_type = "text/event-stream",
+                    headers = {
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            return await _mlx_agentic_non_streaming(
+                run_gen = mlx_generate_with_tools,
+                completion_id = completion_id,
+                created = created,
+                model_name = model_name,
+            )
+
+        # ── MLX client-side tools pass-through (standard OpenAI) ──
+        if _mlx_wants_client_tools:
+            if payload.stream:
+                return StreamingResponse(
+                    _mlx_openai_passthrough_stream(
+                        request = request,
+                        cancel_event = cancel_event,
+                        mlx_backend = mlx_backend,
+                        payload = payload,
+                        messages = mlx_messages,
+                        stop = _mlx_stop,
+                        completion_id = completion_id,
+                        created = created,
+                        model_name = model_name,
+                    ),
+                    media_type = "text/event-stream",
+                    headers = {
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            return await _mlx_openai_passthrough_non_streaming(
+                mlx_backend = mlx_backend,
+                payload = payload,
+                messages = mlx_messages,
+                stop = _mlx_stop,
+                completion_id = completion_id,
+                created = created,
+                model_name = model_name,
+            )
 
         def mlx_generate():
             return mlx_backend.generate_chat_completion(
@@ -3776,3 +3924,617 @@ async def _openai_passthrough_non_streaming(
     # verbatim (matches the docstring). Status is guaranteed 200 by
     # the check above.
     return Response(content = resp.content, media_type = "application/json")
+
+
+# =====================================================================
+# MLX-LM tool-calling helpers (Phase 5 / Chunk C)
+# =====================================================================
+#
+# The GGUF backend proxies to llama-server, which speaks OpenAI's
+# function-calling wire format out of the box; the helpers above simply
+# relay llama-server's SSE verbatim. MLX is in-process and only hands
+# us cumulative text plus agentic-loop events (tool_start / tool_end),
+# so we have to *synthesise* the OpenAI SSE frames ourselves. The two
+# public entry points here are:
+#
+#   • _mlx_agentic_stream / _mlx_agentic_non_streaming — used when the
+#     request carries Studio's `enable_tools=true` shorthand. Studio
+#     executes the built-in tools server-side; we emit a final
+#     assistant text plus a `finish_reason: "stop"` completion.
+#
+#   • _mlx_openai_passthrough_stream / _mlx_openai_passthrough_non_streaming
+#     — used when the request carries standard OpenAI `tools=[...]`.
+#     The model's tool-call XML is parsed into structured
+#     `delta.tool_calls`, streamed to the client, and terminated with
+#     `finish_reason: "tool_calls"` so the external client (opencode /
+#     Claude Code / Cursor) can execute the tools itself.
+
+
+async def _mlx_agentic_stream(
+    *,
+    request,
+    cancel_event,
+    run_gen,
+    completion_id: str,
+    created: int,
+    model_name: str,
+):
+    """Stream the output of ``generate_chat_completion_with_tools``
+    as OpenAI SSE frames.
+
+    Studio's `enable_tools=true` path runs the tools server-side, so
+    from the OpenAI client's perspective the response is a normal
+    streaming completion — content deltas plus a
+    `finish_reason: "stop"` at the end. The custom ``tool_status`` /
+    ``tool_start`` / ``tool_end`` events are surfaced as Studio-specific
+    SSE events (mirrors the existing GGUF tool loop route shape so the
+    frontend doesn't need to branch).
+    """
+    _sentinel = object()
+
+    # First chunk: role.
+    first_chunk = ChatCompletionChunk(
+        id = completion_id,
+        created = created,
+        model = model_name,
+        choices = [
+            ChunkChoice(
+                delta = ChoiceDelta(role = "assistant"),
+                finish_reason = None,
+            )
+        ],
+    )
+    yield f"data: {first_chunk.model_dump_json(exclude_none = True)}\n\n"
+
+    gen = run_gen()
+    prev_text = ""
+    _stream_usage = None
+    _stream_timings = None
+
+    try:
+        while True:
+            if await request.is_disconnected():
+                cancel_event.set()
+                return
+            event = await asyncio.to_thread(next, gen, _sentinel)
+            if event is _sentinel:
+                break
+
+            etype = event.get("type") if isinstance(event, dict) else None
+
+            if etype == "status":
+                # Empty status = tool-iteration boundary; reset cursor so
+                # the next assistant turn streams cleanly.
+                if not event.get("text"):
+                    prev_text = ""
+                yield f"data: {json.dumps({'type': 'tool_status', 'content': event.get('text', '')})}\n\n"
+                continue
+
+            if etype in ("tool_start", "tool_end"):
+                if etype == "tool_start":
+                    prev_text = ""
+                yield f"data: {json.dumps(event)}\n\n"
+                continue
+
+            if etype == "metadata":
+                _stream_usage = event.get("usage")
+                _stream_timings = event.get("timings")
+                continue
+
+            if etype == "content":
+                raw_cumulative = event.get("text", "")
+                new_text = raw_cumulative[len(prev_text) :]
+                prev_text = raw_cumulative
+                if not new_text:
+                    continue
+                chunk = ChatCompletionChunk(
+                    id = completion_id,
+                    created = created,
+                    model = model_name,
+                    choices = [
+                        ChunkChoice(
+                            delta = ChoiceDelta(content = new_text),
+                            finish_reason = None,
+                        )
+                    ],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none = True)}\n\n"
+
+        # Final chunk with finish_reason=stop.
+        final_chunk = ChatCompletionChunk(
+            id = completion_id,
+            created = created,
+            model = model_name,
+            choices = [
+                ChunkChoice(delta = ChoiceDelta(), finish_reason = "stop"),
+            ],
+        )
+        yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
+
+        if _stream_usage or _stream_timings:
+            usage_obj = CompletionUsage(
+                prompt_tokens = (_stream_usage or {}).get("prompt_tokens", 0),
+                completion_tokens = (_stream_usage or {}).get("completion_tokens", 0),
+                total_tokens = (_stream_usage or {}).get("total_tokens", 0),
+            )
+            usage_chunk = ChatCompletionChunk(
+                id = completion_id,
+                created = created,
+                model = model_name,
+                choices = [],
+                usage = usage_obj,
+                timings = _stream_timings,
+            )
+            yield f"data: {usage_chunk.model_dump_json(exclude_none = True)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    except asyncio.CancelledError:
+        cancel_event.set()
+        raise
+    except Exception as e:
+        logger.error("MLX agentic stream error: %s", e, exc_info = True)
+        err = {"error": {"message": _friendly_error(e), "type": "server_error"}}
+        yield f"data: {json.dumps(err)}\n\n"
+
+
+async def _mlx_agentic_non_streaming(
+    *,
+    run_gen,
+    completion_id: str,
+    created: int,
+    model_name: str,
+):
+    """Drive ``generate_chat_completion_with_tools`` to completion and
+    return a single ChatCompletion JSON object.
+    """
+    final_text = ""
+    prev_text = ""
+    usage: Dict[str, Any] = {}
+    for event in run_gen():
+        if not isinstance(event, dict):
+            continue
+        etype = event.get("type")
+        if etype == "content":
+            prev_text = event.get("text", "")
+            final_text = prev_text
+        elif etype == "metadata":
+            usage = event.get("usage", {}) or {}
+
+    response = ChatCompletion(
+        id = completion_id,
+        created = created,
+        model = model_name,
+        choices = [
+            CompletionChoice(
+                message = CompletionMessage(content = final_text),
+                finish_reason = "stop",
+            )
+        ],
+        usage = CompletionUsage(
+            prompt_tokens = usage.get("prompt_tokens", 0),
+            completion_tokens = usage.get("completion_tokens", 0),
+            total_tokens = usage.get("total_tokens", 0),
+        ),
+    )
+    return JSONResponse(content = response.model_dump())
+
+
+async def _mlx_openai_passthrough_stream(
+    *,
+    request,
+    cancel_event,
+    mlx_backend,
+    payload,
+    messages: list[dict],
+    stop: Optional[list[str]],
+    completion_id: str,
+    created: int,
+    model_name: str,
+):
+    """Client-side tools pass-through: stream the model output, hold
+    back tokens that might be forming a tool-call XML block, parse at
+    end of turn, and emit structured ``delta.tool_calls`` per OpenAI's
+    wire format.
+
+    The buffering strategy:
+
+    - While cumulative text starts with (a prefix of) ``<tool_call>``
+      or ``<function=``, we hold back emission. This avoids leaking
+      half-formed XML into the client's content stream before we know
+      whether it's a real tool call or a false positive.
+    - When the buffer grows past :data:`_MLX_PASSTHROUGH_BUFFER_MAX` and
+      still matches a prefix, we flush it as plain text — the model is
+      probably echoing the markup literally.
+    - When the whole turn ends we parse the cumulative text one last
+      time; any calls found get streamed out as OpenAI deltas with the
+      tool call arguments chunked character-by-character (matching
+      llama-server's behaviour and what the official Python SDK
+      assembles transparently for client code).
+    """
+    from core.inference._tool_call_parser import (
+        TOOL_XML_SIGNALS,
+        parse_tool_calls_from_text,
+        strip_tool_markup,
+    )
+
+    _MLX_BUFFER_MAX = 64
+    _sentinel = object()
+
+    # First chunk: role.
+    first_chunk = ChatCompletionChunk(
+        id = completion_id,
+        created = created,
+        model = model_name,
+        choices = [
+            ChunkChoice(
+                delta = ChoiceDelta(role = "assistant"),
+                finish_reason = None,
+            )
+        ],
+    )
+    yield f"data: {first_chunk.model_dump_json(exclude_none = True)}\n\n"
+
+    def _make_gen():
+        return mlx_backend.generate_chat_completion(
+            messages = messages,
+            temperature = payload.temperature,
+            top_p = payload.top_p,
+            top_k = payload.top_k,
+            min_p = payload.min_p,
+            max_tokens = payload.max_tokens,
+            repetition_penalty = payload.repetition_penalty,
+            presence_penalty = payload.presence_penalty,
+            stop = stop,
+            cancel_event = cancel_event,
+            enable_thinking = payload.enable_thinking,
+        )
+
+    # For client-side tools we also need the tool schema in the prompt,
+    # so call the render path with tools. The easiest way is to go
+    # through generate_chat_completion_with_tools with ``tool_choice="none"``
+    # semantics for the agentic portion — but we want the parser to
+    # still see the tool call. Instead, pre-render with tools and feed
+    # generate_chat_completion with the rendered prompt injection by
+    # relying on the tokenizer's template. We already have the model
+    # loaded and ``supports_tools``, so delegate to the tool-loop
+    # method with a custom implementation: run exactly ONE turn, never
+    # execute tools, expose the text.
+    #
+    # Simpler: run generate_chat_completion_with_tools with
+    # ``max_tool_iterations=0`` so the tool-detect + execute path is
+    # bypassed and only the raw model output comes through. When
+    # max_tool_iterations=0 the loop body is skipped entirely, which
+    # goes straight to the final "no more tools" fallback — that
+    # fallback runs one plain turn. Our path-through constraint is that
+    # tools were already passed to the prompt builder on that final
+    # turn via the tools argument, so the model is still prompted with
+    # the schema. Good.
+
+    def _make_passthrough_gen():
+        return mlx_backend.generate_chat_completion_with_tools(
+            messages = messages,
+            tools = payload.tools or [],
+            tool_choice = payload.tool_choice or "auto",
+            temperature = payload.temperature,
+            top_p = payload.top_p,
+            top_k = payload.top_k,
+            min_p = payload.min_p,
+            max_tokens = payload.max_tokens,
+            repetition_penalty = payload.repetition_penalty,
+            presence_penalty = payload.presence_penalty,
+            stop = stop,
+            cancel_event = cancel_event,
+            enable_thinking = payload.enable_thinking,
+            # Do NOT execute tools; we're proxying them to the client.
+            # max_tool_iterations=0 still emits the single "final turn"
+            # with the full tool schema in the rendered prompt.
+            max_tool_iterations = 0,
+            auto_heal_tool_calls = True,
+            tool_call_timeout = 300,
+            session_id = None,
+        )
+
+    gen = _make_passthrough_gen()
+    cumulative = ""
+    prev_content_emitted = 0
+    content_buffer = ""
+    # State machine: "buffering" (might be entering a tool call),
+    # "streaming" (flushing content unchanged), "draining" (inside a
+    # tool call, hold back emission until end-of-turn).
+    state = "buffering"
+    usage: Dict[str, Any] = {}
+
+    try:
+        while True:
+            if await request.is_disconnected():
+                cancel_event.set()
+                return
+            event = await asyncio.to_thread(next, gen, _sentinel)
+            if event is _sentinel:
+                break
+
+            if isinstance(event, dict):
+                etype = event.get("type")
+                if etype == "metadata":
+                    usage = event.get("usage", {}) or {}
+                continue
+
+            if not isinstance(event, str):
+                continue
+
+            cumulative = event
+
+            if state == "draining":
+                # Hold back — tool-call detected, assemble at end.
+                continue
+
+            if state == "streaming":
+                new_text = cumulative[prev_content_emitted:]
+                if not new_text:
+                    continue
+                prev_content_emitted = len(cumulative)
+                chunk = ChatCompletionChunk(
+                    id = completion_id,
+                    created = created,
+                    model = model_name,
+                    choices = [
+                        ChunkChoice(
+                            delta = ChoiceDelta(content = new_text),
+                            finish_reason = None,
+                        )
+                    ],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none = True)}\n\n"
+                continue
+
+            # state == "buffering" — decide what to do with cumulative.
+            stripped = cumulative.lstrip()
+            is_prefix = False
+            is_match = False
+            for sig in TOOL_XML_SIGNALS:
+                if stripped.startswith(sig):
+                    is_match = True
+                    break
+                if sig.startswith(stripped):
+                    is_prefix = True
+                    break
+            if is_match:
+                state = "draining"
+            elif is_prefix and len(stripped) < _MLX_BUFFER_MAX:
+                # Keep buffering — small chance this is still a tool call.
+                continue
+            else:
+                # Plain content — flush everything accumulated.
+                state = "streaming"
+                flush_text = cumulative[prev_content_emitted:]
+                prev_content_emitted = len(cumulative)
+                if flush_text:
+                    chunk = ChatCompletionChunk(
+                        id = completion_id,
+                        created = created,
+                        model = model_name,
+                        choices = [
+                            ChunkChoice(
+                                delta = ChoiceDelta(content = flush_text),
+                                finish_reason = None,
+                            )
+                        ],
+                    )
+                    yield f"data: {chunk.model_dump_json(exclude_none = True)}\n\n"
+
+        # ── End of turn: parse cumulative for tool calls ──
+        tool_calls = parse_tool_calls_from_text(cumulative)
+
+        if tool_calls:
+            # Build structured tool_calls deltas. Emit one delta per
+            # call that carries the id + name, then a second delta per
+            # call that streams the arguments in a single chunk. This
+            # matches the most common shape OpenAI clients expect —
+            # providers sometimes split arguments across multiple
+            # deltas but a single chunk is a valid superset.
+            for i, tc in enumerate(tool_calls):
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                args = func.get("arguments", "")
+                if not isinstance(args, str):
+                    try:
+                        args = json.dumps(args)
+                    except (TypeError, ValueError):
+                        args = "{}"
+
+                header = ChatCompletionChunk(
+                    id = completion_id,
+                    created = created,
+                    model = model_name,
+                    choices = [
+                        ChunkChoice(
+                            delta = ChoiceDelta(
+                                tool_calls = [
+                                    ToolCallDelta(
+                                        index = i,
+                                        id = tc.get("id", f"call_{i}"),
+                                        type = "function",
+                                        function = ToolCallFunctionDelta(
+                                            name = name,
+                                            arguments = "",
+                                        ),
+                                    )
+                                ]
+                            ),
+                            finish_reason = None,
+                        )
+                    ],
+                )
+                yield f"data: {header.model_dump_json(exclude_none = True)}\n\n"
+
+                if args:
+                    args_chunk = ChatCompletionChunk(
+                        id = completion_id,
+                        created = created,
+                        model = model_name,
+                        choices = [
+                            ChunkChoice(
+                                delta = ChoiceDelta(
+                                    tool_calls = [
+                                        ToolCallDelta(
+                                            index = i,
+                                            function = ToolCallFunctionDelta(
+                                                arguments = args,
+                                            ),
+                                        )
+                                    ]
+                                ),
+                                finish_reason = None,
+                            )
+                        ],
+                    )
+                    yield f"data: {args_chunk.model_dump_json(exclude_none = True)}\n\n"
+
+            # Final chunk: finish_reason=tool_calls.
+            final_chunk = ChatCompletionChunk(
+                id = completion_id,
+                created = created,
+                model = model_name,
+                choices = [
+                    ChunkChoice(delta = ChoiceDelta(), finish_reason = "tool_calls")
+                ],
+            )
+            yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
+        else:
+            # No tool calls — if we were draining (false-positive XML
+            # prefix that didn't resolve to a real call), flush the
+            # cleaned cumulative as content now.
+            if state == "draining":
+                cleaned = strip_tool_markup(cumulative, final = True)
+                if cleaned:
+                    chunk = ChatCompletionChunk(
+                        id = completion_id,
+                        created = created,
+                        model = model_name,
+                        choices = [
+                            ChunkChoice(
+                                delta = ChoiceDelta(content = cleaned),
+                                finish_reason = None,
+                            )
+                        ],
+                    )
+                    yield f"data: {chunk.model_dump_json(exclude_none = True)}\n\n"
+            # Final chunk: finish_reason=stop.
+            final_chunk = ChatCompletionChunk(
+                id = completion_id,
+                created = created,
+                model = model_name,
+                choices = [
+                    ChunkChoice(delta = ChoiceDelta(), finish_reason = "stop")
+                ],
+            )
+            yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
+
+        if usage:
+            usage_obj = CompletionUsage(
+                prompt_tokens = usage.get("prompt_tokens", 0),
+                completion_tokens = usage.get("completion_tokens", 0),
+                total_tokens = usage.get("total_tokens", 0),
+            )
+            usage_chunk = ChatCompletionChunk(
+                id = completion_id,
+                created = created,
+                model = model_name,
+                choices = [],
+                usage = usage_obj,
+            )
+            yield f"data: {usage_chunk.model_dump_json(exclude_none = True)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    except asyncio.CancelledError:
+        cancel_event.set()
+        raise
+    except Exception as e:
+        logger.error("MLX passthrough stream error: %s", e, exc_info = True)
+        err = {"error": {"message": _friendly_error(e), "type": "server_error"}}
+        yield f"data: {json.dumps(err)}\n\n"
+
+
+async def _mlx_openai_passthrough_non_streaming(
+    *,
+    mlx_backend,
+    payload,
+    messages: list[dict],
+    stop: Optional[list[str]],
+    completion_id: str,
+    created: int,
+    model_name: str,
+):
+    """Client-side tools pass-through (non-streaming).
+
+    Runs the same one-shot generation as the streaming path, collects
+    the cumulative text, parses it for tool calls, and returns a
+    single ChatCompletion JSON body. When tool calls are found they
+    are attached to ``choices[0].message.tool_calls`` and
+    ``finish_reason`` is set to ``"tool_calls"``; otherwise it's a
+    standard content-only response.
+    """
+    from core.inference._tool_call_parser import (
+        parse_tool_calls_from_text,
+        strip_tool_markup,
+    )
+
+    cumulative = ""
+    usage: Dict[str, Any] = {}
+    for event in mlx_backend.generate_chat_completion_with_tools(
+        messages = messages,
+        tools = payload.tools or [],
+        tool_choice = payload.tool_choice or "auto",
+        temperature = payload.temperature,
+        top_p = payload.top_p,
+        top_k = payload.top_k,
+        min_p = payload.min_p,
+        max_tokens = payload.max_tokens,
+        repetition_penalty = payload.repetition_penalty,
+        presence_penalty = payload.presence_penalty,
+        stop = stop,
+        cancel_event = None,
+        enable_thinking = payload.enable_thinking,
+        max_tool_iterations = 0,
+        auto_heal_tool_calls = True,
+        tool_call_timeout = 300,
+    ):
+        if isinstance(event, dict):
+            if event.get("type") == "metadata":
+                usage = event.get("usage", {}) or {}
+            continue
+        cumulative = event
+
+    tool_calls = parse_tool_calls_from_text(cumulative)
+
+    if tool_calls:
+        # Build non-streaming CompletionMessage with tool_calls.
+        message_body = {
+            "role": "assistant",
+            "content": strip_tool_markup(cumulative, final = True) or None,
+            "tool_calls": tool_calls,
+        }
+        finish_reason = "tool_calls"
+    else:
+        message_body = {"role": "assistant", "content": cumulative}
+        finish_reason = "stop"
+
+    payload_out = {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": message_body,
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+    }
+    return JSONResponse(content = payload_out)

@@ -1685,7 +1685,12 @@ class MlxLmBackend:
 
         # ── Tool iteration cap reached ────────────────────────────
         # Inject a "no more tools" nudge and do one final plain turn
-        # so the conversation ends with assistant text.
+        # so the conversation ends with assistant text. For the
+        # max_tool_iterations=0 client-passthrough case (route layer
+        # wants a single raw tool-aware turn with no execution), skip
+        # the nudge AND keep ``tools=`` in the prompt so the model
+        # still sees the schema on its single turn.
+        passthrough_mode = max_tool_iterations == 0
         if max_tool_iterations > 0:
             conversation.append(
                 {
@@ -1703,8 +1708,8 @@ class MlxLmBackend:
         final_timings: Dict[str, Any] = {}
         for event in self._stream_assistant_turn(
             conversation = conversation,
-            tools = None,
-            tool_choice = "none",
+            tools = tools if passthrough_mode else None,
+            tool_choice = tool_choice_norm if passthrough_mode else "none",
             temperature = temperature,
             top_p = top_p,
             top_k = top_k,
