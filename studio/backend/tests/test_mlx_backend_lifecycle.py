@@ -99,3 +99,103 @@ def test_load_chat_unload_bonsai():
     finally:
         assert backend.unload_model()
         assert not backend.is_loaded
+
+
+@pytest.mark.skipif(not MLX_LM_AVAILABLE, reason = "mlx_lm or model not available")
+def test_stop_string_end_to_end():
+    """With ``stop=["END"]``, the backend MUST truncate before the literal
+    ``END`` and never emit it (nor anything after)."""
+    from core.inference.mlx_lm import MlxLmBackend
+
+    backend = MlxLmBackend()
+    ok = backend.load_model(
+        local_path = _MODEL_PATH,
+        model_identifier = Path(_MODEL_PATH).name,
+    )
+    assert ok and backend.is_loaded
+
+    try:
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "Respond with exactly this, nothing else: ok END extra"
+                ),
+            }
+        ]
+        final_text = ""
+        saw_metadata = False
+        for event in backend.generate_chat_completion(
+            messages = messages,
+            max_tokens = 64,
+            stop = ["END"],
+        ):
+            if isinstance(event, dict):
+                saw_metadata = True
+                assert event.get("type") == "metadata"
+                assert event.get("finish_reason") == "stop"
+            else:
+                final_text = event
+        assert saw_metadata
+        # Core contract of Phase 2 stop strings: the literal stop sequence
+        # must be absent from the emitted response.
+        assert "END" not in final_text, (
+            f"stop string leaked into output: {final_text!r}"
+        )
+    finally:
+        assert backend.unload_model()
+
+
+@pytest.mark.skipif(not MLX_LM_AVAILABLE, reason = "mlx_lm or model not available")
+def test_repetition_penalty_changes_output():
+    """Two greedy (temp=0) runs with identical prompts but different
+    repetition_penalty values must produce different outputs — the
+    penalty is actually taking effect, not silently dropped.
+
+    Greedy sampling makes the run deterministic so any divergence is
+    attributable to the logits processor."""
+    from core.inference.mlx_lm import MlxLmBackend
+
+    backend = MlxLmBackend()
+    ok = backend.load_model(
+        local_path = _MODEL_PATH,
+        model_identifier = Path(_MODEL_PATH).name,
+    )
+    assert ok and backend.is_loaded
+
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "Write a short paragraph about the color blue. "
+                "Use the word 'blue' several times."
+            ),
+        }
+    ]
+
+    def _run(rep: float) -> str:
+        out = ""
+        for event in backend.generate_chat_completion(
+            messages = messages,
+            temperature = 0.0,  # greedy → deterministic per-processor
+            top_p = 1.0,
+            top_k = 0,
+            min_p = 0.0,
+            repetition_penalty = rep,
+            max_tokens = 96,
+        ):
+            if not isinstance(event, dict):
+                out = event
+        return out
+
+    try:
+        baseline = _run(1.0)
+        penalized = _run(1.3)
+        assert baseline, "empty baseline output"
+        assert penalized, "empty penalized output"
+        assert baseline != penalized, (
+            "repetition_penalty=1.3 produced identical output to 1.0 — "
+            "logits processor is not taking effect"
+        )
+    finally:
+        assert backend.unload_model()
