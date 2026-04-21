@@ -1462,7 +1462,7 @@ async def list_models(
             loaded_models.append(model_info)
 
         # Include active GGUF model (loaded via llama-server)
-        from routes.inference import get_llama_cpp_backend
+        from routes.inference import get_llama_cpp_backend, get_mlx_lm_backend
 
         llama_backend = get_llama_cpp_backend()
         if llama_backend.is_loaded and llama_backend.model_identifier:
@@ -1474,6 +1474,18 @@ async def list_models(
                     is_vision = llama_backend.is_vision,
                     is_audio = getattr(llama_backend, "_is_audio", False),
                     audio_type = getattr(llama_backend, "_audio_type", None),
+                )
+            )
+
+        # Include active MLX model (loaded via mlx-lm)
+        mlx_backend = get_mlx_lm_backend()
+        if mlx_backend.is_loaded and mlx_backend.model_identifier:
+            loaded_models.append(
+                ModelDetails(
+                    id = mlx_backend.model_identifier,
+                    name = mlx_backend.model_identifier.split("/")[-1],
+                    is_mlx = True,
+                    is_vision = False,
                 )
             )
 
@@ -2254,11 +2266,19 @@ async def delete_cached_model(
 
     # Check if model is currently loaded
     try:
-        from routes.inference import get_llama_cpp_backend
+        from routes.inference import get_llama_cpp_backend, get_mlx_lm_backend
 
         llama_backend = get_llama_cpp_backend()
         if llama_backend.is_loaded and llama_backend.model_identifier:
             loaded_id = llama_backend.model_identifier.lower()
+            if loaded_id == repo_id.lower() or loaded_id.startswith(repo_id.lower()):
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "Unload the model before deleting",
+                )
+        mlx_backend = get_mlx_lm_backend()
+        if mlx_backend.is_loaded and mlx_backend.model_identifier:
+            loaded_id = mlx_backend.model_identifier.lower()
             if loaded_id == repo_id.lower() or loaded_id.startswith(repo_id.lower()):
                 raise HTTPException(
                     status_code = 400,

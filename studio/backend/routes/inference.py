@@ -726,6 +726,15 @@ async def unload_model(
             logger.info(f"Unloaded GGUF model: {request.model_path}")
             return UnloadResponse(status = "unloaded", model = request.model_path)
 
+        # Check if the MLX backend has this model loaded
+        mlx_backend = get_mlx_lm_backend()
+        if mlx_backend.is_loaded and (
+            mlx_backend.model_identifier == request.model_path
+        ):
+            await asyncio.to_thread(mlx_backend.unload_model)
+            logger.info(f"Unloaded MLX model: {request.model_path}")
+            return UnloadResponse(status = "unloaded", model = request.model_path)
+
         # Otherwise, unload from Unsloth backend
         backend = get_inference_backend()
         backend.unload_model(request.model_path)
@@ -821,6 +830,38 @@ async def get_status(
     """
     try:
         llama_backend = get_llama_cpp_backend()
+        mlx_backend = get_mlx_lm_backend()
+
+        # If an MLX model is loaded, report that first (it is mutually
+        # exclusive with the GGUF backend but we check it first because
+        # users may switch backends and we want the newest one to win).
+        if mlx_backend.is_loaded:
+            _mlx_model_id = mlx_backend.model_identifier
+            _inference_cfg = (
+                load_inference_config(_mlx_model_id) if _mlx_model_id else None
+            )
+            return InferenceStatusResponse(
+                active_model = _mlx_model_id,
+                is_vision = False,
+                is_gguf = False,
+                is_mlx = True,
+                is_audio = False,
+                audio_type = None,
+                has_audio_input = False,
+                loading = [],
+                loaded = [_mlx_model_id] if _mlx_model_id else [],
+                inference = _inference_cfg,
+                requires_trust_remote_code = bool(
+                    (_inference_cfg or {}).get("trust_remote_code", False)
+                ),
+                supports_reasoning = False,
+                reasoning_always_on = False,
+                supports_tools = False,
+                context_length = mlx_backend.context_length,
+                max_context_length = mlx_backend.max_context_length,
+                native_context_length = mlx_backend.native_context_length,
+                speculative_type = None,
+            )
 
         # If a GGUF model is loaded via llama-server, report that
         if llama_backend.is_loaded:
