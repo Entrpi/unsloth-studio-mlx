@@ -522,6 +522,12 @@ export function ChatSettingsPanel({
   const kvCacheDtype = useChatRuntimeStore((s) => s.kvCacheDtype);
   const setKvCacheDtype = useChatRuntimeStore((s) => s.setKvCacheDtype);
   const loadedKvCacheDtype = useChatRuntimeStore((s) => s.loadedKvCacheDtype);
+  // Phase 7 — draft model path for MLX speculative decoding.
+  const draftModelPath = useChatRuntimeStore((s) => s.draftModelPath);
+  const setDraftModelPath = useChatRuntimeStore((s) => s.setDraftModelPath);
+  const loadedDraftModelPath = useChatRuntimeStore(
+    (s) => s.loadedDraftModelPath,
+  );
   const customContextLength = useChatRuntimeStore((s) => s.customContextLength);
   const setCustomContextLength = useChatRuntimeStore(
     (s) => s.setCustomContextLength,
@@ -532,7 +538,8 @@ export function ChatSettingsPanel({
   const kvDirty = kvCacheDtype !== loadedKvCacheDtype;
   const ctxDirty = customContextLength !== null;
   const specDirty = speculativeType !== loadedSpeculativeType;
-  const modelSettingsDirty = kvDirty || ctxDirty || specDirty;
+  const draftDirty = draftModelPath !== loadedDraftModelPath;
+  const modelSettingsDirty = kvDirty || ctxDirty || specDirty || draftDirty;
   const [customPresets, setCustomPresets] = useState<Preset[]>(() =>
     loadSavedCustomPresets(),
   );
@@ -1031,7 +1038,9 @@ export function ChatSettingsPanel({
                         Speculative Decoding
                       </div>
                       <div className="text-[11px] text-muted-foreground">
-                        Speed up generation with no VRAM cost.
+                        {isMlx
+                          ? "Use a smaller MLX model as draft."
+                          : "Speed up generation with no VRAM cost."}
                       </div>
                     </div>
                     <div className="w-full min-w-0">
@@ -1045,11 +1054,40 @@ export function ChatSettingsPanel({
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="ngram-mod">On</SelectItem>
+                          {isMlx ? (
+                            <SelectItem value="mlx-draft-model">On</SelectItem>
+                          ) : (
+                            <SelectItem value="ngram-mod">On</SelectItem>
+                          )}
                           <SelectItem value="off">Off</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
+                  </div>
+                )}
+                {/* Phase 7: MLX speculative requires a draft-model path.
+                    Only show the input when MLX is active AND speculative
+                    is turned on — matches the GGUF UI's "only show
+                    dependent controls when relevant" pattern. */}
+                {isMlx && speculativeType === "mlx-draft-model" && (
+                  <div className="space-y-1">
+                    <div className="text-xs font-medium">
+                      Draft Model Path
+                    </div>
+                    <Input
+                      type="text"
+                      value={draftModelPath ?? ""}
+                      placeholder="/absolute/path/to/mlx-draft-dir"
+                      className="h-7 w-full text-xs"
+                      onChange={(e) => {
+                        const v = e.target.value.trim();
+                        setDraftModelPath(v || null);
+                      }}
+                    />
+                    <p className="text-[11px] text-muted-foreground">
+                      Smaller MLX checkpoint of the same family. Must
+                      match the base tokenizer. Apply reloads the model.
+                    </p>
                   </div>
                 )}
                 {modelSettingsDirty && (
@@ -1067,6 +1105,7 @@ export function ChatSettingsPanel({
                         setCustomContextLength(null);
                         setKvCacheDtype(loadedKvCacheDtype);
                         setSpeculativeType(loadedSpeculativeType);
+                        setDraftModelPath(loadedDraftModelPath);
                       }}
                       className="rounded-md border px-2.5 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent"
                     >

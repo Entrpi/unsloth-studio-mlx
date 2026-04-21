@@ -176,6 +176,14 @@ type ChatRuntimeStore = {
   loadedKvCacheDtype: string | null;
   speculativeType: string | null;
   loadedSpeculativeType: string | null;
+  // Phase 7 — MLX speculative decoding requires a draft-model path.
+  // The value is the absolute path to the draft MLX checkpoint dir
+  // (e.g. /Users/.../Ternary-Bonsai-1.7B-mlx-2bit). ``null`` when no
+  // draft is configured. Separate from ``speculativeType`` because a
+  // path with ``speculativeType === null`` is an error state the UI
+  // must disambiguate from an explicit off.
+  draftModelPath: string | null;
+  loadedDraftModelPath: string | null;
   customContextLength: number | null;
   defaultChatTemplate: string | null;
   chatTemplateOverride: string | null;
@@ -215,6 +223,7 @@ type ChatRuntimeStore = {
   setToolCallTimeout: (value: number) => void;
   setKvCacheDtype: (dtype: string | null) => void;
   setSpeculativeType: (type: string | null) => void;
+  setDraftModelPath: (path: string | null) => void;
   setCustomContextLength: (v: number | null) => void;
   setChatTemplateOverride: (template: string | null) => void;
   setPendingAudio: (base64: string, name: string) => void;
@@ -252,6 +261,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   loadedKvCacheDtype: null,
   speculativeType: "ngram-mod",
   loadedSpeculativeType: null,
+  draftModelPath: null,
+  loadedDraftModelPath: null,
   customContextLength: null,
   defaultChatTemplate: null,
   chatTemplateOverride: null,
@@ -345,6 +356,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
       loadedKvCacheDtype: null,
       speculativeType: "ngram-mod",
       loadedSpeculativeType: null,
+      draftModelPath: null,
+      loadedDraftModelPath: null,
       customContextLength: null,
       defaultChatTemplate: null,
       chatTemplateOverride: null,
@@ -371,6 +384,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
     }),
   setKvCacheDtype: (kvCacheDtype) => set({ kvCacheDtype }),
   setSpeculativeType: (speculativeType) => set({ speculativeType }),
+  setDraftModelPath: (draftModelPath) => set({ draftModelPath }),
   setCustomContextLength: (customContextLength) => set({ customContextLength }),
   setChatTemplateOverride: (chatTemplateOverride) => set({ chatTemplateOverride }),
   setPendingAudio: (base64, name) =>

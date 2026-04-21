@@ -452,7 +452,7 @@ export function useChatModelRuntime() {
               previousWasUnloaded = true;
             }
 
-            const { chatTemplateOverride, kvCacheDtype, customContextLength, ggufContextLength, speculativeType } = useChatRuntimeStore.getState();
+            const { chatTemplateOverride, kvCacheDtype, customContextLength, ggufContextLength, speculativeType, draftModelPath } = useChatRuntimeStore.getState();
             // GGUF: use custom context length, or 0 = model's native context
             // Non-GGUF: use the Max Seq Length slider value
             const isDirectGgufFile = modelId.toLowerCase().endsWith(".gguf");
@@ -470,6 +470,11 @@ export function useChatModelRuntime() {
               chat_template_override: chatTemplateOverride,
               cache_type_kv: kvCacheDtype,
               speculative_type: speculativeType,
+              // Phase 7: MLX draft-model path for speculative decoding.
+              // Only meaningful when speculativeType === "mlx-draft-model"
+              // — the backend ignores it otherwise. We forward the raw
+              // value so a user can leave it set across reloads.
+              draft_model_path: draftModelPath,
             });
 
             // If cancelled while loading, don't update UI to show
@@ -526,6 +531,10 @@ export function useChatModelRuntime() {
               loadedKvCacheDtype: loadedKv,
               speculativeType: loadedSpec,
               loadedSpeculativeType: loadedSpec,
+              // Phase 7: the backend doesn't echo the draft path in the
+              // response (it's derived from the request), so reuse the
+              // value we just sent as the "loaded" baseline.
+              loadedDraftModelPath: draftModelPath,
               customContextLength: keepCustomCtx,
               defaultChatTemplate: loadResponse.chat_template ?? null,
               chatTemplateOverride: null,
