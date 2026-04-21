@@ -8,6 +8,12 @@ pandas
 nest_asyncio
 datasets==4.3.0
 pyjwt
+# Required by FastAPI multipart form handlers (UploadFile / Form / File).
+# Used by /v1/audio/transcriptions and the dataset upload routes — without
+# this, FastAPI raises at request time rather than import time, so it was
+# easy to miss during CI. Pinned here explicitly after Chunk C surfaced it
+# during the GGUF regression-test run.
+python-multipart
 easydict
 addict
 # gradio>=4.0.0                  # 148 MB - Studio uses React + FastAPI, not Gradio
