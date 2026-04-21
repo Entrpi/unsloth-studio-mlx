@@ -917,6 +917,54 @@ def _iter_gguf_files(directory: Path, recursive: bool = False):
             yield f
 
 
+def _detect_mlx_model(path: Path) -> bool:
+    """Return True iff *path* is a local MLX checkpoint directory.
+
+    The detection rule is empirically derived from ``mlx_lm.utils.save_config``
+    (MLX writes a top-level ``"quantization"`` dict with both ``bits`` and
+    ``group_size`` keys). Stock HuggingFace configs do not carry this block,
+    and bitsandbytes / GPTQ checkpoints use a different key
+    (``"quantization_config"``) so there is no collision.
+
+    The function is defensive: missing / malformed ``config.json`` simply
+    returns False, never raises.
+    """
+    try:
+        p = Path(path)
+        if not p.is_dir():
+            return False
+        config_path = p / "config.json"
+        if not config_path.is_file():
+            return False
+        with open(config_path, "r", encoding = "utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(cfg, dict):
+        return False
+    quant = cfg.get("quantization")
+    if not isinstance(quant, dict):
+        return False
+    return "bits" in quant and "group_size" in quant
+
+
+def _read_mlx_max_position_embeddings(path: Path) -> Optional[int]:
+    """Read ``max_position_embeddings`` from an MLX model's ``config.json``.
+
+    Returns None on any failure. Used to populate ``native_context_length``
+    for MLX-loaded models.
+    """
+    try:
+        with open(Path(path) / "config.json", "r", encoding = "utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    val = cfg.get("max_position_embeddings") if isinstance(cfg, dict) else None
+    if isinstance(val, int) and val > 0:
+        return val
+    return None
+
+
 def detect_mmproj_file(path: str, search_root: Optional[str] = None) -> Optional[str]:
     """
     Find the mmproj (vision projection) GGUF file for a given model.
@@ -1858,6 +1906,9 @@ class ModelConfig:
     is_vision: bool  # Is this a vision model?
     is_lora: bool  # Is this a lora adapter?
     is_gguf: bool = False  # Is this a GGUF model?
+    is_mlx: bool = False  # Is this an MLX (Apple Silicon) checkpoint?
+    mlx_path: Optional[str] = None  # Absolute path to the MLX model dir
+    native_context_length: Optional[int] = None  # From config.json (MLX)
     is_audio: bool = False  # Is this a TTS audio model?
     audio_type: Optional[str] = (
         None  # Audio codec type: 'snac', 'csm', 'bicodec', 'dac'
@@ -2039,6 +2090,29 @@ class ModelConfig:
                     is_gguf = True,
                     gguf_file = gguf_file,
                     gguf_mmproj_file = mmproj_file,
+                )
+
+            # Auto-detect MLX checkpoints (after GGUF wins). MLX detection keys
+            # off a top-level "quantization" {"bits", "group_size"} block in
+            # config.json, written by mlx_lm.utils.save_config.
+            if _detect_mlx_model(Path(path)):
+                display_name = Path(path).name
+                native_ctx = _read_mlx_max_position_embeddings(Path(path))
+                logger.info(
+                    f"Detected local MLX model at '{path}' "
+                    f"(native_context_length={native_ctx})"
+                )
+                return cls(
+                    identifier = identifier,
+                    display_name = display_name,
+                    path = path,
+                    is_local = True,
+                    is_cached = True,
+                    is_vision = False,
+                    is_lora = False,
+                    is_mlx = True,
+                    mlx_path = path,
+                    native_context_length = native_ctx,
                 )
         else:
             # Check if the HF repo contains GGUF files
