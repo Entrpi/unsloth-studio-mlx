@@ -971,3 +971,62 @@ JSDoc `@deprecated` comments were added to every legacy boolean on `types/api.ts
 - `backend_kind` itself is NOT deprecated (it's the replacement).
 - Reading a deprecated field on an instance raises `DeprecationWarning`; construction stays silent; reading `backend_kind` stays silent.
 - Every `BackendKind` literal variant is accepted by Pydantic; invalid variants are rejected.
+
+---
+
+# Chunk G — Residual follow-ups
+
+Closes the two items Chunk F's deliverable flagged as still open after the main deprecation landed. After this chunk the follow-up list is empty.
+
+## Items landed
+
+| # | Item | Status |
+|---|---|---|
+| G1 | Migrate `ModelOption.isGguf` to `backendKind` across `components/assistant-ui/model-selector/**` so the frontend deprecation is uniform outside `features/chat/**` | landed |
+| G2 | Add `backend_kind` to `ValidateModelResponse` so the `/validate` endpoint is symmetric with `LoadResponse` / `InferenceStatusResponse` | landed |
+
+## G1 — `ModelOption.backendKind`
+
+`ModelOption` in `studio/frontend/src/components/assistant-ui/model-selector/types.ts` now carries an additive `backendKind?: BackendKind | null` alongside the deprecated `isGguf`. `BackendKind` is imported from `@/features/chat/types/api` — the same path already used for `GgufVariantDetail` in `pickers.tsx`, so no new layering.
+
+The single `ModelOption.isGguf` read site (`pickers.tsx` line 493, in the `modelGgufIds` memo that feeds `isKnownGgufRepo`) now prefers `backendKind === "gguf"` and falls back to the deprecated boolean — the same fallback pattern F2 used in `chat-page.tsx`. `isGguf` on `ModelOption` carries a JSDoc `@deprecated` note mirroring the backend Pydantic field.
+
+`chat-page.tsx` now populates `backendKind` on each `ModelOption` it builds from the store (reading through `ChatModelSummary.backendKind` which F2 introduced); `isGguf` stays populated for compat with any picker that hasn't migrated yet.
+
+Per the chunk's hard rules, `LoraModelOption` / `HfModelResult` / `LocalModelInfo` / training-flow `ModelOption` reads in `pickers.tsx` (rows 1192, 1199, 1543…) were left alone — they construct `isGguf` locally from `.gguf` suffix heuristics and don't carry a backend summary. They're intentionally out of scope for G1.
+
+## G2 — `ValidateModelResponse.backend_kind`
+
+`ValidateModelResponse` in `studio/backend/models/inference.py` now carries `backend_kind: Optional[BackendKind] = Field(default=None, description=...)`. The field style matches `LoadResponse.backend_kind` verbatim — same `None`-on-cold-start semantics, same "primary source of truth / booleans deprecated" docstring.
+
+The single `/validate` construction site in `routes/inference.py` now derives `backend_kind` from the resolved `ModelConfig`:
+
+| `ModelConfig` flag | → `backend_kind` |
+|---|---|
+| `is_mlx_vlm` | `"mlx+vlm"` |
+| `is_mlx_audio` | `"mlx+audio"` |
+| `is_mlx_lora` (or `is_mlx && is_lora`) | `"mlx+lora"` |
+| `is_mlx` | `"mlx"` |
+| `is_gguf` | `"gguf"` |
+| none of the above | `"unsloth"` |
+
+The booleans `is_mlx` / `is_mlx_vlm` / `is_mlx_audio` are now also populated on `ValidateModelResponse` (they weren't before — only `is_gguf` was set pre-G2). This is additive and keeps the wire shape symmetric with `LoadResponse`.
+
+## Test results after Chunk G
+
+- **276 MLX tests pass, 0 xfail.** Delta from Chunk F: +16 new G2 tests in `test_mlx_validate_backend_kind.py`; no regressions in the 260 pre-existing tests.
+- 28 tool-call parser tests continue to pass.
+- `npm run typecheck` in `studio/frontend` clean.
+
+## New G2 tests
+
+`studio/backend/tests/test_mlx_validate_backend_kind.py` (16 tests):
+- **Compat path** — constructing `ValidateModelResponse(is_gguf=True, …)` with no `backend_kind` still works; reading the deprecated boolean still emits a `DeprecationWarning` per the F2 contract.
+- **Dump round-trip** — constructing with `backend_kind="gguf"` carries both the enum AND the deprecated boolean through `model_dump()`.
+- **Schema contract** — `backend_kind` is NOT `deprecated` in the generated schema even though it sits alongside deprecated peers.
+- **Enum variants** — every `BackendKind` literal is accepted; invalid strings are rejected.
+- **Route-level** — POST `/inference/validate` against a stubbed `ModelConfig` returns the correct `backend_kind` for each of gguf / mlx / mlx+lora / mlx+vlm / mlx+audio / unsloth; legacy booleans mirror the config deterministically.
+
+## Residual follow-ups after Chunk G
+
+None. The deprecation is uniform across the Pydantic schemas that carry backend identity (`LoadResponse`, `InferenceStatusResponse`, `ValidateModelResponse`, `ModelDetails`) and across the frontend chat + model-selector surfaces. Removal of the legacy booleans remains deferred to a future chunk once telemetry confirms no external readers still hit them.
