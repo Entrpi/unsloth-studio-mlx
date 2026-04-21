@@ -63,9 +63,10 @@ def test_load_unload_roundtrip():
     assert backend.native_context_length == backend.context_length
     # Feature flags. Bonsai ships a Qwen3-derived template with literal
     # <think>/</think> tags → Phase 4 detects it as reasoning-capable
-    # (always-on). Vision and tools remain false in Chunk A.
+    # (always-on). The template also contains `tools`/`tool_calls` keywords
+    # → Phase 5 detects tool-calling support. Vision stays false until Phase 9.
     assert backend.is_vision is False
-    assert backend.supports_tools is False
+    assert backend.supports_tools is True
     assert backend.supports_reasoning is True
     assert backend.reasoning_always_on is True
     assert backend.reasoning_default is True
