@@ -948,6 +948,193 @@ def _detect_mlx_model(path: Path) -> bool:
     return "bits" in quant and "group_size" in quant
 
 
+def _detect_mlx_vlm_model(path: Path) -> bool:
+    """Return True iff *path* is a local MLX vision-language checkpoint.
+
+    Phase 9 (Chunk D) detection rule. Two-signal check:
+
+    1. The directory ships **both** ``preprocessor_config.json`` and
+       ``processor_config.json`` alongside ``config.json``. This is the
+       shape ``mlx-vlm`` checkpoints follow: the image processor config
+       and the composite AutoProcessor config live side-by-side with
+       the weights. Stock MLX text checkpoints never ship either file.
+
+    2. OR ``config.json:architectures[0]`` ends with
+       ``"ConditionalGeneration"`` AND ``model_type`` is in the
+       curated allow-list we've actually confirmed ``mlx-vlm`` can load
+       (see ``_KNOWN_MLX_VLM_MODEL_TYPES``). This catches checkpoints
+       that skipped the preprocessor-config file but still work with
+       ``mlx_vlm.load``.
+
+    Called AFTER :func:`_detect_mlx_model` in the detection chain, so a
+    base-text MLX checkpoint that happens to live in a directory with
+    an orphan ``preprocessor_config.json`` won't get misclassified —
+    the VLM detector is only consulted when the MLX detector returns
+    False or from the VLM-specific branch in ``from_identifier``. In
+    practice there's no collision because VLM configs still carry the
+    MLX ``quantization`` block, so we reverse the check: **if
+    preprocessor_config.json is present the model is VLM, regardless
+    of whether ``_detect_mlx_model`` already said "yes"**.
+    """
+    try:
+        p = Path(path)
+        if not p.is_dir():
+            return False
+        if not (p / "config.json").is_file():
+            return False
+
+        has_preprocessor = (p / "preprocessor_config.json").is_file()
+        has_processor = (p / "processor_config.json").is_file()
+        # Single-file signal: processor_config.json alone is enough on
+        # some HF exports; preprocessor_config.json alone is enough on
+        # others. Require at least one to be present.
+        if has_preprocessor or has_processor:
+            return True
+
+        # Fallback: architecture / model_type probe. Only succeeds when
+        # the config explicitly advertises a ConditionalGeneration head
+        # AND the model_type is one we know mlx-vlm supports.
+        with open(p / "config.json", "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            return False
+        archs = cfg.get("architectures")
+        first_arch = archs[0] if isinstance(archs, list) and archs else None
+        model_type = cfg.get("model_type")
+        if (
+            isinstance(first_arch, str)
+            and first_arch.endswith("ConditionalGeneration")
+            and isinstance(model_type, str)
+            and model_type.lower() in _KNOWN_MLX_VLM_MODEL_TYPES
+        ):
+            return True
+        return False
+    except (OSError, ValueError):
+        return False
+
+
+# Curated set of ``model_type`` strings that we have confirmed
+# ``mlx-vlm`` can load. Derived from the module list in
+# ``mlx_vlm.models`` as of mlx-vlm 0.4.4 (probed at Chunk D start).
+# Lower-cased for case-insensitive comparison.
+#
+# We intentionally list ``model_type`` values (from config.json) rather
+# than the ``mlx_vlm.models`` submodule names — the mapping is usually
+# 1:1 but not always (e.g., Qwen3.5-VL ships ``model_type: "qwen3_5"``
+# which maps to ``mlx_vlm.models.qwen3_5``).
+_KNOWN_MLX_VLM_MODEL_TYPES = frozenset(
+    {
+        "aya_vision",
+        "deepseek_vl_v2",
+        "deepseekocr",
+        "dots_ocr",
+        "ernie4_5_moe_vl",
+        "falcon_ocr",
+        "falcon_perception",
+        "fastvlm",
+        "florence2",
+        "gemma3",
+        "gemma3n",
+        "gemma4",
+        "glm4v",
+        "glm4v_moe",
+        "glm_ocr",
+        "granite4_vision",
+        "granite_vision",
+        "hunyuan_vl",
+        "idefics2",
+        "idefics3",
+        "internvl_chat",
+        "jina_vlm",
+        "kimi_vl",
+        "lfm2_vl",
+        "llama4",
+        "llava",
+        "llava_bunny",
+        "llava_next",
+        "minicpmo",
+        "mistral3",
+        "mistral4",
+        "mllama",
+        "molmo",
+        "molmo2",
+        "molmo_point",
+        "moondream3",
+        "multi_modality",
+        "paddleocr_vl",
+        "paligemma",
+        "phi3_v",
+        "phi4_siglip",
+        "phi4mm",
+        "pixtral",
+        "qwen2_5_vl",
+        "qwen2_vl",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_omni_moe",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+        "rfdetr",
+        "sam3",
+        "sam3_1",
+        "smolvlm",
+    }
+)
+
+
+def _detect_mlx_audio_model(path: Path) -> bool:
+    """Return True iff *path* is a local MLX audio checkpoint.
+
+    Phase 10 (Chunk D) detection rule. Key off ``config.json``'s
+    ``architectures[0]`` / ``model_type``:
+
+    - ``architectures[0]`` ending in ``AudioForConditionalGeneration``
+      (catches ``Lfm2AudioForConditionalGeneration`` and future
+      omni/audio models that follow the same naming).
+    - OR ``model_type`` in the curated allow-list
+      :data:`_KNOWN_MLX_AUDIO_MODEL_TYPES`.
+
+    The detection is run BEFORE :func:`_detect_mlx_vlm_model` and
+    :func:`_detect_mlx_model` because the LFM2.5-Audio checkpoint
+    does not carry an ``mlx-lm`` quantization block (weights are
+    pre-trained bf16, not MLX-quantized) and is not a VLM.
+    """
+    try:
+        p = Path(path)
+        if not p.is_dir() or not (p / "config.json").is_file():
+            return False
+        with open(p / "config.json", "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            return False
+        archs = cfg.get("architectures")
+        first_arch = archs[0] if isinstance(archs, list) and archs else None
+        model_type = cfg.get("model_type")
+        if isinstance(first_arch, str) and first_arch.endswith(
+            "AudioForConditionalGeneration"
+        ):
+            return True
+        if (
+            isinstance(model_type, str)
+            and model_type.lower() in _KNOWN_MLX_AUDIO_MODEL_TYPES
+        ):
+            return True
+        return False
+    except (OSError, ValueError):
+        return False
+
+
+# Curated set of ``model_type`` strings for MLX audio models.
+# Derived from the module list in ``mlx_audio.sts.models`` as of
+# mlx-audio 0.4.2 (probed at Chunk D start).
+_KNOWN_MLX_AUDIO_MODEL_TYPES = frozenset(
+    {
+        "lfm_audio",
+        "lfm2_audio",
+    }
+)
+
+
 def _detect_mlx_adapter(path: Path) -> bool:
     """Return True iff *path* is a directory containing MLX LoRA adapter files.
 
@@ -1945,6 +2132,19 @@ class ModelConfig:
     # stored inside the base model's directory.
     is_mlx_lora: bool = False
     mlx_adapter_path: Optional[str] = None
+    # Phase 9 (Chunk D) — MLX vision-language support. When
+    # ``is_mlx_vlm=True`` the route's loader branches to
+    # ``MlxVlmBackend.load_model`` instead of ``MlxLmBackend``.
+    # ``mlx_vlm_path`` mirrors ``mlx_path`` and is the local snapshot
+    # dir to pass to ``mlx_vlm.load``. Mutually exclusive with
+    # ``is_mlx`` (the base text flag): a checkpoint is either VLM or
+    # text, not both.
+    is_mlx_vlm: bool = False
+    mlx_vlm_path: Optional[str] = None
+    # Phase 10 (Chunk D) — MLX audio support. When ``is_mlx_audio=True``
+    # the route's loader branches to ``MlxAudioBackend.load_model``.
+    is_mlx_audio: bool = False
+    mlx_audio_path: Optional[str] = None
     native_context_length: Optional[int] = None  # From config.json (MLX)
     is_audio: bool = False  # Is this a TTS audio model?
     audio_type: Optional[str] = (
@@ -2127,6 +2327,56 @@ class ModelConfig:
                     is_gguf = True,
                     gguf_file = gguf_file,
                     gguf_mmproj_file = mmproj_file,
+                )
+
+            # Phase 10 (Chunk D) — MLX audio checkpoint detection. Runs
+            # BEFORE the VLM and base-MLX detectors because audio
+            # models (LFM2.5-Audio) do NOT carry the mlx-lm
+            # ``quantization`` block but DO advertise their audio
+            # architecture via ``architectures`` / ``model_type``.
+            if _detect_mlx_audio_model(Path(path)):
+                display_name = Path(path).name
+                native_ctx = _read_mlx_max_position_embeddings(Path(path))
+                logger.info(
+                    f"Detected local MLX-Audio model at '{path}' "
+                    f"(native_context_length={native_ctx})"
+                )
+                return cls(
+                    identifier = identifier,
+                    display_name = display_name,
+                    path = path,
+                    is_local = True,
+                    is_cached = True,
+                    is_vision = False,
+                    is_lora = False,
+                    is_mlx_audio = True,
+                    mlx_audio_path = path,
+                    is_audio = True,
+                    native_context_length = native_ctx,
+                )
+
+            # Phase 9 (Chunk D) — MLX vision-language detection. Runs
+            # BEFORE the base-MLX detector because VLM checkpoints also
+            # ship the ``quantization`` block (they're MLX-quantized
+            # too) and would otherwise be misrouted to ``MlxLmBackend``.
+            if _detect_mlx_vlm_model(Path(path)):
+                display_name = Path(path).name
+                native_ctx = _read_mlx_max_position_embeddings(Path(path))
+                logger.info(
+                    f"Detected local MLX-VLM model at '{path}' "
+                    f"(native_context_length={native_ctx})"
+                )
+                return cls(
+                    identifier = identifier,
+                    display_name = display_name,
+                    path = path,
+                    is_local = True,
+                    is_cached = True,
+                    is_vision = True,
+                    is_lora = False,
+                    is_mlx_vlm = True,
+                    mlx_vlm_path = path,
+                    native_context_length = native_ctx,
                 )
 
             # Auto-detect MLX checkpoints (after GGUF wins). MLX detection keys
