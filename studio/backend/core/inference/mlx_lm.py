@@ -32,6 +32,7 @@ The module is importable on any platform: ``mlx_lm`` is lazy-imported inside
 
 from __future__ import annotations
 
+import concurrent.futures
 import gc
 import json
 import platform
@@ -1733,16 +1734,94 @@ class MlxLmBackend:
                     "arguments": arguments,
                 }
 
+                # ── Hard-timeout wrapper around execute_tool ─────
+                #
+                # execute_tool passes its ``timeout`` down to each tool's
+                # implementation, but tool impls don't all honour it as
+                # a wall-clock bound (e.g. ``ddgs`` passes it per-
+                # request, not across its multi-provider fallback
+                # chain), and none of them interrupt a blocking socket
+                # read when ``cancel_event`` fires.
+                #
+                # Previously a hung ``web_search`` would wedge the
+                # agentic loop indefinitely — the user's "Stop" did
+                # nothing, and the process stayed pinned for hours on
+                # a stuck ESTABLISHED connection. Wrap the call in a
+                # per-invocation thread so the loop can abandon the
+                # tool when either the outer timeout expires or the
+                # user cancels. We can't forcibly kill the blocked
+                # thread (CPython threads aren't interruptible), but
+                # we can detach it and move on — the stuck socket eats
+                # a few KB of stack until the OS times it out.
                 try:
                     effective_timeout = (
                         None if tool_call_timeout >= 9999 else tool_call_timeout
                     )
-                    result = execute_tool(
+                    tool_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers = 1,
+                        thread_name_prefix = "mlx-tool-exec",
+                    )
+                    try:
+                        tool_future = tool_executor.submit(
+                            execute_tool,
+                            tool_name,
+                            arguments,
+                            cancel_event = cancel_event,
+                            timeout = effective_timeout,
+                            session_id = session_id,
+                        )
+                        deadline = (
+                            time.monotonic() + effective_timeout
+                            if effective_timeout is not None
+                            else None
+                        )
+                        # Poll in 0.5 s slices so cancel_event latency
+                        # stays bounded while still letting well-behaved
+                        # tools return within the deadline.
+                        while True:
+                            remaining = (
+                                deadline - time.monotonic()
+                                if deadline is not None
+                                else None
+                            )
+                            if remaining is not None and remaining <= 0:
+                                raise concurrent.futures.TimeoutError()
+                            wait_for = (
+                                min(0.5, remaining)
+                                if remaining is not None
+                                else 0.5
+                            )
+                            try:
+                                result = tool_future.result(timeout = wait_for)
+                                break
+                            except concurrent.futures.TimeoutError:
+                                if (
+                                    cancel_event is not None
+                                    and cancel_event.is_set()
+                                ):
+                                    # User cancelled; don't wait on the
+                                    # zombie thread, return to the
+                                    # caller so the SSE stream can
+                                    # close cleanly.
+                                    return
+                                # else keep waiting within the deadline
+                                continue
+                    finally:
+                        # wait=False so a still-running tool thread
+                        # doesn't hold up shutdown. The orphaned
+                        # thread exits when its socket read eventually
+                        # unblocks or errors.
+                        tool_executor.shutdown(wait = False)
+                except concurrent.futures.TimeoutError:
+                    logger.warning(
+                        "Tool '%s' exceeded %ss timeout; abandoning "
+                        "background thread.",
                         tool_name,
-                        arguments,
-                        cancel_event = cancel_event,
-                        timeout = effective_timeout,
-                        session_id = session_id,
+                        effective_timeout,
+                    )
+                    result = (
+                        f"Error executing {tool_name}: timed out after "
+                        f"{effective_timeout}s."
                     )
                 except Exception as exc:
                     result = f"Error executing {tool_name}: {exc}"

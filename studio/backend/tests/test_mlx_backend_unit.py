@@ -2126,6 +2126,149 @@ class TestContentStreamHoldback:
                 )
 
 
+class TestAgenticLoopToolTimeout:
+    """Regression coverage for hung tool execution wedging the agentic
+    loop. Previously a blocking ``web_search`` could hold the MLX
+    backend for hours because ``execute_tool`` was called synchronously
+    on the generator thread and the tool's own ``timeout=`` kwarg
+    wasn't a strict wall-clock bound. The loop now wraps each tool
+    call in a ``concurrent.futures`` thread so it can abandon the
+    invocation when either the outer timeout expires or ``cancel_event``
+    fires.
+    """
+
+    def _run_with_kwargs(self, b, turns_text, tools, **extra_kwargs):
+        """Inline version of _run_tool_loop that forwards extra kwargs
+        (eg tool_call_timeout, cancel_event) to
+        generate_chat_completion_with_tools."""
+        from unittest import mock as _mock
+        import sys as _sys
+
+        turn_iter = iter(turns_text)
+
+        def fake_stream_generate(_model, _tokenizer, **_kwargs):
+            txt = next(turn_iter)
+            if not txt:
+                yield _FakeResp("", prompt_tokens=5, generation_tokens=0)
+                return
+            mid = len(txt) // 2
+            yield _FakeResp(txt[:mid])
+            yield _FakeResp(
+                txt[mid:],
+                prompt_tokens=10,
+                generation_tokens=20,
+                prompt_tps=5.0,
+                generation_tps=30.0,
+            )
+
+        import core.inference.mlx_lm as mlx_lm_mod
+
+        with _mock.patch.object(
+            mlx_lm_mod, "stream_generate", fake_stream_generate, create=True
+        ), _mock.patch.object(
+            mlx_lm_mod,
+            "_build_mlx_sampler_and_processors",
+            return_value=(None, []),
+        ):
+            fake_mod = _mock.MagicMock()
+            fake_mod.stream_generate = fake_stream_generate
+            with _mock.patch.dict(_sys.modules, {"mlx_lm": fake_mod}):
+                return list(
+                    b.generate_chat_completion_with_tools(
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=tools,
+                        **extra_kwargs,
+                    )
+                )
+
+    def test_hung_tool_returns_timeout_error_not_deadlock(self):
+        from unittest import mock
+        import time as _time
+
+        b = _stub_backend_for_tools()
+
+        # Tool implementation that sleeps far longer than the wrapper's
+        # tool_call_timeout. The loop must abandon it and continue.
+        slept_for = {}
+
+        def _hang_forever(name, arguments, cancel_event, timeout, session_id):
+            start = _time.monotonic()
+            _time.sleep(10)
+            slept_for["done"] = _time.monotonic() - start
+            return "should-not-reach-here"
+
+        with mock.patch(
+            "core.inference.tools.execute_tool", side_effect=_hang_forever
+        ):
+            start = _time.monotonic()
+            events = self._run_with_kwargs(
+                b,
+                turns_text=[
+                    '<tool_call>{"name": "web_search", '
+                    '"arguments": {"q": "x"}}</tool_call>',
+                    "final.",
+                ],
+                tools=[{"type": "function", "function": {"name": "web_search"}}],
+                tool_call_timeout=1,
+                max_tool_iterations=3,
+            )
+            elapsed = _time.monotonic() - start
+
+        # The outer loop must have returned within tool_call_timeout
+        # plus one poll slice + follow-up turn overhead — not 10s.
+        assert elapsed < 5, (
+            f"tool-hang wedged the loop for {elapsed:.1f}s; timeout was "
+            f"not enforced"
+        )
+        tool_end_events = [e for e in events if e.get("type") == "tool_end"]
+        assert tool_end_events, "no tool_end event — loop didn't unblock"
+        assert "timed out" in tool_end_events[0]["result"].lower(), (
+            f"expected timeout marker in result; got {tool_end_events[0]}"
+        )
+        # 'done' not set because the fake tool was abandoned mid-sleep.
+        assert "done" not in slept_for
+
+    def test_cancel_event_during_tool_exits_cleanly(self):
+        from unittest import mock
+        import time as _time
+
+        b = _stub_backend_for_tools()
+        cancel = threading.Event()
+
+        def _hang_then_check(name, arguments, cancel_event, timeout, session_id):
+            _time.sleep(10)
+            return "too-late"
+
+        def _fire_cancel():
+            _time.sleep(0.3)
+            cancel.set()
+
+        threading.Thread(target=_fire_cancel, daemon=True).start()
+
+        with mock.patch(
+            "core.inference.tools.execute_tool", side_effect=_hang_then_check
+        ):
+            start = _time.monotonic()
+            events = self._run_with_kwargs(
+                b,
+                turns_text=[
+                    '<tool_call>{"name": "web_search", '
+                    '"arguments": {"q": "x"}}</tool_call>',
+                    "final.",
+                ],
+                tools=[{"type": "function", "function": {"name": "web_search"}}],
+                cancel_event=cancel,
+                tool_call_timeout=30,
+                max_tool_iterations=3,
+            )
+            elapsed = _time.monotonic() - start
+
+        assert elapsed < 3, (
+            f"cancel_event didn't interrupt tool; loop ran {elapsed:.1f}s"
+        )
+        assert events  # tool_start at minimum
+
+
 class TestAgenticLoopMaxIterations:
     def test_cap_triggers_final_nudge(self):
         from unittest import mock
