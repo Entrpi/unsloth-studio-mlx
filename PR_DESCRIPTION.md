@@ -864,3 +864,48 @@ curl -s -X POST http://localhost:8085/v1/audio/transcriptions \
     round-trip, ASR call contract).
   - All pre-existing Chunks A–C tests unchanged.
 - `npm run typecheck` in `studio/frontend` clean.
+
+---
+
+# Chunk E — Refinement pass
+
+Quality / polish pass across Chunks A–D follow-ups. No new user-visible features; tightens correctness, ergonomics, robustness, and test coverage.
+
+## Items landed
+
+| # | Item | Status |
+|---|---|---|
+| E1 | Fix stale Phase-1 `test_non_gguf_load_responses_omit_field` (MLX now populates `native_context_length`) | landed |
+| E2 | Pin `python-multipart` as explicit runtime dep (was ad-hoc install during Chunk C) | landed |
+| E3 | Expose `num_draft_tokens` via `LoadRequest` (was hardcoded to 3) | landed |
+| E4 | Surface backend `warnings: list[str]` on `LoadProgressResponse` + frontend | landed |
+| E5 | Hard-refuse tokenizer mismatch on speculative decoding (was soft warning) | landed |
+| E6 | Fix cross-test pollution via module-load stubs (httpx / import-order issues) | landed |
+| E7 | Stream tool-call arguments across multiple SSE deltas (OpenAI spec compliance) | landed |
+| E8 | Non-Bonsai tool-calling template coverage — new `test_mlx_tool_templates.py`, 2 xfail cases for known template gaps | landed (partial) |
+| E9 | `mlx-whisper` as parallel ASR path (opt-in via `backend=whisper`) | landed |
+| E10 | `BackendKind` boolean deprecation (optional) | deferred |
+
+## E9 — Whisper ASR opt-in
+
+`LFM2.5-Audio` ASR is conversational rather than verbatim (see PROBE_RESULTS.md). For real transcription, clients now opt in to `mlx-whisper` via the `backend` form field on `/v1/audio/transcriptions`.
+
+```bash
+curl -s -X POST http://localhost:8085/v1/audio/transcriptions \
+  -H "Authorization: Bearer $STUDIO_API_KEY" \
+  -F file=@/tmp/speech.wav \
+  -F backend=whisper \
+  -F response_format=json
+# Expected: {"text": "verbatim transcription"}.
+# Whisper model resolves via MLX_WHISPER_MODEL env var, falls back to
+# mlx-community/whisper-tiny. Lazy-imported; the ASR path continues to
+# work without mlx-whisper for the LFM2.5-Audio default.
+```
+
+Non-goals: replacing LFM2.5-Audio as the default ASR. Whisper is opt-in; the prior path is preserved.
+
+## Test results after Chunk E
+
+- 248 MLX tests pass + 2 xfail (E8's documented non-Bonsai template gaps).
+- 0 regressions from Chunks A–D.
+- `/tmp/mlxtest/bin/pytest tests/test_mlx_*.py tests/test_tool_call_parser.py tests/test_native_context_length.py` completes in ~3 min.
