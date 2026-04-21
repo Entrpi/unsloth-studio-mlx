@@ -12,11 +12,14 @@ All four models were fetched via `hf download` into the existing
 | `~/.lmstudio/models/mlx-community/Ministral-3-3B-Instruct-2512-4bit` | Text + tool-template (native tool_calls) | ~2.6 GB |
 | `~/.lmstudio/models/mlx-community/Llama-3.2-3B-Instruct-4bit` | Text + tool-template (Llama3 JSON dialect) | ~1.7 GB |
 | `~/.lmstudio/models/mlx-community/whisper-small-mlx-4bit` | ASR (mlx-whisper) | ~187 MB |
+| `~/.lmstudio/models/mlx-community/gemma-4-e4b-it-4bit` | Text + tool template + tool-call E2E (Gemma-4 dense) | ~4.9 GB |
 
 Already local and reused by the matrix expansion:
 
 - `~/.lmstudio/models/mlx-community/Qwen3.5-35B-A3B-4bit` (~17 GB) — MoE.
 - `~/.lmstudio/models/lmstudio-community/GLM-4.6V-Flash-MLX-8bit` (~10 GB) — non-Qwen VLM.
+- `~/.lmstudio/models/mlx-community/gemma-4-31b-it-4bit` (~17 GB) — Gemma-4 dense (template probe only).
+- `~/.lmstudio/models/mlx-community/gemma-4-26b-a4b-4bit` (~14 GB) — Gemma-4 MoE (a4b).
 
 ## Fetch commands
 
@@ -35,6 +38,9 @@ local-dir — HF's cache lock is per-repo so they don't contend):
 
 /tmp/mlxtest/bin/hf download mlx-community/whisper-small-mlx-4bit \
   --local-dir /Users/ent/.lmstudio/models/mlx-community/whisper-small-mlx-4bit &
+
+/tmp/mlxtest/bin/hf download mlx-community/gemma-4-e4b-it-4bit \
+  --local-dir /Users/ent/.lmstudio/models/mlx-community/gemma-4-e4b-it-4bit &
 
 wait
 ```
@@ -60,6 +66,13 @@ wait
   round-trip against it produces recognisable words. Chunk E-9 shipped
   the `transcribe_with_whisper` method mock-only; this model makes the
   path end-to-end testable.
+- **gemma-4-e4b-it-4bit** — Google Gemma-4 E4B (~4.9 GB) dense 4-bit
+  instruct. Closes the last Gemma-4 coverage cell: H-2 originally only
+  template-probed Gemma-4 (the 31B dense row) and never loaded weights.
+  E4B is small enough to ship alongside the default fast-suite so the
+  E2E "Gemma-4 loads + generates" path is no longer CI-silent. Also
+  powers the Gemma-4 tool-calling end-to-end check (native
+  `<|tool_call>call:NAME{...}<tool_call|>` dialect inherited from 31B).
 
 ## Decommissioning
 
