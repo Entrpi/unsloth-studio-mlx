@@ -5180,10 +5180,35 @@ async def _mlx_agentic_stream(
     _stream_usage = None
     _stream_timings = None
 
+    # ── Concurrent disconnect poll ─────────────────────────────
+    # The in-line ``if await request.is_disconnected(): ...`` check
+    # below only runs between events. While the backend's generator is
+    # blocked inside a synchronous tool call (handed off via
+    # ``asyncio.to_thread(next, gen, ...)``), the disconnect check
+    # doesn't fire — so clicking Stop in the UI during a tool
+    # execution used to do nothing until the tool finally returned
+    # (or the 300 s cap expired). Poll every 500 ms in a background
+    # task so ``cancel_event`` gets set quickly regardless of what
+    # ``next(gen)`` is doing; the backend's tool wrapper polls
+    # ``cancel_event`` at the same cadence and returns.
+    async def _disconnect_poller():
+        try:
+            while not cancel_event.is_set():
+                await asyncio.sleep(0.5)
+                if await request.is_disconnected():
+                    cancel_event.set()
+                    return
+        except asyncio.CancelledError:
+            return
+
+    _disconnect_task = asyncio.create_task(_disconnect_poller())
+
     try:
         while True:
             if await request.is_disconnected():
                 cancel_event.set()
+                return
+            if cancel_event.is_set():
                 return
             event = await asyncio.to_thread(next, gen, _sentinel)
             if event is _sentinel:
@@ -5264,6 +5289,14 @@ async def _mlx_agentic_stream(
         logger.error("MLX agentic stream error: %s", e, exc_info = True)
         err = {"error": {"message": _friendly_error(e), "type": "server_error"}}
         yield f"data: {json.dumps(err)}\n\n"
+    finally:
+        # Always cancel the background disconnect poller so it doesn't
+        # outlive the stream (and hold a reference to ``request``).
+        _disconnect_task.cancel()
+        try:
+            await _disconnect_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 async def _mlx_agentic_non_streaming(

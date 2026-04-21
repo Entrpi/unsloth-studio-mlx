@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import os
 import sys
 from unittest import mock
@@ -168,7 +169,7 @@ class TestMlxAgenticStream:
         frames = _drive_async_gen(
             _mlx_agentic_stream(
                 request=_FakeRequest(),
-                cancel_event=mock.MagicMock(),
+                cancel_event=threading.Event(),
                 run_gen=run_gen,
                 completion_id="chatcmpl-test",
                 created=1000,
@@ -248,7 +249,7 @@ class TestMlxOpenaiPassthroughStream:
         frames = _drive_async_gen(
             _mlx_openai_passthrough_stream(
                 request=_FakeRequest(),
-                cancel_event=mock.MagicMock(),
+                cancel_event=threading.Event(),
                 mlx_backend=backend,
                 payload=payload,
                 messages=[{"role": "user", "content": "weather?"}],
@@ -318,7 +319,7 @@ class TestMlxOpenaiPassthroughStream:
         frames = _drive_async_gen(
             _mlx_openai_passthrough_stream(
                 request=_FakeRequest(),
-                cancel_event=mock.MagicMock(),
+                cancel_event=threading.Event(),
                 mlx_backend=backend,
                 payload=payload,
                 messages=[{"role": "user", "content": "q?"}],
@@ -371,7 +372,7 @@ class TestMlxOpenaiPassthroughStream:
         frames = _drive_async_gen(
             _mlx_openai_passthrough_stream(
                 request=_FakeRequest(),
-                cancel_event=mock.MagicMock(),
+                cancel_event=threading.Event(),
                 mlx_backend=backend,
                 payload=payload,
                 messages=[{"role": "user", "content": "q"}],

@@ -1757,6 +1757,24 @@ class MlxLmBackend:
                     effective_timeout = (
                         None if tool_call_timeout >= 9999 else tool_call_timeout
                     )
+                    # Per-tool cap. The ``tool_call_timeout=300`` default
+                    # is sized for long-running code tools (python /
+                    # terminal); for latency-sensitive tools like
+                    # web_search, 30 s is already generous — waiting 5
+                    # minutes for a stuck DuckDuckGo request wedges the
+                    # whole agentic loop. Apply the tighter cap so a
+                    # misbehaving backend provider doesn't block a
+                    # legitimate tool-calling session.
+                    _TOOL_TIMEOUT_CAPS = {
+                        "web_search": 30,
+                        "fetch_url": 30,
+                    }
+                    cap = _TOOL_TIMEOUT_CAPS.get(tool_name)
+                    if cap is not None and (
+                        effective_timeout is None
+                        or effective_timeout > cap
+                    ):
+                        effective_timeout = cap
                     tool_executor = concurrent.futures.ThreadPoolExecutor(
                         max_workers = 1,
                         thread_name_prefix = "mlx-tool-exec",
