@@ -225,10 +225,11 @@ async def load_model(
                 context_length = mlx_backend.context_length,
                 max_context_length = mlx_backend.max_context_length,
                 native_context_length = mlx_backend.native_context_length,
-                supports_reasoning = False,
-                reasoning_always_on = False,
+                # Phase 4: surface reasoning introspection from the backend.
+                supports_reasoning = mlx_backend.supports_reasoning,
+                reasoning_always_on = mlx_backend.reasoning_always_on,
                 supports_tools = False,
-                chat_template = None,
+                chat_template = mlx_backend.chat_template,
                 speculative_type = None,
             )
 
@@ -489,11 +490,12 @@ async def load_model(
                 context_length = mlx_backend.context_length,
                 max_context_length = mlx_backend.max_context_length,
                 native_context_length = mlx_backend.native_context_length,
-                supports_reasoning = False,
-                reasoning_always_on = False,
+                # Phase 4: surface reasoning introspection from the backend.
+                supports_reasoning = mlx_backend.supports_reasoning,
+                reasoning_always_on = mlx_backend.reasoning_always_on,
                 supports_tools = False,
                 cache_type_kv = None,
-                chat_template = None,
+                chat_template = mlx_backend.chat_template,
                 speculative_type = None,
             )
 
@@ -854,8 +856,9 @@ async def get_status(
                 requires_trust_remote_code = bool(
                     (_inference_cfg or {}).get("trust_remote_code", False)
                 ),
-                supports_reasoning = False,
-                reasoning_always_on = False,
+                # Phase 4: surface reasoning introspection from the backend.
+                supports_reasoning = mlx_backend.supports_reasoning,
+                reasoning_always_on = mlx_backend.reasoning_always_on,
                 supports_tools = False,
                 context_length = mlx_backend.context_length,
                 max_context_length = mlx_backend.max_context_length,
