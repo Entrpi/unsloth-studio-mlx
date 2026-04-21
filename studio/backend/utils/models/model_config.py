@@ -1169,15 +1169,32 @@ def _read_mlx_max_position_embeddings(path: Path) -> Optional[int]:
 
     Returns None on any failure. Used to populate ``native_context_length``
     for MLX-loaded models.
+
+    Chunk H-2 (B2): VLM-family configs like Mistral 3's
+    ``Mistral3ForConditionalGeneration`` split the transformer config
+    between a top-level block (vision / image-processor fields) and a
+    nested ``text_config`` dict that holds ``max_position_embeddings``.
+    When the top-level key is missing or None we descend into
+    ``text_config.max_position_embeddings`` so Ministral-3 and any
+    future VLM-architectured model loaded via the text path report
+    the real native context length instead of None.
     """
     try:
         with open(Path(path) / "config.json", "r", encoding = "utf-8") as f:
             cfg = json.load(f)
     except (OSError, ValueError):
         return None
-    val = cfg.get("max_position_embeddings") if isinstance(cfg, dict) else None
+    if not isinstance(cfg, dict):
+        return None
+    val = cfg.get("max_position_embeddings")
     if isinstance(val, int) and val > 0:
         return val
+    # Fallback: nested text_config (VLM-style configs).
+    text_cfg = cfg.get("text_config")
+    if isinstance(text_cfg, dict):
+        nested = text_cfg.get("max_position_embeddings")
+        if isinstance(nested, int) and nested > 0:
+            return nested
     return None
 
 

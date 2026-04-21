@@ -946,7 +946,12 @@ class MlxLmBackend:
             load_s = time.time() - t0
 
             # Read max_position_embeddings from config.json; cap by n_ctx
-            # if supplied.
+            # if supplied. Chunk H-2 (B2): VLM-family configs (e.g.
+            # Ministral-3's Mistral3ForConditionalGeneration) nest
+            # max_position_embeddings inside ``text_config`` — fall back
+            # there when the top-level key is absent so the Studio-level
+            # context_length surface doesn't silently return None while
+            # mlx_lm consumes the nested config internally.
             native_ctx: Optional[int] = None
             try:
                 with open(path / "config.json", "r", encoding = "utf-8") as f:
@@ -954,6 +959,12 @@ class MlxLmBackend:
                 val = cfg.get("max_position_embeddings")
                 if isinstance(val, int) and val > 0:
                     native_ctx = val
+                else:
+                    text_cfg = cfg.get("text_config")
+                    if isinstance(text_cfg, dict):
+                        nested = text_cfg.get("max_position_embeddings")
+                        if isinstance(nested, int) and nested > 0:
+                            native_ctx = nested
             except (OSError, ValueError):
                 pass
 

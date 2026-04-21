@@ -88,15 +88,19 @@ def test_load_chat_unload_family(family: str, model_dir: Path):
     assert ok is True, f"{family}: MlxLmBackend.load_model returned False"
     assert backend.is_loaded is True
     assert backend.model_identifier == model_dir.name
-    # Ideally every family advertises a context length from config.
-    # Ministral-3 is actually a VLM (Mistral3ForConditionalGeneration)
-    # with ``max_position_embeddings`` nested inside ``text_config``,
-    # so the top-level detection returns None. It still generates
-    # cleanly via mlx_lm — we just don't block the smoke test on
-    # the surfaced property when the nested-config path hasn't been
-    # wired through. Qwen/Llama/Hermes all populate it correctly.
-    if backend.context_length is not None:
-        assert backend.context_length > 0
+    # Every family must advertise a context length from config.
+    # Chunk H-2 (B2): Ministral-3 is ``Mistral3ForConditionalGeneration``
+    # with ``max_position_embeddings`` nested inside ``text_config``;
+    # the MLX backend's config reader now descends into that nested
+    # block so the surfaced property is a real integer (32768) rather
+    # than None. Qwen / Llama / Hermes populate it from the top-level
+    # key directly.
+    assert backend.context_length is not None, (
+        f"{family}: context_length is None — the backend's config "
+        f"reader failed to extract max_position_embeddings from "
+        f"config.json (top-level or text_config fallback)"
+    )
+    assert backend.context_length > 0
 
     try:
         messages = [

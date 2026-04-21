@@ -119,6 +119,51 @@ def test_read_max_position_embeddings_malformed(tmp_path: Path) -> None:
     assert _read_mlx_max_position_embeddings(tmp_path) is None
 
 
+def test_read_max_position_embeddings_nested_text_config(
+    tmp_path: Path,
+) -> None:
+    """Chunk H-2 (B2): VLM-family configs like Mistral 3's
+    ``Mistral3ForConditionalGeneration`` split the transformer config
+    between a top-level block (vision fields) and a nested
+    ``text_config`` dict. When the top-level ``max_position_embeddings``
+    is missing, the reader must descend into ``text_config``.
+
+    This mirrors the real Ministral-3-3B-Instruct-2512 config shape —
+    no top-level ``max_position_embeddings``, value of 32768 nested
+    under ``text_config``."""
+    _write_json(
+        tmp_path / "config.json",
+        {
+            "architectures": ["Mistral3ForConditionalGeneration"],
+            # MLX detection hook — matches the real Ministral-3 4-bit
+            # shape which has an MLX quantization block at the top.
+            "quantization": {"group_size": 64, "bits": 4},
+            "text_config": {"max_position_embeddings": 32768},
+            "vision_config": {"image_size": 1024},
+        },
+    )
+    assert _read_mlx_max_position_embeddings(tmp_path) == 32768
+
+    # And ModelConfig.from_identifier should surface it on the
+    # ``native_context_length`` field.
+    cfg = ModelConfig.from_identifier(str(tmp_path))
+    assert cfg is not None
+    assert cfg.is_mlx is True
+    assert cfg.native_context_length == 32768
+
+
+def test_read_max_position_embeddings_top_level_wins(tmp_path: Path) -> None:
+    """Top-level value takes precedence over nested when both exist."""
+    _write_json(
+        tmp_path / "config.json",
+        {
+            "max_position_embeddings": 4096,
+            "text_config": {"max_position_embeddings": 32768},
+        },
+    )
+    assert _read_mlx_max_position_embeddings(tmp_path) == 4096
+
+
 # ── Phase 6 — MLX LoRA adapter detection ─────────────────────────────
 
 
