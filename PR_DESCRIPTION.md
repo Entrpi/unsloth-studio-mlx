@@ -1030,3 +1030,114 @@ The booleans `is_mlx` / `is_mlx_vlm` / `is_mlx_audio` are now also populated on 
 ## Residual follow-ups after Chunk G
 
 None. The deprecation is uniform across the Pydantic schemas that carry backend identity (`LoadResponse`, `InferenceStatusResponse`, `ValidateModelResponse`, `ModelDetails`) and across the frontend chat + model-selector surfaces. Removal of the legacy booleans remains deferred to a future chunk once telemetry confirms no external readers still hit them.
+
+---
+
+# Chunk H — Real LoRA fixture
+
+Closes the last end-to-end gap in the Phase 6 matrix: until now `mlx_lm.load(..., adapter_path=...)` was only exercised through mocks. Chunk H ships a vendored real MLX LoRA adapter + integration test that actually fuses the adapter onto a base model at load time.
+
+## Items landed
+
+| # | Item | Status |
+|---|---|---|
+| H1 | Probe — confirm `mlx_lm.lora` trains against a 2-bit quantized MLX base (not explicitly covered by mlx-lm docs) | landed |
+| H2 | Dataset fixture — 400 train / 80 valid `dair-ai/emotion` rows as JSONL under `tests/fixtures/lora_dataset/emotion/` | landed |
+| H3 | Adapter fixture — 4.8 MB `adapters.safetensors` + 1 KB `adapter_config.json` under `tests/fixtures/lora_adapter/`, trained on H2 against Bonsai 1.7B 2-bit | landed |
+| H4 | Integration test — `test_load_bonsai_with_real_lora_adapter` loads the fixture through the real `mlx_lm.load` path and streams tokens through the fused model | landed |
+| H5 | Detection test — `test_detect_mlx_adapter_real_fixture` points `_detect_mlx_adapter` at the vendored fixture, proving the plural-`adapters` key survives round-tripping through the mlx-lm trainer | landed |
+
+## Base choice
+
+**Bonsai 1.7B 2-bit** (`/Users/ent/.lmstudio/models/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit`) — already the Phase 7 speculative-decoding draft, so the existing test suite knows how to locate it via `MLX_TEST_DRAFT_MODEL_PATH`. Probing first: a 10-iter smoke train dropped val loss 6.77 → 1.63 with ~0.6 GB peak mem, so 2-bit QLoRA works on mlx-lm 0.31.2 despite not being explicitly advertised. Full audit trail in `docs/chunk-h-lora/probe.md`.
+
+## Training recipe
+
+```
+mlx_lm.lora \
+  --train \
+  --model /Users/ent/.lmstudio/models/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit \
+  --data studio/backend/tests/fixtures/lora_dataset/emotion \
+  --adapter-path studio/backend/tests/fixtures/lora_adapter \
+  --iters 200 --batch-size 2 --num-layers 4 \
+  --learning-rate 1e-4 --val-batches 5 \
+  --steps-per-report 20 --steps-per-eval 50 \
+  --fine-tune-type lora --seed 42
+```
+
+- Trainable params: 1.245 M / 1720 M (0.072%) — LoRA rank 8, scale 20, 4 layers.
+- Loss trajectory (val): 5.522 → 2.663 (iter 50) → 2.756 (iter 100) → 2.711 (iter 200).
+- Wall clock ~25 s on M5 32 GB, peak mem 0.99 GB.
+- Output: `adapters.safetensors` (4.8 MB) + `adapter_config.json` (1 KB).
+
+We are NOT chasing classification accuracy — the recipe is just enough to produce a legitimate adapter that exercises Phase 6 loading end-to-end. The fixture's value is **structural**, not semantic.
+
+## Tests added
+
+- `test_mlx_backend_lifecycle.py::test_load_bonsai_with_real_lora_adapter` (gated on `MLX_LORA_AVAILABLE` — requires the 1.7B draft base + fixture files). Loads Bonsai 1.7B 2-bit with `adapter_path=<fixture>`, asserts `is_lora` flips, `adapter_path` round-trips, `load_progress` terminates at `phase="loaded"`, streams 8 tokens through the fused model without error, and resets cleanly on unload.
+- `test_mlx_backend_detection.py::test_detect_mlx_adapter_real_fixture` — points the pure-Python detector at the vendored fixture and asserts `True`. Skips cleanly in checkouts where the fixture is absent.
+
+## Test results after Chunk H
+
+- **278 MLX tests pass, 0 xfail.** Delta from Chunk G: +1 integration test (real adapter load/generate) +1 unit test (real fixture detection).
+- 28 tool-call parser tests continue to pass.
+- Full regression: `pytest tests/test_mlx_*.py tests/test_tool_call_parser.py tests/test_native_context_length.py` — 278 passed in 66 s.
+
+## Fixture inventory
+
+```
+studio/backend/tests/fixtures/lora_dataset/emotion/
+  train.jsonl                    60 KB  (400 rows)
+  valid.jsonl                    11 KB  ( 80 rows)
+studio/backend/tests/fixtures/lora_adapter/
+  adapters.safetensors           4.8 MB
+  adapter_config.json            1 KB
+docs/chunk-h-lora/
+  probe.md                       probe trail (2-bit decision gate)
+  training.log                   full training output
+```
+
+Both `adapters.safetensors` and the training log are force-added past the root `.gitignore` patterns (`*.safetensors` / `*.log`) — this is intentional, small (<6 MB total), deterministic-ish test-fixture material.
+
+## Regenerating the fixture
+
+If the fixture needs refreshing (e.g. because mlx-lm's adapter shape changes):
+
+```
+# 1. Re-run the probe if the target base changed.
+# See docs/chunk-h-lora/probe.md for the canonical smoke-training command.
+
+# 2. Re-emit the JSONL dataset from HF.
+cd /tmp/unsloth-mlx-chunkH-lora
+/tmp/mlxtest/bin/python -c "
+from datasets import load_dataset
+import json, pathlib
+ds = load_dataset('dair-ai/emotion', 'split')
+LABELS = ['sadness', 'joy', 'love', 'anger', 'fear', 'surprise']
+outdir = pathlib.Path('studio/backend/tests/fixtures/lora_dataset/emotion')
+outdir.mkdir(parents=True, exist_ok=True)
+for split, split_out_name, n in [('train', 'train', 400), ('validation', 'valid', 80)]:
+    rows = ds[split].select(range(n))
+    with open(outdir / f'{split_out_name}.jsonl', 'w') as f:
+        for r in rows:
+            f.write(json.dumps({'text': f\"Classify the emotion: {r['text']}\nLabel: {LABELS[r['label']]}\"}) + '\n')
+"
+
+# 3. Re-train the adapter (destructive — overwrites the fixture).
+/tmp/mlxtest/bin/mlx_lm.lora \
+  --train \
+  --model /Users/ent/.lmstudio/models/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit \
+  --data studio/backend/tests/fixtures/lora_dataset/emotion \
+  --adapter-path studio/backend/tests/fixtures/lora_adapter \
+  --iters 200 --batch-size 2 --num-layers 4 \
+  --learning-rate 1e-4 --val-batches 5 \
+  --steps-per-report 20 --steps-per-eval 50 \
+  --fine-tune-type lora --seed 42
+
+# 4. Drop the per-checkpoint copies mlx-lm writes alongside the final.
+rm -f studio/backend/tests/fixtures/lora_adapter/0000*_adapters.safetensors
+```
+
+## Residual follow-ups after Chunk H
+
+None. Phase 6 (LoRA) now has both mock-level unit coverage (pre-existing) AND real-adapter end-to-end coverage (this chunk). Every row in the MLX parity matrix has at least one real-hardware test.
