@@ -10,7 +10,7 @@ at ``core/inference/llama_cpp.py:2016`` and was lifted into this module
 during Phase-5 (Chunk C) so the MLX backend can share the same parsing
 logic without taking a dependency on the GGUF backend.
 
-Two wire-level dialects are recognised. Both are emitted by chat
+Three wire-level dialects are recognised. All are emitted by chat
 templates in the wild, and the same Qwen3-family model can emit either
 one depending on how the base template was customised:
 
@@ -30,6 +30,18 @@ one depending on how the base template was customised:
    where ``</parameter>`` / ``</function>`` are optional — models
    routinely drop the closing tags when the argument value contains
    ``</function>`` or similar substrings.
+
+3. **Gemma-4 ``<|tool_call>``** (Gemma-4 E4B / 31B-it / 26B-a4b MoE).
+   The call is rendered with Gemma-specific delimiter tokens::
+
+       <|tool_call>call:tool_name{key:<|"|>value<|"|>,...}<tool_call|>
+
+   where ``<|"|>`` is Gemma's escaped-quote token pair, keys are bare
+   identifiers (no surrounding quotes), and the closing marker is
+   ``<tool_call|>``. The body is JSON-ish: bools/numbers/null are
+   literal, nested objects/arrays use standard ``{}`` / ``[]``. We
+   normalise this to regular JSON (Gemma-quotes → ``"``, bare keys
+   get quoted) and parse.
 
 The parser returns OpenAI-compatible ``tool_calls`` dicts (the same
 shape llama-server already synthesises on its end), so every caller can
@@ -87,6 +99,21 @@ _TC_PARAM_START_RE = re.compile(r"<parameter=(\w+)>\s*")
 #: occurrence.
 _TC_PARAM_CLOSE_RE = re.compile(r"\s*</parameter>\s*$")
 
+#: Gemma-4 tool-call start: ``<|tool_call>call:NAME{``. Captures the
+#: function name and aligns with the opening brace so the balanced-
+#: brace walker can pick up from there.
+_TC_GEMMA_START_RE = re.compile(r"<\|tool_call>call:(\w+)\s*\{")
+
+#: Gemma's escaped-quote token pair — used to delimit string values in
+#: the tool-call body. Normalised to ``"`` before JSON parsing.
+_TC_GEMMA_QUOTE = '<|"|>'
+
+#: Unquoted-key detector for Gemma bodies. Only fires at a position
+#: following ``{`` or ``,`` (with optional whitespace) — matches the
+#: natural positions of object keys without touching identifiers
+#: elsewhere.
+_TC_GEMMA_KEY_RE = re.compile(r'([{,]\s*)(\w+)\s*:')
+
 
 # ── Auto-heal / stripping patterns ───────────────────────────────────
 # These are the regexes GGUF uses to *remove* tool-call XML from a
@@ -105,19 +132,21 @@ _TC_PARAM_CLOSE_RE = re.compile(r"\s*</parameter>\s*$")
 TOOL_CLOSED_PATS = [
     re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL),
     re.compile(r"<function=\w+>.*?</function>", re.DOTALL),
+    re.compile(r"<\|tool_call>.*?<tool_call\|>", re.DOTALL),
 ]
 
 #: Final-flush patterns: also strip dangling unclosed blocks.
 TOOL_ALL_PATS = TOOL_CLOSED_PATS + [
     re.compile(r"<tool_call>.*$", re.DOTALL),
     re.compile(r"<function=\w+>.*$", re.DOTALL),
+    re.compile(r"<\|tool_call>.*$", re.DOTALL),
 ]
 
 #: Prefixes that the speculative buffer watches for. If the assistant
 #: stream starts with any of these, the buffer holds back emission
 #: until the shape resolves (either into a complete tool call, which
 #: gets drained, or into plain content, which gets flushed).
-TOOL_XML_SIGNALS = ("<tool_call>", "<function=")
+TOOL_XML_SIGNALS = ("<tool_call>", "<function=", "<|tool_call>")
 
 
 # ── Public dataclass result (optional) ───────────────────────────────
@@ -204,6 +233,7 @@ def parse_tool_calls_from_text(
 
     try_json = family in ("auto", "qwen", "bonsai", "hermes", "json")
     try_xml = family in ("auto", "claude", "xml", "text-gen", "mistral")
+    try_gemma = family in ("auto", "gemma", "gemma4", "gemma-4")
 
     # ── Dialect 1: JSON inside <tool_call> tags ─────────────────
     # Use balanced-brace extraction that skips braces inside JSON
@@ -269,6 +299,17 @@ def parse_tool_calls_from_text(
         xml_calls = _parse_xml_function_dialect(content)
         # Re-number to keep ids unique across dialects.
         for call in xml_calls:
+            call["id"] = f"call_{len(tool_calls)}"
+            tool_calls.append(call)
+
+    # ── Dialect 3: Gemma-4 <|tool_call>call:NAME{...}<tool_call|> ──
+    # Tried last in auto mode because the opening marker is a distinct
+    # token pair that doesn't collide with the other two dialects, and
+    # models that emit Gemma-style calls never emit JSON-in-<tool_call>
+    # simultaneously. Forced when caller passes model_family="gemma".
+    if try_gemma and (not tool_calls or family in ("gemma", "gemma4", "gemma-4")):
+        gemma_calls = _parse_gemma_dialect(content)
+        for call in gemma_calls:
             call["id"] = f"call_{len(tool_calls)}"
             tool_calls.append(call)
 
@@ -371,6 +412,82 @@ def _parse_xml_function_dialect(content: str) -> List[Dict[str, Any]]:
                 "function": {
                     "name": func_name,
                     "arguments": json.dumps(arguments),
+                },
+            }
+        )
+    return tool_calls
+
+
+def _parse_gemma_dialect(content: str) -> List[Dict[str, Any]]:
+    """Parse Gemma-4's ``<|tool_call>call:NAME{...}<tool_call|>`` dialect.
+
+    Gemma emits tool calls with bare (unquoted) keys and string values
+    wrapped in the ``<|"|>`` token pair rather than standard ``"``.
+    Booleans / numbers / ``null`` are literal; nested objects and
+    arrays use standard ``{}`` / ``[]``.
+
+    The parser walks the body with balanced-brace counting that
+    respects Gemma's quote tokens, then normalises the extracted body
+    to standard JSON in two steps (Gemma-quotes → ``"`` and bare-key
+    quoting) before ``json.loads``. Pathological string values that
+    themselves contain a ``{key:`` shape at depth zero can trip the
+    key-quoting regex; those calls fail ``json.loads`` and are
+    skipped rather than mis-parsed.
+
+    The returned shape matches :func:`_parse_xml_function_dialect` so
+    the caller can re-number ids uniformly across dialects.
+    """
+    tool_calls: List[Dict[str, Any]] = []
+    qlen = len(_TC_GEMMA_QUOTE)
+    for m in _TC_GEMMA_START_RE.finditer(content):
+        func_name = m.group(1)
+        # ``m.end()`` lands one past the ``{``. Back up so body_start
+        # points AT the opening brace so the depth counter starts
+        # from 1 after we consume it below.
+        body_start = m.end() - 1
+        depth = 0
+        in_quote = False
+        i = body_start
+        while i < len(content):
+            if content[i : i + qlen] == _TC_GEMMA_QUOTE:
+                in_quote = not in_quote
+                i += qlen
+                continue
+            if not in_quote:
+                ch = content[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            i += 1
+        if depth != 0:
+            # Unclosed body; skip this call.
+            continue
+        body = content[body_start : i + 1]  # includes { and }
+
+        # Normalise to JSON: Gemma-quotes to standard quotes, then
+        # quote the bare keys. The order matters — if we quote keys
+        # first, any Gemma-quoted string that happens to contain a
+        # ``,word:`` substring would get spuriously re-quoted.
+        json_text = body.replace(_TC_GEMMA_QUOTE, '"')
+        json_text = _TC_GEMMA_KEY_RE.sub(r'\1"\2":', json_text)
+        try:
+            obj = json.loads(json_text)
+        except (json.JSONDecodeError, ValueError):
+            # Malformed body (or pathological string-content collision
+            # with the key-quoting regex). Skip this call.
+            continue
+        if not isinstance(obj, dict):
+            continue
+        tool_calls.append(
+            {
+                "id": f"call_{len(tool_calls)}",
+                "type": "function",
+                "function": {
+                    "name": func_name,
+                    "arguments": json.dumps(obj),
                 },
             }
         )

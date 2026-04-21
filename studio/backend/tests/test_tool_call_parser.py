@@ -248,10 +248,14 @@ class TestStripToolMarkup:
         assert strip_tool_markup("", final=True) == ""
 
     def test_patterns_are_exported(self):
-        assert len(TOOL_CLOSED_PATS) == 2
-        assert len(TOOL_ALL_PATS) == 4
+        # Three dialects: JSON-in-<tool_call>, XML <function=>, and
+        # Gemma-4 <|tool_call>. ALL_PATS adds one unclosed variant per
+        # dialect for the final-flush pass.
+        assert len(TOOL_CLOSED_PATS) == 3
+        assert len(TOOL_ALL_PATS) == 6
         assert "<tool_call>" in TOOL_XML_SIGNALS
         assert "<function=" in TOOL_XML_SIGNALS
+        assert "<|tool_call>" in TOOL_XML_SIGNALS
 
 
 # ---------------------------------------------------------------------
@@ -274,6 +278,124 @@ class TestParsedToolCallDataclass:
             "type": "function",
             "function": {"name": "python", "arguments": '{"code": "1"}'},
         }
+
+
+# ---------------------------------------------------------------------
+# Behaviour preservation — parity against the old inlined GGUF path
+# ---------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------
+# Dialect 3 — Gemma-4 <|tool_call>call:NAME{…}<tool_call|>
+# ---------------------------------------------------------------------
+
+
+class TestGemmaDialect:
+    def test_simple_gemma_tool_call(self):
+        text = '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert calls[0]["type"] == "function"
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
+        assert calls[0]["id"].startswith("call_")
+
+    def test_gemma_with_chain_of_thought_prefix(self):
+        # Gemma-4 wraps its reasoning in <|channel>thought ... <channel|>
+        # and follows it with the tool call. The parser must ignore the
+        # reasoning block and pick up the call.
+        text = (
+            "<|channel>thought\n"
+            "Analyse the request. The user wants Paris weather.\n"
+            "<channel|>"
+            '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'
+        )
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
+
+    def test_gemma_multi_arg_with_types(self):
+        text = (
+            '<|tool_call>call:configure{'
+            'name:<|"|>test<|"|>,'
+            "enabled:true,"
+            "count:42,"
+            'tags:[<|"|>a<|"|>,<|"|>b<|"|>],'
+            "ratio:0.5,"
+            "extra:null"
+            "}<tool_call|>"
+        )
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        args = json.loads(calls[0]["function"]["arguments"])
+        assert args == {
+            "name": "test",
+            "enabled": True,
+            "count": 42,
+            "tags": ["a", "b"],
+            "ratio": 0.5,
+            "extra": None,
+        }
+
+    def test_gemma_nested_object(self):
+        text = (
+            '<|tool_call>call:submit{'
+            'payload:{user:<|"|>alice<|"|>,ids:[1,2,3]},'
+            "timeout:30"
+            "}<tool_call|>"
+        )
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        args = json.loads(calls[0]["function"]["arguments"])
+        assert args == {"payload": {"user": "alice", "ids": [1, 2, 3]}, "timeout": 30}
+
+    def test_gemma_unclosed_call_is_skipped(self):
+        # Missing <tool_call|> end marker; balanced-brace walker runs
+        # off the end and the call is skipped rather than mis-parsed.
+        text = '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>'  # no close
+        calls = parse_tool_calls_from_text(text)
+        assert calls == []
+
+    def test_gemma_multiple_calls_in_one_turn(self):
+        text = (
+            '<|tool_call>call:first{x:1}<tool_call|>'
+            '<|tool_call>call:second{y:<|"|>two<|"|>}<tool_call|>'
+        )
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 2
+        assert [c["function"]["name"] for c in calls] == ["first", "second"]
+        assert [c["id"] for c in calls] == ["call_0", "call_1"]
+
+    def test_gemma_forced_family_hint(self):
+        # model_family="gemma" should force the Gemma dialect only.
+        text = '<|tool_call>call:ping{}<tool_call|>'
+        calls = parse_tool_calls_from_text(text, model_family="gemma")
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "ping"
+
+    def test_gemma_dialect_not_tried_when_json_forced(self):
+        # When family="qwen"/"json", Gemma markup is ignored entirely.
+        text = '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'
+        assert parse_tool_calls_from_text(text, model_family="qwen") == []
+
+    def test_strip_removes_closed_gemma_block(self):
+        text = (
+            "Prose before. "
+            '<|tool_call>call:x{y:1}<tool_call|>'
+            " Prose after."
+        )
+        assert strip_tool_markup(text) == "Prose before.  Prose after."
+
+    def test_strip_final_removes_unclosed_gemma(self):
+        text = (
+            "Prose. "
+            '<|tool_call>call:x{y:1}'  # no close marker
+        )
+        assert strip_tool_markup(text, final=True) == "Prose."
+
+    def test_gemma_signal_in_tool_xml_signals(self):
+        assert "<|tool_call>" in TOOL_XML_SIGNALS
 
 
 # ---------------------------------------------------------------------
