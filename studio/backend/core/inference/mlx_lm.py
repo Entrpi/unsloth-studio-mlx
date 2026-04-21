@@ -279,6 +279,14 @@ class MlxLmBackend:
         self._supports_reasoning: bool = False
         self._reasoning_always_on: bool = False
         self._reasoning_default: bool = True
+        # Phase 5 — tool-calling support flag. Set by ``_detect_tools``
+        # during load_model off the tokenizer's chat template.
+        self._supports_tools: bool = False
+        # Cache whether apply_chat_template accepts a ``tools`` kwarg so
+        # we only try-fail once per load. Detection runs on the first
+        # tool-calling turn and the result sticks for the lifetime of
+        # the loaded model.
+        self._tools_kwarg_ok: Optional[bool] = None
         # Phase 3 — load progress tracking. The GGUF backend drives its
         # load-progress endpoint off /proc VmRSS; MLX is in-process so
         # we instead track two distinct phases:
@@ -381,7 +389,16 @@ class MlxLmBackend:
 
     @property
     def supports_tools(self) -> bool:
-        return False
+        """True iff the loaded tokenizer's chat template renders tools.
+
+        Populated at ``load_model`` time by :meth:`_detect_tools` off the
+        same ``tokenizer.chat_template`` inspection the reasoning probe
+        uses. A template is considered tool-capable when it mentions
+        ``tool_calls`` (assistant tool_calls block) or ``tools`` (schema
+        injection hook). Both are required for Qwen3 / Bonsai / Hermes
+        / Mistral-instruct templates to render a proper tool turn.
+        """
+        return self._supports_tools
 
     @property
     def cache_type_kv(self) -> Optional[str]:
@@ -724,6 +741,37 @@ class MlxLmBackend:
                 "MLX: reasoning detected via literal <think> tags (always-on)"
             )
 
+    def _detect_tools(self, tokenizer: Any) -> None:
+        """Populate :attr:`_supports_tools` from the chat template.
+
+        The rule mirrors how llama-server / vLLM decide whether a GGUF
+        model is tool-capable: look for template-level hooks that
+        render a tool schema or an assistant tool-call block. We also
+        require the template to reference the ``tools`` variable so
+        that ``apply_chat_template(..., tools=...)`` produces a
+        functional tool-use prompt (some templates mention
+        ``tool_calls`` only in the assistant-echo branch, which is
+        useless for the model's first turn).
+
+        Errors are non-fatal — templates that fail the probe get
+        ``supports_tools=False`` and the backend transparently skips
+        the tool-calling path.
+        """
+        self._supports_tools = False
+        template = getattr(tokenizer, "chat_template", None)
+        if not isinstance(template, str) or not template:
+            return
+        # Qwen3 / Bonsai / Hermes / Mistral-instruct all mention both
+        # literals in their templates; a template with only one is
+        # almost certainly not tool-use capable.
+        has_tools_schema = "tools" in template
+        has_tool_calls = "tool_calls" in template
+        self._supports_tools = bool(has_tools_schema and has_tool_calls)
+        logger.info(
+            f"MLX: tool-calling support = {self._supports_tools} "
+            f"(tools-kw={has_tools_schema}, tool_calls-kw={has_tool_calls})"
+        )
+
     def load_model(
         self,
         local_path: str,
@@ -999,6 +1047,19 @@ class MlxLmBackend:
             except Exception as e:
                 logger.debug(f"MLX reasoning detection failed ({e}); defaulting to off")
 
+            # Phase 5: tool-calling support probe. Uses the same chat
+            # template the reasoning probe already inspected. Errors
+            # default to supports_tools=False so the route's tool-call
+            # branch falls back to a clean 400.
+            try:
+                self._detect_tools(tokenizer)
+            except Exception as e:
+                logger.debug(
+                    f"MLX tool-calling detection failed ({e}); defaulting to off"
+                )
+                self._supports_tools = False
+            self._tools_kwarg_ok = None
+
             logger.info(
                 f"MLX model loaded in {load_s:.2f}s: "
                 f"identifier={model_identifier} path={path} "
@@ -1045,6 +1106,9 @@ class MlxLmBackend:
         self._supports_reasoning = False
         self._reasoning_always_on = False
         self._reasoning_default = True
+        # Phase 5: clear tool-calling state.
+        self._supports_tools = False
+        self._tools_kwarg_ok = None
         # Phase 8: reset KV-cache state to "unquantized default" so a
         # subsequent load without cache_type_kv doesn't inherit the
         # previous model's quantization.
@@ -1074,6 +1138,83 @@ class MlxLmBackend:
     def unload_model(self) -> bool:
         with self._lock:
             return self._unload_locked()
+
+    def _render_prompt(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
+        enable_thinking: Optional[bool] = None,
+    ) -> str:
+        """Render the prompt via the tokenizer's chat template.
+
+        Shared by :meth:`generate_chat_completion` (no-tool path) and
+        :meth:`generate_chat_completion_with_tools` (agentic loop). The
+        three differences that matter per path:
+
+        - ``enable_thinking`` is forwarded through
+          ``chat_template_kwargs`` only when the model advertises
+          reasoning support. Templates that don't know about it reject
+          unknown kwargs, so we drop it silently.
+        - ``tools`` and ``tool_choice`` are forwarded only when
+          non-empty. First call falls back to a no-tools render if the
+          template's ``apply_chat_template`` signature rejects the
+          ``tools`` kwarg; the fallback result sticks (cached on
+          ``self._tools_kwarg_ok``) for the lifetime of the load.
+        - On any template failure we drop to a ChatML-style fallback so
+          the generator still produces something legible — the tests
+          rely on this.
+        """
+        tokenizer = self._tokenizer
+
+        apply_kwargs: Dict[str, Any] = {
+            "add_generation_prompt": True,
+            "tokenize": False,
+        }
+        if self.supports_reasoning and enable_thinking is not None:
+            apply_kwargs["chat_template_kwargs"] = {
+                "enable_thinking": bool(enable_thinking)
+            }
+
+        want_tools = bool(tools)
+        if want_tools and self._tools_kwarg_ok is not False:
+            # Try tools kwarg; cache whether it works.
+            tools_kwargs = dict(apply_kwargs)
+            tools_kwargs["tools"] = list(tools)
+            if tool_choice is not None:
+                tools_kwargs["tool_choice"] = tool_choice
+            try:
+                out = tokenizer.apply_chat_template(messages, **tools_kwargs)
+                self._tools_kwarg_ok = True
+                return out
+            except TypeError as e:
+                logger.info(
+                    f"MLX: tokenizer.apply_chat_template rejected `tools` "
+                    f"kwarg ({e}); falling back to tools-less render. "
+                    f"The route must inject the tool schema into a "
+                    f"system message instead."
+                )
+                self._tools_kwarg_ok = False
+            except Exception as e:
+                logger.warning(
+                    f"MLX: apply_chat_template with tools raised ({e}); "
+                    f"falling back to no-tools path for this render"
+                )
+
+        try:
+            return tokenizer.apply_chat_template(messages, **apply_kwargs)
+        except Exception as e:
+            logger.warning(
+                f"apply_chat_template failed ({e}); falling back to manual prompt"
+            )
+            parts: list[str] = []
+            for m in messages:
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                parts.append(f"<|{role}|>\n{content}")
+            parts.append("<|assistant|>\n")
+            return "\n".join(parts)
 
     def generate_chat_completion(
         self,
@@ -1142,34 +1283,12 @@ class MlxLmBackend:
         tokenizer = self._tokenizer
         model = self._model
 
-        # Build the prompt via the tokenizer's chat template. Fall back to
-        # a minimal ChatML-style prompt if the model has no template.
-        # When the model advertises reasoning support AND the caller
-        # explicitly set ``enable_thinking``, pass it through
-        # ``chat_template_kwargs``. When the model doesn't support
-        # reasoning we skip the kwarg entirely: some templates reject
-        # unknown kwargs.
-        apply_kwargs: Dict[str, Any] = {
-            "add_generation_prompt": True,
-            "tokenize": False,
-        }
-        if self.supports_reasoning and enable_thinking is not None:
-            apply_kwargs["chat_template_kwargs"] = {
-                "enable_thinking": bool(enable_thinking)
-            }
-        try:
-            prompt = tokenizer.apply_chat_template(messages, **apply_kwargs)
-        except Exception as e:
-            logger.warning(
-                f"apply_chat_template failed ({e}); falling back to manual prompt"
-            )
-            parts: list[str] = []
-            for m in messages:
-                role = m.get("role", "user")
-                content = m.get("content", "")
-                parts.append(f"<|{role}|>\n{content}")
-            parts.append("<|assistant|>\n")
-            prompt = "\n".join(parts)
+        prompt = self._render_prompt(
+            messages,
+            tools = None,
+            tool_choice = None,
+            enable_thinking = enable_thinking,
+        )
 
         # Build the sampler and logits processors via the single helper.
         sampler, processors = _build_mlx_sampler_and_processors(
@@ -1292,4 +1411,595 @@ class MlxLmBackend:
             "usage": usage,
             "timings": timings,
             "finish_reason": finish_reason,
+        }
+
+    # ── Phase 5 — Agentic tool-calling loop ───────────────────────
+    def generate_chat_completion_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        tool_choice: Optional[Any] = None,
+        temperature: float = 0.6,
+        top_p: float = 0.95,
+        top_k: int = 20,
+        min_p: float = 0.01,
+        max_tokens: Optional[int] = None,
+        repetition_penalty: float = 1.0,
+        repetition_context_size: Optional[int] = None,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        logit_bias: Optional[Dict[int, float]] = None,
+        stop: Optional[List[str]] = None,
+        cancel_event: Optional[threading.Event] = None,
+        enable_thinking: Optional[bool] = None,
+        max_tool_iterations: int = 10,
+        auto_heal_tool_calls: bool = True,
+        tool_call_timeout: int = 300,
+        session_id: Optional[str] = None,
+    ) -> Generator[Union[Dict[str, Any], str], None, None]:
+        """Run the same agentic tool-use loop the GGUF backend runs.
+
+        Yielded events mirror :meth:`LlamaCppBackend.generate_chat_completion_with_tools`
+        so the route layer can share the glue that turns them into SSE
+        frames:
+
+        - ``{"type": "content", "text": cumulative}`` — cumulative
+          content text of the current assistant turn.
+        - ``{"type": "status", "text": "Calling tool X ..."}`` — UI
+          badge text. Empty string signals "clear badge".
+        - ``{"type": "tool_start", "tool_name", "tool_call_id",
+          "arguments"}`` — emitted just before executing a tool.
+        - ``{"type": "tool_end", "tool_name", "tool_call_id",
+          "result"}`` — the tool's output, as a string.
+        - ``{"type": "metadata", "usage": {...}, "timings": {...}}`` —
+          final chunk with accumulated token counts and per-second
+          figures across every model turn in the loop.
+
+        Semantics:
+
+        - ``tool_choice="none"`` short-circuits the loop — one plain
+          generation turn is run without tools and the resulting text
+          flows out as ``content`` events.
+        - When the template accepts a ``tools`` kwarg
+          (``self._tools_kwarg_ok == True``) we pass the schema
+          through ``apply_chat_template(..., tools=tools)``. Templates
+          that reject the kwarg get a fallback: the tool list is
+          injected into the system prompt as a JSON block with a
+          format-nudge so the model still knows the calling
+          convention. This mirrors what llama-server does when its
+          built-in templater doesn't understand tools.
+        - After each turn the accumulated text is run through
+          :func:`parse_tool_calls_from_text`. No calls → yield the
+          text as the final content event, done. Calls → execute
+          serially via :func:`core.inference.tools.execute_tool`,
+          append the assistant(tool_calls) + tool-result messages,
+          and loop.
+        - ``max_tool_iterations`` caps the loop. Hitting the cap
+          injects a "no more tools available — answer now" user
+          message and runs one more turn so the conversation ends
+          with assistant text rather than a hanging tool_calls.
+        - Cancellation is checked at every iteration boundary and
+          between tool executions; inside a single turn we rely on
+          :meth:`generate_chat_completion` honouring the same event.
+        """
+        if not self.is_loaded:
+            raise RuntimeError("MLX model is not loaded")
+        if not self.supports_tools:
+            raise RuntimeError(
+                "Loaded MLX model does not advertise tool-calling support "
+                "(chat template does not mention tools / tool_calls). "
+                "Reload a tool-capable model (e.g. Qwen3 / Bonsai / Hermes)."
+            )
+
+        # Lazy imports to keep the module importable on non-Darwin CI.
+        from core.inference._tool_call_parser import (
+            parse_tool_calls_from_text,
+            strip_tool_markup,
+        )
+        from core.inference.tools import execute_tool
+
+        tool_choice_norm = self._normalize_tool_choice(tool_choice)
+        conversation = [dict(m) for m in messages]
+
+        # Sum usage/timings across every turn so the final metadata
+        # event matches what the non-tool path emits for a single turn.
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        accumulated_predicted_ms = 0.0
+        accumulated_predicted_n = 0
+
+        # ``tool_choice="none"`` → skip the agentic loop entirely.
+        if tool_choice_norm == "none":
+            yield from self._run_plain_tool_turn(
+                conversation = conversation,
+                tools = tools,
+                tool_choice = tool_choice_norm,
+                temperature = temperature,
+                top_p = top_p,
+                top_k = top_k,
+                min_p = min_p,
+                max_tokens = max_tokens,
+                repetition_penalty = repetition_penalty,
+                repetition_context_size = repetition_context_size,
+                presence_penalty = presence_penalty,
+                frequency_penalty = frequency_penalty,
+                logit_bias = logit_bias,
+                stop = stop,
+                cancel_event = cancel_event,
+                enable_thinking = enable_thinking,
+            )
+            return
+
+        for iteration in range(max_tool_iterations):
+            if cancel_event is not None and cancel_event.is_set():
+                return
+
+            # ── Generate one assistant turn, accumulating text ────
+            turn_text = ""
+            turn_usage: Dict[str, Any] = {}
+            turn_timings: Dict[str, Any] = {}
+            for event in self._stream_assistant_turn(
+                conversation = conversation,
+                tools = tools if iteration == 0 or self._tools_kwarg_ok else tools,
+                tool_choice = tool_choice_norm,
+                temperature = temperature,
+                top_p = top_p,
+                top_k = top_k,
+                min_p = min_p,
+                max_tokens = max_tokens,
+                repetition_penalty = repetition_penalty,
+                repetition_context_size = repetition_context_size,
+                presence_penalty = presence_penalty,
+                frequency_penalty = frequency_penalty,
+                logit_bias = logit_bias,
+                stop = stop,
+                cancel_event = cancel_event,
+                enable_thinking = enable_thinking,
+            ):
+                if isinstance(event, dict):
+                    if event.get("type") == "metadata":
+                        turn_usage = event.get("usage", {}) or {}
+                        turn_timings = event.get("timings", {}) or {}
+                    continue
+                # Cumulative text from the inner generator.
+                turn_text = event
+                # Stream cleaned tokens to the caller so the UI sees
+                # streaming before the tool-call resolves.
+                cleaned = strip_tool_markup(turn_text) if auto_heal_tool_calls else turn_text
+                yield {"type": "content", "text": cleaned}
+
+            if cancel_event is not None and cancel_event.is_set():
+                return
+
+            total_prompt_tokens = turn_usage.get("prompt_tokens", total_prompt_tokens)
+            total_completion_tokens += int(turn_usage.get("completion_tokens", 0) or 0)
+            # predicted_ms / predicted_n aren't native to mlx-lm's
+            # response object, but some stream_generate futures do
+            # populate them via the speculative path. Fold defensively.
+            pm = turn_timings.get("predicted_ms") if isinstance(turn_timings, dict) else None
+            pn = turn_timings.get("predicted_n") if isinstance(turn_timings, dict) else None
+            if isinstance(pm, (int, float)):
+                accumulated_predicted_ms += float(pm)
+            if isinstance(pn, (int, float)):
+                accumulated_predicted_n += int(pn)
+
+            # ── Parse the turn's text for tool calls ──────────────
+            tool_calls = (
+                parse_tool_calls_from_text(turn_text) if auto_heal_tool_calls else []
+            )
+
+            if not tool_calls:
+                # Final answer turn — emit the cleaned text one last
+                # time and the metadata event.
+                final_text = (
+                    strip_tool_markup(turn_text, final = True)
+                    if auto_heal_tool_calls
+                    else turn_text
+                )
+                yield {"type": "content", "text": final_text}
+                yield {"type": "status", "text": ""}
+                yield self._build_metadata_event(
+                    prompt_tokens = total_prompt_tokens,
+                    completion_tokens = total_completion_tokens,
+                    predicted_ms = accumulated_predicted_ms,
+                    predicted_n = accumulated_predicted_n,
+                    base_timings = turn_timings,
+                )
+                return
+
+            # ── Execute each tool, then continue the conversation ──
+            # Record the assistant's turn (with tool_calls) so
+            # apply_chat_template in the next iteration has the full
+            # history; strip markup from the content so the assistant
+            # message content stays readable.
+            assistant_content = (
+                strip_tool_markup(turn_text, final = True)
+                if auto_heal_tool_calls
+                else turn_text
+            )
+            assistant_msg: Dict[str, Any] = {
+                "role": "assistant",
+                "content": assistant_content,
+                "tool_calls": tool_calls,
+            }
+            conversation.append(assistant_msg)
+
+            for tc in tool_calls:
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                func = tc.get("function", {})
+                tool_name = func.get("name", "")
+                raw_args = func.get("arguments", "")
+                if isinstance(raw_args, str):
+                    try:
+                        arguments = json.loads(raw_args) if raw_args else {}
+                    except json.JSONDecodeError:
+                        arguments = {"raw": raw_args}
+                else:
+                    arguments = raw_args
+
+                status = self._tool_status_text(tool_name, arguments)
+                yield {"type": "status", "text": status}
+                yield {
+                    "type": "tool_start",
+                    "tool_name": tool_name,
+                    "tool_call_id": tc.get("id", ""),
+                    "arguments": arguments,
+                }
+
+                try:
+                    effective_timeout = (
+                        None if tool_call_timeout >= 9999 else tool_call_timeout
+                    )
+                    result = execute_tool(
+                        tool_name,
+                        arguments,
+                        cancel_event = cancel_event,
+                        timeout = effective_timeout,
+                        session_id = session_id,
+                    )
+                except Exception as exc:
+                    result = f"Error executing {tool_name}: {exc}"
+
+                yield {
+                    "type": "tool_end",
+                    "tool_name": tool_name,
+                    "tool_call_id": tc.get("id", ""),
+                    "result": result,
+                }
+
+                tool_msg: Dict[str, Any] = {
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": result if isinstance(result, str) else str(result),
+                }
+                tc_id = tc.get("id")
+                if tc_id:
+                    tool_msg["tool_call_id"] = tc_id
+                conversation.append(tool_msg)
+
+            yield {"type": "status", "text": ""}
+            # Continue the for loop — next iteration generates the
+            # assistant's follow-up turn with the new tool results in
+            # context.
+
+        # ── Tool iteration cap reached ────────────────────────────
+        # Inject a "no more tools" nudge and do one final plain turn
+        # so the conversation ends with assistant text.
+        if max_tool_iterations > 0:
+            conversation.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "You have used all available tool calls. Based on "
+                        "everything you found so far, provide your final "
+                        "answer now. Do not call any more tools."
+                    ),
+                }
+            )
+        yield {"type": "status", "text": ""}
+        final_text_cum = ""
+        final_usage: Dict[str, Any] = {}
+        final_timings: Dict[str, Any] = {}
+        for event in self._stream_assistant_turn(
+            conversation = conversation,
+            tools = None,
+            tool_choice = "none",
+            temperature = temperature,
+            top_p = top_p,
+            top_k = top_k,
+            min_p = min_p,
+            max_tokens = max_tokens,
+            repetition_penalty = repetition_penalty,
+            repetition_context_size = repetition_context_size,
+            presence_penalty = presence_penalty,
+            frequency_penalty = frequency_penalty,
+            logit_bias = logit_bias,
+            stop = stop,
+            cancel_event = cancel_event,
+            enable_thinking = enable_thinking,
+        ):
+            if isinstance(event, dict):
+                if event.get("type") == "metadata":
+                    final_usage = event.get("usage", {}) or {}
+                    final_timings = event.get("timings", {}) or {}
+                continue
+            final_text_cum = event
+            yield {"type": "content", "text": final_text_cum}
+
+        total_prompt_tokens = final_usage.get("prompt_tokens", total_prompt_tokens)
+        total_completion_tokens += int(final_usage.get("completion_tokens", 0) or 0)
+        yield self._build_metadata_event(
+            prompt_tokens = total_prompt_tokens,
+            completion_tokens = total_completion_tokens,
+            predicted_ms = accumulated_predicted_ms,
+            predicted_n = accumulated_predicted_n,
+            base_timings = final_timings,
+        )
+
+    # ── Helper methods for the tool loop ──────────────────────────
+
+    @staticmethod
+    def _normalize_tool_choice(tool_choice: Any) -> Optional[str]:
+        """Collapse OpenAI ``tool_choice`` values to a simple string.
+
+        Returns one of ``"auto"`` / ``"required"`` / ``"none"`` or
+        ``None`` when the input is unrecognised (caller treats that
+        as "auto"). The structured ``{"type": "function", ...}`` form
+        is currently treated as "required" — we don't yet implement
+        forcing a specific function name, but the backend still runs
+        the loop and lets the model pick.
+        """
+        if tool_choice is None:
+            return "auto"
+        if isinstance(tool_choice, str):
+            low = tool_choice.strip().lower()
+            if low in ("auto", "required", "none"):
+                return low
+            return "auto"
+        if isinstance(tool_choice, dict):
+            if tool_choice.get("type") == "function":
+                return "required"
+            return "auto"
+        return "auto"
+
+    def _stream_assistant_turn(
+        self,
+        *,
+        conversation: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: Optional[str],
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        min_p: float,
+        max_tokens: Optional[int],
+        repetition_penalty: float,
+        repetition_context_size: Optional[int],
+        presence_penalty: float,
+        frequency_penalty: float,
+        logit_bias: Optional[Dict[int, float]],
+        stop: Optional[List[str]],
+        cancel_event: Optional[threading.Event],
+        enable_thinking: Optional[bool],
+    ) -> Generator[Union[str, Dict[str, Any]], None, None]:
+        """Stream one assistant turn with the current conversation.
+
+        Mirrors :meth:`generate_chat_completion` but passes ``tools``
+        into the prompt builder. The body is a near-clone — we can't
+        share the loop because the prompt must be rebuilt per turn
+        (the conversation grows between turns).
+        """
+        try:
+            from mlx_lm import stream_generate  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(f"mlx_lm is not installed: {e}") from e
+
+        # Build prompt with or without tools based on tool_choice.
+        render_tools = tools if (tools and tool_choice != "none") else None
+        prompt = self._render_prompt(
+            conversation,
+            tools = render_tools,
+            tool_choice = tool_choice if render_tools else None,
+            enable_thinking = enable_thinking,
+        )
+        # When the template didn't accept the tools kwarg, inject the
+        # schema as a system-prompt prefix so the model still knows
+        # about the available tools.
+        if render_tools and self._tools_kwarg_ok is False:
+            prompt = self._inject_tool_schema_prefix(prompt, render_tools)
+
+        sampler, processors = _build_mlx_sampler_and_processors(
+            temperature = temperature,
+            top_p = top_p,
+            top_k = top_k,
+            min_p = min_p,
+            repetition_penalty = repetition_penalty,
+            repetition_context_size = repetition_context_size,
+            presence_penalty = presence_penalty,
+            frequency_penalty = frequency_penalty,
+            logit_bias = logit_bias,
+        )
+        sg_kwargs: Dict[str, Any] = {"prompt": prompt}
+        if max_tokens is not None and max_tokens > 0:
+            sg_kwargs["max_tokens"] = int(max_tokens)
+        if sampler is not None:
+            sg_kwargs["sampler"] = sampler
+        if processors:
+            sg_kwargs["logits_processors"] = processors
+        if self._kv_bits is not None:
+            sg_kwargs["kv_bits"] = int(self._kv_bits)
+            sg_kwargs["kv_group_size"] = int(self._kv_group_size)
+            sg_kwargs["quantized_kv_start"] = int(self._quantized_kv_start)
+        if self._draft_model is not None:
+            sg_kwargs["draft_model"] = self._draft_model
+            sg_kwargs["num_draft_tokens"] = int(self._num_draft_tokens)
+
+        stop_strings: List[str] = []
+        if stop:
+            if isinstance(stop, str):
+                stop_strings = [stop]
+            else:
+                stop_strings = [s for s in stop if isinstance(s, str) and s]
+        max_stop_len = max((len(s) for s in stop_strings), default = 0)
+
+        cumulative = ""
+        last_resp: Any = None
+        finish_reason = "stop"
+        try:
+            for resp in stream_generate(self._model, self._tokenizer, **sg_kwargs):
+                last_resp = resp
+                if cancel_event is not None and cancel_event.is_set():
+                    finish_reason = "cancelled"
+                    break
+                text = getattr(resp, "text", "") or ""
+                if not text:
+                    continue
+                cumulative += text
+                if stop_strings:
+                    scan_start = max(0, len(cumulative) - (max_stop_len + len(text)))
+                    hay = cumulative[scan_start:]
+                    earliest_rel: Optional[int] = None
+                    for s in stop_strings:
+                        idx = hay.find(s)
+                        if idx != -1 and (earliest_rel is None or idx < earliest_rel):
+                            earliest_rel = idx
+                    if earliest_rel is not None:
+                        cut = scan_start + earliest_rel
+                        cumulative = cumulative[:cut]
+                        yield cumulative
+                        break
+                yield cumulative
+        except Exception as e:
+            logger.error(f"MLX stream_generate (tool turn) raised: {e}")
+            raise
+
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        timings: Dict[str, Any] = {
+            "prompt_per_second": None,
+            "predicted_per_second": None,
+        }
+        if last_resp is not None:
+            pt = int(getattr(last_resp, "prompt_tokens", 0) or 0)
+            gt = int(getattr(last_resp, "generation_tokens", 0) or 0)
+            usage = {
+                "prompt_tokens": pt,
+                "completion_tokens": gt,
+                "total_tokens": pt + gt,
+            }
+            timings = {
+                "prompt_per_second": getattr(last_resp, "prompt_tps", None),
+                "predicted_per_second": getattr(last_resp, "generation_tps", None),
+            }
+        yield {
+            "type": "metadata",
+            "usage": usage,
+            "timings": timings,
+            "finish_reason": finish_reason,
+        }
+
+    def _run_plain_tool_turn(
+        self, **kwargs: Any
+    ) -> Generator[Union[Dict[str, Any], str], None, None]:
+        """``tool_choice="none"`` path: run one turn, relay events."""
+        conversation = kwargs.pop("conversation")
+        for event in self._stream_assistant_turn(
+            conversation = conversation, **kwargs
+        ):
+            if isinstance(event, dict):
+                if event.get("type") == "metadata":
+                    yield {
+                        "type": "metadata",
+                        "usage": event.get("usage", {}),
+                        "timings": event.get("timings", {}),
+                    }
+                continue
+            yield {"type": "content", "text": event}
+        yield {"type": "status", "text": ""}
+
+    @staticmethod
+    def _inject_tool_schema_prefix(
+        prompt: str, tools: List[Dict[str, Any]]
+    ) -> str:
+        """Prepend a tool-schema block when the template didn't accept
+        the ``tools`` kwarg.
+
+        The shape mirrors what Qwen3 / Bonsai's tools-aware system
+        message looks like so the model recognises the convention —
+        the same XML ``<tool_call>{"name":..., "arguments":...}</tool_call>``
+        pattern the parser then extracts. This is a fallback for
+        templates whose Jinja doesn't know about the ``tools`` kwarg;
+        in practice Bonsai does accept it, so this code path is rarely
+        taken.
+        """
+        schema_lines = [
+            "# Tools",
+            "",
+            "You may call one or more functions to assist with the user query.",
+            "",
+            "You are provided with function signatures within <tools></tools> XML tags:",
+            "<tools>",
+        ]
+        for t in tools:
+            try:
+                schema_lines.append(json.dumps(t))
+            except (TypeError, ValueError):
+                continue
+        schema_lines.append("</tools>")
+        schema_lines.append("")
+        schema_lines.append(
+            "For each function call, return a json object with function name and "
+            "arguments within <tool_call></tool_call> XML tags:"
+        )
+        schema_lines.append("<tool_call>")
+        schema_lines.append('{"name": <function-name>, "arguments": <args-json-object>}')
+        schema_lines.append("</tool_call>")
+        return "\n".join(schema_lines) + "\n\n" + prompt
+
+    @staticmethod
+    def _tool_status_text(tool_name: str, arguments: Dict[str, Any]) -> str:
+        """Build UI status text for a tool invocation.
+
+        Mirrors the style GGUF uses in its agentic loop so the
+        frontend badges look identical regardless of backend.
+        """
+        if tool_name == "web_search":
+            url = (arguments.get("url") or "").strip()
+            if url:
+                return f"Reading: {url[:80]}"
+            return f"Searching: {arguments.get('query', '')[:80]}"
+        if tool_name == "python":
+            preview = (arguments.get("code") or "").strip().split("\n")[0][:60]
+            return f"Running Python: {preview}" if preview else "Running Python..."
+        if tool_name == "terminal":
+            cmd = (arguments.get("command") or "")[:60]
+            return f"Running: {cmd}" if cmd else "Running command..."
+        return f"Calling: {tool_name}"
+
+    @staticmethod
+    def _build_metadata_event(
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        predicted_ms: float,
+        predicted_n: int,
+        base_timings: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Assemble a final metadata event from accumulated counts."""
+        timings = dict(base_timings) if isinstance(base_timings, dict) else {}
+        if predicted_ms or predicted_n:
+            timings["predicted_ms"] = predicted_ms
+            timings["predicted_n"] = predicted_n
+            if predicted_ms > 0:
+                timings["predicted_per_second"] = (
+                    predicted_n / (predicted_ms / 1000.0)
+                )
+        return {
+            "type": "metadata",
+            "usage": {
+                "prompt_tokens": int(prompt_tokens or 0),
+                "completion_tokens": int(completion_tokens or 0),
+                "total_tokens": int((prompt_tokens or 0) + (completion_tokens or 0)),
+            },
+            "timings": timings,
         }

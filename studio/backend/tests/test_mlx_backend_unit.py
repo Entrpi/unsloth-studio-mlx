@@ -1420,3 +1420,386 @@ def test_enable_thinking_omitted_when_none() -> None:
             )
     _, kwargs = b._tokenizer.apply_chat_template.call_args
     assert "chat_template_kwargs" not in kwargs
+
+
+# =====================================================================
+# Phase 5 — tool-calling loop
+# =====================================================================
+
+
+class _FakeResp:
+    """Stand-in for mlx-lm's stream_generate response object."""
+
+    def __init__(self, text, **kwargs):
+        self.text = text
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+def _stub_backend_for_tools(mocker_module=None):
+    """Return a loaded-shaped backend ready for tool-loop tests.
+
+    The backend has tokenizer/model stubs and ``_supports_tools=True``.
+    ``_tools_kwarg_ok=True`` so the render path goes through the tools
+    branch without probing the template.
+    """
+    from unittest import mock as _mock
+
+    b = _fresh_backend()
+    b._model = _mock.MagicMock(name="model")
+    b._tokenizer = _mock.MagicMock(name="tokenizer")
+    b._tokenizer.apply_chat_template = _mock.MagicMock(return_value="PROMPT")
+    b._tokenizer.chat_template = "{% if tools %}{{ tool_calls }}{% endif %}"
+    b._model_identifier = "unit/test"
+    b._supports_tools = True
+    b._tools_kwarg_ok = True
+    return b
+
+
+def _run_tool_loop(b, *, turns_text, tools, tool_choice=None, max_iter=10):
+    """Drive generate_chat_completion_with_tools with a scripted stream.
+
+    ``turns_text`` is a list — the i-th entry is the cumulative text
+    the i-th assistant turn should yield. Each turn's internal loop
+    delivers fake (text, metadata) pairs.
+    """
+    from unittest import mock as _mock
+
+    # Each turn is a list of _FakeResp deltas (cumulative = join).
+    def make_resps(full_text):
+        # Split roughly in thirds so we exercise multi-chunk streaming.
+        if not full_text:
+            return [_FakeResp("", prompt_tokens=5, generation_tokens=0)]
+        mid = len(full_text) // 2
+        return [
+            _FakeResp(full_text[:mid]),
+            _FakeResp(
+                full_text[mid:],
+                prompt_tokens=10,
+                generation_tokens=20,
+                prompt_tps=5.0,
+                generation_tps=30.0,
+            ),
+        ]
+
+    turn_iter = iter(turns_text)
+
+    def fake_stream_generate(_model, _tokenizer, **_kwargs):
+        txt = next(turn_iter)
+        yield from make_resps(txt)
+
+    import core.inference.mlx_lm as mlx_lm_mod
+
+    with _mock.patch.object(
+        mlx_lm_mod, "stream_generate", fake_stream_generate, create=True
+    ), _mock.patch.object(
+        mlx_lm_mod,
+        "_build_mlx_sampler_and_processors",
+        return_value=(None, []),
+    ):
+        # Inject fake mlx_lm module so the local `from mlx_lm import
+        # stream_generate` inside the backend resolves to our stub.
+        fake_mod = _mock.MagicMock()
+        fake_mod.stream_generate = fake_stream_generate
+        with _mock.patch.dict(sys.modules, {"mlx_lm": fake_mod}):
+            return list(
+                b.generate_chat_completion_with_tools(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    max_tool_iterations=max_iter,
+                )
+            )
+
+
+class TestToolDetect:
+    def test_supports_tools_false_without_template(self):
+        b = _fresh_backend()
+        b._tokenizer = type("T", (), {"chat_template": None})()
+        b._detect_tools(b._tokenizer)
+        assert b.supports_tools is False
+
+    def test_supports_tools_true_with_tools_kwds(self):
+        b = _fresh_backend()
+        # Template mentions both literals.
+        b._tokenizer = type("T", (), {"chat_template": "{{ tools }} {{ tool_calls }}"})()
+        b._detect_tools(b._tokenizer)
+        assert b.supports_tools is True
+
+    def test_supports_tools_false_without_tool_calls(self):
+        b = _fresh_backend()
+        b._tokenizer = type("T", (), {"chat_template": "{{ tools }} only"})()
+        b._detect_tools(b._tokenizer)
+        assert b.supports_tools is False
+
+
+class TestToolChoiceNormalisation:
+    def test_none_short_circuits_loop(self):
+        b = _stub_backend_for_tools()
+        # Only one turn should be consumed even if we would loop.
+        events = _run_tool_loop(
+            b,
+            turns_text=["plain answer, no tool"],
+            tools=[{"type": "function", "function": {"name": "x"}}],
+            tool_choice="none",
+        )
+        types = [e.get("type") for e in events if isinstance(e, dict)]
+        # No tool_start / tool_end should appear.
+        assert "tool_start" not in types
+        assert "tool_end" not in types
+        assert "metadata" in types
+
+    def test_auto_maps_correctly(self):
+        from core.inference.mlx_lm import MlxLmBackend
+
+        assert MlxLmBackend._normalize_tool_choice(None) == "auto"
+        assert MlxLmBackend._normalize_tool_choice("auto") == "auto"
+        assert MlxLmBackend._normalize_tool_choice("required") == "required"
+        assert MlxLmBackend._normalize_tool_choice("none") == "none"
+        # Structured: treated as "required" (loop runs).
+        assert (
+            MlxLmBackend._normalize_tool_choice(
+                {"type": "function", "function": {"name": "x"}}
+            )
+            == "required"
+        )
+        # Unknown → "auto"
+        assert MlxLmBackend._normalize_tool_choice("invalid") == "auto"
+
+
+class TestAgenticLoopSingleToolHappyPath:
+    def test_single_tool_call_then_final_answer(self):
+        from unittest import mock
+
+        b = _stub_backend_for_tools()
+        tool_call_markup = (
+            'thinking...\n<tool_call>{"name": "get_weather", '
+            '"arguments": {"city": "Paris"}}</tool_call>'
+        )
+
+        with mock.patch(
+            "core.inference.tools.execute_tool",
+            return_value='{"temp": 22}',
+        ) as exec_mock:
+            events = _run_tool_loop(
+                b,
+                turns_text=[tool_call_markup, "The weather is 22°C."],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "parameters": {},
+                        },
+                    }
+                ],
+            )
+
+        types = [e.get("type") for e in events if isinstance(e, dict)]
+        assert types.count("tool_start") == 1
+        assert types.count("tool_end") == 1
+        assert types.count("metadata") == 1
+        # Executor was called with the parsed arguments.
+        exec_mock.assert_called_once()
+        args = exec_mock.call_args.args
+        kwargs = exec_mock.call_args.kwargs
+        assert args[0] == "get_weather"
+        assert args[1] == {"city": "Paris"}
+        # Final content event carries the synthesised answer text.
+        content_events = [e for e in events if e.get("type") == "content"]
+        final_text = content_events[-1]["text"]
+        assert "22°C" in final_text
+
+    def test_tool_start_carries_id_and_arguments(self):
+        from unittest import mock
+
+        b = _stub_backend_for_tools()
+        with mock.patch(
+            "core.inference.tools.execute_tool",
+            return_value="result",
+        ):
+            events = _run_tool_loop(
+                b,
+                turns_text=[
+                    '<tool_call>{"name": "x", "arguments": {"q": "1"}}</tool_call>',
+                    "done",
+                ],
+                tools=[{"type": "function", "function": {"name": "x"}}],
+            )
+        tool_start = next(e for e in events if e.get("type") == "tool_start")
+        tool_end = next(e for e in events if e.get("type") == "tool_end")
+        assert tool_start["tool_name"] == "x"
+        assert tool_start["arguments"] == {"q": "1"}
+        assert tool_start["tool_call_id"].startswith("call_")
+        assert tool_end["result"] == "result"
+        assert tool_end["tool_call_id"] == tool_start["tool_call_id"]
+
+
+class TestAgenticLoopMultiTurn:
+    def test_two_tool_calls_then_final(self):
+        from unittest import mock
+
+        b = _stub_backend_for_tools()
+
+        results = iter(['{"t1": 1}', '{"t2": 2}'])
+
+        with mock.patch(
+            "core.inference.tools.execute_tool",
+            side_effect=lambda *a, **kw: next(results),
+        ):
+            events = _run_tool_loop(
+                b,
+                turns_text=[
+                    '<tool_call>{"name": "a", "arguments": {"i": 1}}</tool_call>',
+                    '<tool_call>{"name": "b", "arguments": {"j": 2}}</tool_call>',
+                    "All done.",
+                ],
+                tools=[
+                    {"type": "function", "function": {"name": "a"}},
+                    {"type": "function", "function": {"name": "b"}},
+                ],
+            )
+
+        starts = [e for e in events if e.get("type") == "tool_start"]
+        ends = [e for e in events if e.get("type") == "tool_end"]
+        assert [s["tool_name"] for s in starts] == ["a", "b"]
+        assert [e["result"] for e in ends] == ['{"t1": 1}', '{"t2": 2}']
+
+
+class TestAgenticLoopMaxIterations:
+    def test_cap_triggers_final_nudge(self):
+        from unittest import mock
+
+        b = _stub_backend_for_tools()
+
+        # Every turn wants to call a tool; cap at 2 so after 2
+        # iterations the loop injects the "no more tools" nudge and
+        # runs one more turn with plain text.
+        calls = [
+            '<tool_call>{"name": "loop", "arguments": {}}</tool_call>',
+            '<tool_call>{"name": "loop", "arguments": {}}</tool_call>',
+            "Final fallback answer.",
+        ]
+        with mock.patch(
+            "core.inference.tools.execute_tool",
+            return_value="ok",
+        ):
+            events = _run_tool_loop(
+                b,
+                turns_text=calls,
+                tools=[{"type": "function", "function": {"name": "loop"}}],
+                max_iter=2,
+            )
+        # Exactly two tool executions ran (one per loop iteration).
+        starts = [e for e in events if e.get("type") == "tool_start"]
+        assert len(starts) == 2
+        # Final content event has the fallback text.
+        contents = [e for e in events if e.get("type") == "content"]
+        assert any("Final fallback answer" in e["text"] for e in contents)
+
+
+class TestPromptRenderWithTools:
+    def test_forwards_tools_kwarg_when_template_accepts(self):
+        from unittest import mock
+
+        b = _fresh_backend()
+        b._tokenizer = mock.MagicMock()
+        b._tokenizer.apply_chat_template.return_value = "RENDERED"
+        b._tools_kwarg_ok = True  # pretend detection succeeded
+        out = b._render_prompt(
+            [{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "x"}}],
+            tool_choice="auto",
+        )
+        assert out == "RENDERED"
+        call = b._tokenizer.apply_chat_template.call_args
+        # tools kwarg was forwarded
+        assert call.kwargs.get("tools") == [
+            {"type": "function", "function": {"name": "x"}}
+        ]
+        assert call.kwargs.get("tool_choice") == "auto"
+
+    def test_falls_back_when_tools_kwarg_rejected(self):
+        from unittest import mock
+
+        b = _fresh_backend()
+        b._tokenizer = mock.MagicMock()
+        # First call (with tools) raises TypeError; second call (without)
+        # returns the tool-less prompt.
+        b._tokenizer.apply_chat_template.side_effect = [
+            TypeError("unexpected keyword argument 'tools'"),
+            "RENDERED_NOTOOLS",
+        ]
+        b._tools_kwarg_ok = None
+        out = b._render_prompt(
+            [{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "x"}}],
+        )
+        # The detection has been cached for future calls.
+        assert b._tools_kwarg_ok is False
+        assert out == "RENDERED_NOTOOLS"
+        # Second call: no tools kwarg.
+        second_call = b._tokenizer.apply_chat_template.call_args_list[1]
+        assert "tools" not in second_call.kwargs
+
+
+class TestStatusText:
+    def test_web_search_query(self):
+        from core.inference.mlx_lm import MlxLmBackend
+
+        assert (
+            MlxLmBackend._tool_status_text("web_search", {"query": "abc"})
+            == "Searching: abc"
+        )
+
+    def test_web_search_url(self):
+        from core.inference.mlx_lm import MlxLmBackend
+
+        out = MlxLmBackend._tool_status_text(
+            "web_search", {"url": "https://example.com"}
+        )
+        assert out.startswith("Reading: ")
+
+    def test_python_code(self):
+        from core.inference.mlx_lm import MlxLmBackend
+
+        out = MlxLmBackend._tool_status_text("python", {"code": "print(1)\nprint(2)"})
+        assert out.startswith("Running Python:")
+
+    def test_terminal_command(self):
+        from core.inference.mlx_lm import MlxLmBackend
+
+        out = MlxLmBackend._tool_status_text("terminal", {"command": "ls /"})
+        assert out.startswith("Running:")
+
+    def test_unknown_tool_fallback(self):
+        from core.inference.mlx_lm import MlxLmBackend
+
+        assert (
+            MlxLmBackend._tool_status_text("custom_x", {}) == "Calling: custom_x"
+        )
+
+
+class TestToolRefusalWhenNotSupported:
+    def test_raises_when_not_tool_capable(self):
+        b = _fresh_backend()
+        b._model = object()
+        b._tokenizer = object()
+        b._supports_tools = False
+        with pytest.raises(RuntimeError, match="does not advertise tool-calling"):
+            list(
+                b.generate_chat_completion_with_tools(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[{"type": "function", "function": {"name": "x"}}],
+                )
+            )
+
+    def test_raises_when_not_loaded(self):
+        b = _fresh_backend()
+        with pytest.raises(RuntimeError, match="not loaded"):
+            list(
+                b.generate_chat_completion_with_tools(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[{"type": "function", "function": {"name": "x"}}],
+                )
+            )
