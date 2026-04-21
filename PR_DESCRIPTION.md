@@ -670,3 +670,197 @@ curl -sN http://127.0.0.1:8000/v1/chat/completions \
   string — rendering correctness depends on the chat template.
   Verified to work with Bonsai but not proven out for Hermes / Mistral
   templates that don't re-serialise `tool_calls` cleanly.
+
+---
+
+# Chunk D (Phases 9 + 10) — Vision + Audio
+
+Adds two new MLX peer backends completing the parity roadmap:
+
+- **`MlxVlmBackend`** (Phase 9, `core/inference/mlx_vlm.py`) — load
+  `mlx-community` vision-language checkpoints via `mlx_vlm.load()` and
+  stream multimodal chat with `mlx_vlm.stream_generate()`. Target and
+  smoke model: `mlx-community/Qwen3.5-4B-MLX-4bit`.
+- **`MlxAudioBackend`** (Phase 10, `core/inference/mlx_audio.py`) — TTS
+  via `LFM2AudioModel.from_pretrained` + `generate_from_chat_state`
+  (`mode="interleaved"`), ASR via best-effort `mode="text"` with audio
+  injected through `ChatState.add_audio`. Target and smoke model:
+  `mlx-community/LFM2.5-Audio-1.5B-bf16`.
+
+Additive companion: a `BackendKind` enum
+(`"gguf" | "mlx" | "mlx+lora" | "mlx+vlm" | "mlx+audio" | "unsloth"`)
+lands on `LoadResponse` and `InferenceStatusResponse`. The boolean
+flags (`is_gguf` / `is_mlx` / `is_mlx_vlm` / `is_mlx_audio`) are
+preserved — nothing is deprecated yet.
+
+## Probe-phase findings (pre-implementation)
+
+Committed separately as `PROBE_RESULTS.md`. Highlights:
+
+- `mlx-vlm==0.4.4` — works. `load()` returns `(model, processor)`;
+  `stream_generate` yields `GenerationResult` objects with `.text`.
+  Qwen3.5-4B-VLM describes a red-square test image with 100 %
+  reliability (assertion: output contains `"red"` or `"square"`).
+  Installing `mlx-vlm` transitively pulls in `torch` + `torchvision`
+  because the HF `Qwen3VLVideoProcessor` is hard-required by
+  `AutoProcessor.from_pretrained` even when video is never used.
+- `mlx-audio==0.4.2` — TTS works reliably. LFM2.5-Audio-1.5B-bf16
+  synthesizes "Say hello world" to a 0.96 s / 24 kHz mono WAV with
+  non-trivial energy. ASR is **best-effort** — the model is a voice
+  assistant, not a dedicated ASR, and does not reliably transcribe
+  its own short TTS outputs. Documented as a softer assertion in
+  the integration test.
+- `mlx-audio` pins `mlx-lm==0.31.1` in its `install_requires`; we
+  keep the Chunk-C pin `mlx-lm==0.31.2` and the resolver emits a
+  warning rather than an error. All `mlx-audio` imports + TTS paths
+  verified working with the mismatched pin.
+
+Decision: **PROCEED** — both ecosystems are production-ready for the
+primary flows; ASR degrades to best-effort with a softened test.
+
+## Scope
+
+**In scope (Chunk D):**
+
+- `_detect_mlx_vlm_model` — dual-signal detector (preprocessor /
+  processor config JSON files OR `architectures[*]` ending
+  `ConditionalGeneration` + known-VLM `model_type` allow-list).
+- `_detect_mlx_audio_model` — `architectures[*]` ending
+  `AudioForConditionalGeneration` OR known audio-model_type allow-list.
+- `MlxVlmBackend` with properties and public surface matching the
+  other peer backends (so the route's dispatch stays trivial):
+  `is_loaded`, `is_active`, `is_vision=True`, `model_identifier`,
+  `context_length`, `supports_tools`, `supports_reasoning`,
+  `load_model`, `unload_model`, `generate_chat_completion(..., image_b64=...)`.
+- `MlxAudioBackend` with `generate_tts(text) -> (wav_bytes,
+  sample_rate)` and `transcribe(audio_bytes, prompt=...) -> str`.
+  Returns valid RIFF/WAVE using the stdlib `wave` module so the
+  output is parseable everywhere.
+- Route wiring:
+  - `get_mlx_vlm_backend()` + `get_mlx_audio_backend()` lazy singletons.
+  - `_unload_all_mlx_peers(keep=...)` helper — Section 4.6 of the
+    roadmap's "peer-unload loop" (applied ~5 call sites across
+    GGUF / Unsloth / MLX / MLX-VLM / MLX-Audio loads).
+  - `/api/inference/load` branches for `is_mlx_vlm` and
+    `is_mlx_audio` (before the base MLX branch because both detect
+    on VLM/audio-specific signals).
+  - `/api/inference/unload` and `/api/inference/status` surface the
+    new peers with `backend_kind` enum values.
+  - `/api/inference/load-progress` polls the VLM / audio peers too.
+  - **`POST /v1/audio/speech`** (and `/api/inference/audio/speech`)
+    — OpenAI-compatible TTS endpoint. Body: `{input, model, voice,
+    response_format}`. Returns raw WAV bytes.
+  - **`POST /v1/audio/transcriptions`** (and
+    `/api/inference/audio/transcriptions`) — OpenAI-compatible ASR
+    endpoint. Multipart upload. Returns JSON `{"text": "..."}`.
+- Schemas: `is_mlx_vlm` / `is_mlx_audio` / `backend_kind` on
+  `LoadResponse`, `ValidateModelResponse`, `InferenceStatusResponse`,
+  `ModelDetails`.
+- Frontend:
+  - `BackendKind` TS enum + `is_mlx_vlm` / `is_mlx_audio` /
+    `backend_kind` on the API interfaces.
+  - `ChatModelSummary.isMlxVlm` / `isMlxAudio`.
+  - `chat-runtime-store.ts` now tracks `activeIsMlxVlm` /
+    `activeIsMlxAudio` / `activeBackendKind`; both are set from
+    `LoadModelResponse` and `InferenceStatusResponse`.
+  - Model-tag logic emits "MLX-VLM" and "MLX-Audio" labels.
+  - A VLM load treats `isVision = true` so the image composer shows
+    automatically — no UI changes required downstream of the flag.
+  - `npm run typecheck` clean.
+- Requirements: `mlx-vlm>=0.4.4,<0.5` and `mlx-audio>=0.4.2,<0.5`,
+  both `sys_platform == "darwin"` gated.
+
+**Out of scope (deferred):**
+
+- Video input on VLM models (even though Qwen3VL ships a video
+  processor config — video is off the Chunk D menu).
+- Audio input on VLM models (Qwen3-Omni exists but we didn't probe it).
+- VLM LoRA adapter loading (Phase 6 LoRA story is base-text only).
+- Streaming audio output (roadmap-defined non-goal).
+- Voice-to-voice conversational chat composer (too much UI work).
+- A dedicated ASR model path — we rely on LFM2.5-Audio's built-in
+  audio-in channel rather than shipping `mlx-whisper`. That's a
+  reasonable follow-up if ASR quality becomes a priority.
+
+## Deviations from the roadmap
+
+- The roadmap suggested **extending** `MlxLmBackend` to carry audio
+  behavior (mirroring `LlamaCppBackend`'s audio_type fork). We
+  implemented a **peer class** instead because
+  `LFM2AudioModel.from_pretrained` has a different load signature
+  and the generate surface yields `(token, modality)` tuples rather
+  than `GenerationResult`. The peer-class approach kept `MlxLmBackend`
+  unchanged and made the route dispatch simpler.
+- `BackendKind` is rolled out **additively in Phase 9+10** (not "in
+  Phase 6 additively + deprecate in 9/10"). Booleans stay on every
+  response; no deprecation warnings yet. A future chunk can flip
+  the UI to read `backend_kind` exclusively and then trim the
+  booleans.
+- The peer-unload refactor (roadmap §4.6) was **applied**. A new
+  `_unload_all_mlx_peers(keep=...)` helper replaces the ~5 inline
+  chains of `if backend.is_loaded: backend.unload_model()`.
+
+## Smoke-test curls
+
+### Load + describe an image (Phase 9)
+
+```bash
+# Load Qwen3.5-4B-VLM
+curl -s -X POST http://localhost:8085/api/inference/load \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer $STUDIO_API_KEY' \
+  -d '{"model_path":"/Users/ent/.lmstudio/models/mlx-community/Qwen3.5-4B-MLX-4bit","max_seq_length":0,"load_in_4bit":false,"is_lora":false}'
+
+# Send a multimodal chat with a base64 PNG
+B64=$(python3 -c 'from PIL import Image,ImageDraw;import io,base64;img=Image.new("RGB",(256,256),"white");ImageDraw.Draw(img).rectangle([64,64,192,192],fill="red");b=io.BytesIO();img.save(b,format="PNG");print(base64.b64encode(b.getvalue()).decode())')
+curl -s -X POST http://localhost:8085/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer $STUDIO_API_KEY' \
+  -d "{\"model\":\"qwen3.5-vlm\",\"stream\":false,\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Describe this image in one short sentence.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,$B64\"}}]}]}"
+# Expected: response text mentions 'red' or 'square'.
+```
+
+### TTS via /v1/audio/speech (Phase 10)
+
+```bash
+# Load LFM2.5-Audio
+curl -s -X POST http://localhost:8085/api/inference/load \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer $STUDIO_API_KEY' \
+  -d '{"model_path":"/Users/ent/.lmstudio/models/mlx-community/LFM2.5-Audio-1.5B-bf16","max_seq_length":0,"load_in_4bit":false,"is_lora":false}'
+
+# OpenAI-shape TTS
+curl -s -X POST http://localhost:8085/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer $STUDIO_API_KEY' \
+  -d '{"model":"lfm2-audio","input":"Hello world, this is Unsloth Studio on MLX.","response_format":"wav"}' \
+  --output /tmp/studio_tts.wav
+# Expected: /tmp/studio_tts.wav is a playable 24 kHz mono WAV.
+```
+
+### ASR via /v1/audio/transcriptions (Phase 10)
+
+```bash
+curl -s -X POST http://localhost:8085/v1/audio/transcriptions \
+  -H 'Authorization: Bearer $STUDIO_API_KEY' \
+  -F file=@/tmp/studio_tts.wav \
+  -F model=lfm2-audio \
+  -F response_format=json
+# Expected: {"text": "..."}.
+# Best-effort — LFM2.5-Audio may respond conversationally rather than
+# verbatim transcribing. See PROBE_RESULTS.md for the limitation.
+```
+
+## Test results
+
+- 201 tests in `tests/test_mlx*.py` + `tests/test_tool_call_parser.py`
+  all pass on macOS arm64, including:
+  - 22 new VLM detection / backend unit tests.
+  - 4 new VLM Darwin-gated integration tests (Qwen3.5-4B-VLM
+    end-to-end: load, describe red square, text-only fallback,
+    peer-unload after loading another MLX model).
+  - 4 new audio backend unit tests (WAV packing round-trip).
+  - 3 new audio Darwin-gated integration tests (LFM2.5-Audio TTS
+    round-trip, ASR call contract).
+  - All pre-existing Chunks A–C tests unchanged.
+- `npm run typecheck` in `studio/frontend` clean.
