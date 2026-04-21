@@ -152,6 +152,28 @@ def get_llama_cpp_backend() -> LlamaCppBackend:
     return _llama_cpp_backend
 
 
+# MLX inference backend (Apple Silicon). Lazy-constructed so non-Darwin
+# CI does not pay the import cost and does not fail when mlx_lm is
+# unavailable.
+_mlx_lm_backend: Optional["MlxLmBackend"] = None  # noqa: F821 (forward ref)
+
+
+def get_mlx_lm_backend():
+    """Return the process-wide ``MlxLmBackend`` singleton.
+
+    Instantiation is deferred to the first call so Linux / Windows
+    imports of this module do not need ``mlx_lm`` available. The class
+    itself does not import ``mlx_lm`` at construction time; the actual
+    ``mlx_lm.load`` call is deferred further to ``load_model``.
+    """
+    global _mlx_lm_backend
+    if _mlx_lm_backend is None:
+        from core.inference.mlx_lm import MlxLmBackend
+
+        _mlx_lm_backend = MlxLmBackend()
+    return _mlx_lm_backend
+
+
 @router.post("/load", response_model = LoadResponse)
 async def load_model(
     request: LoadRequest,
@@ -174,6 +196,41 @@ async def load_model(
         # ── Already-loaded check: skip reload if the exact model is active ──
         backend = get_inference_backend()
         llama_backend = get_llama_cpp_backend()
+        mlx_backend = get_mlx_lm_backend()
+
+        # MLX short-circuit (must precede GGUF/Unsloth checks because the
+        # MLX backend's model_identifier is the local dir name, which may
+        # collide with a user-visible Unsloth path).
+        if (
+            mlx_backend.is_loaded
+            and mlx_backend.model_identifier
+            and mlx_backend.model_identifier.lower() == request.model_path.lower()
+            and not request.gguf_variant
+        ):
+            logger.info(
+                f"Model already loaded (MLX): {request.model_path}, skipping reload"
+            )
+            inference_config = load_inference_config(mlx_backend.model_identifier)
+            return LoadResponse(
+                status = "already_loaded",
+                model = mlx_backend.model_identifier,
+                display_name = mlx_backend.model_identifier,
+                is_vision = False,
+                is_lora = False,
+                is_gguf = False,
+                is_mlx = True,
+                is_audio = False,
+                inference = inference_config,
+                requires_trust_remote_code = False,
+                context_length = mlx_backend.context_length,
+                max_context_length = mlx_backend.max_context_length,
+                native_context_length = mlx_backend.native_context_length,
+                supports_reasoning = False,
+                reasoning_always_on = False,
+                supports_tools = False,
+                chat_template = None,
+                speculative_type = None,
+            )
 
         if request.gguf_variant:
             if (
@@ -281,6 +338,7 @@ async def load_model(
 
             llama_backend = get_llama_cpp_backend()
             unsloth_backend = get_inference_backend()
+            mlx_peer = get_mlx_lm_backend()
 
             # Unload any active Unsloth model first to free VRAM
             if unsloth_backend.active_model_name:
@@ -288,6 +346,10 @@ async def load_model(
                     f"Unloading Unsloth model '{unsloth_backend.active_model_name}' before loading GGUF"
                 )
                 unsloth_backend.unload_model(unsloth_backend.active_model_name)
+            # Unload any active MLX model before loading GGUF (unified mem)
+            if mlx_peer.is_loaded:
+                logger.info("Unloading MLX model before loading GGUF")
+                await asyncio.to_thread(mlx_peer.unload_model)
 
             # Route to HF mode or local mode based on config
             # Run in a thread so the event loop stays free for progress
@@ -371,6 +433,70 @@ async def load_model(
                 speculative_type = llama_backend.speculative_type,
             )
 
+        # ── MLX path: load via mlx_lm (Apple Silicon only) ─────────
+        if config.is_mlx:
+            if effective_gpu_ids is not None:
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "gpu_ids is not supported for MLX models.",
+                )
+
+            mlx_backend = get_mlx_lm_backend()
+            unsloth_backend = get_inference_backend()
+
+            # Unload any active peer backends first (mirrors GGUF behavior).
+            if unsloth_backend.active_model_name:
+                logger.info(
+                    f"Unloading Unsloth model '{unsloth_backend.active_model_name}' before loading MLX"
+                )
+                unsloth_backend.unload_model(unsloth_backend.active_model_name)
+            if llama_backend.is_loaded:
+                logger.info("Unloading GGUF model before loading MLX model")
+                await asyncio.to_thread(llama_backend.unload_model)
+
+            success = await asyncio.to_thread(
+                mlx_backend.load_model,
+                local_path = config.mlx_path or config.path,
+                model_identifier = config.identifier,
+                hf_token = request.hf_token,
+                n_ctx = request.max_seq_length,
+            )
+            if not success:
+                raise HTTPException(
+                    status_code = 500,
+                    detail = f"Failed to load MLX model: {config.display_name}",
+                )
+
+            logger.info(f"Loaded MLX model via mlx_lm: {config.identifier}")
+
+            inference_config = load_inference_config(config.identifier)
+
+            return LoadResponse(
+                status = "loaded",
+                model = config.identifier,
+                display_name = config.display_name,
+                is_vision = False,
+                is_lora = False,
+                is_gguf = False,
+                is_mlx = True,
+                is_audio = False,
+                audio_type = None,
+                has_audio_input = False,
+                inference = inference_config,
+                requires_trust_remote_code = bool(
+                    inference_config.get("trust_remote_code", False)
+                ),
+                context_length = mlx_backend.context_length,
+                max_context_length = mlx_backend.max_context_length,
+                native_context_length = mlx_backend.native_context_length,
+                supports_reasoning = False,
+                reasoning_always_on = False,
+                supports_tools = False,
+                cache_type_kv = None,
+                chat_template = None,
+                speculative_type = None,
+            )
+
         # ── Standard path: load via Unsloth/transformers ──────────
         backend = get_inference_backend()
 
@@ -379,6 +505,12 @@ async def load_model(
         if llama_backend.is_loaded:
             logger.info("Unloading GGUF model before loading Unsloth model")
             llama_backend.unload_model()
+
+        # Unload any active MLX model first
+        mlx_backend_peer = get_mlx_lm_backend()
+        if mlx_backend_peer.is_loaded:
+            logger.info("Unloading MLX model before loading Unsloth model")
+            await asyncio.to_thread(mlx_backend_peer.unload_model)
 
         # Shut down any export subprocess to free VRAM
         try:
