@@ -1227,7 +1227,55 @@ Cold-cache load times are observably variable (e.g. MoE swings from ~10 s warm t
 
 ## Residual follow-ups after Chunk H-2
 
-1. **Ministral tool-template xfail** — see `docs/chunk-h2-matrix/blockers.md`. Fix is ~30 lines in `_extract_content_parts` (per-template content coercion) plus one new test. Deferred.
-2. **Ministral-3 context_length detection** — top-level `max_position_embeddings` returns None because Ministral-3 is actually `Mistral3ForConditionalGeneration` with the key nested under `text_config`. Generation works, but the property surface is slightly lossy. Same root cause will likely apply to any future VLM-architectured model loaded via the text path; ~5-line fix in MLX backend's context-length detection.
+~~1. **Ministral tool-template xfail** — see `docs/chunk-h2-matrix/blockers.md`.
+Fix is ~30 lines in `_extract_content_parts` (per-template content coercion)
+plus one new test. Deferred.~~
+~~2. **Ministral-3 context_length detection** — top-level `max_position_embeddings`
+returns None because Ministral-3 is actually `Mistral3ForConditionalGeneration`
+with the key nested under `text_config`. Generation works, but the property
+surface is slightly lossy. Same root cause will likely apply to any future
+VLM-architectured model loaded via the text path; ~5-line fix in MLX backend's
+context-length detection.~~
 
-Both are genuinely deferrable — neither blocks any user-facing capability.
+**Both follow-ups closed — see "H-2 B1/B2 closure" below.** None remaining.
+
+## H-2 B1/B2 closure
+
+Follow-up items 1 and 2 above are both fixed on this same branch:
+
+- **B1 (Ministral tool-template xfail).** `_extract_content_parts` now coerces
+  `content=None` to `content=""` on assistant turns that carry `tool_calls`
+  AND take the native-iteration branch (template iterates
+  `message.tool_calls` directly). Templates that iterate `tool_calls` ignore
+  content for that turn, so the coercion is a purely defensive widening —
+  it never changes the rendered output for Qwen / Bonsai / Gemma / Llama-3.2
+  / Hermes, and unblocks Ministral's `content|length`-on-the-assistant-branch
+  strictness. A secondary alternation issue (Ministral's template enforces
+  user/assistant alternation over content-bearing turns, which the 4-turn
+  fixture `user → assistant-tc → tool → user` tripped) is closed by
+  reducing the shared tool-call fixture to the canonical 3-turn shape —
+  renders identically across every other family. Ministral's row in
+  `tests/test_mlx_tool_templates.py` is now a plain pass case, 0 xfails.
+
+- **B2 (Ministral context_length detection).** Both config-reader call
+  sites — `_read_mlx_max_position_embeddings` in `utils/models/model_config.py`
+  and the inline read in `core/inference/mlx_lm.py` — now fall back to
+  `config["text_config"]["max_position_embeddings"]` when the top-level
+  key is absent or None. `mlx_vlm` has had the same fallback since Chunk D
+  for Qwen3.5-VL, so this brings the text-path side to parity. Real-hardware
+  result: Ministral-3 surfaces `context_length=262144` (its actual native
+  context per the nested `text_config`). The H2-2 smoke test previously
+  exempted Ministral from the `context_length is not None` check; that
+  exemption is removed and the smoke test now asserts non-None across all
+  three new families.
+
+## Test results after B1 / B2 closure
+
+- Default run (no env vars):
+  ```
+  pytest tests/test_mlx_*.py tests/test_tool_call_parser.py tests/test_native_context_length.py
+  → 288 passed, 3 skipped, 0 xfailed
+  ```
+  (2 new passing rows vs chunk-H-2 tip: Ministral tool-template row flipped
+  xfail → pass, plus two new unit tests for the `text_config` fallback in
+  `test_mlx_backend_detection.py`. Net count: 285 → 288 passed; 1 → 0 xfail.)

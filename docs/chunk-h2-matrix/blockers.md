@@ -6,6 +6,8 @@ things that didn't are tracked here.
 
 ## B1. Ministral-3 template rejects `content=None` on assistant-with-tool_calls
 
+**Resolved in `bf2d4bd9` + `9deafdd4`.**
+
 **Family.** `mlx-community/Ministral-3-3B-Instruct-2512-4bit`.
 
 **Symptom.** `tokenizer.apply_chat_template(...)` raises
@@ -20,34 +22,64 @@ branch before checking `tool_calls`. Jinja's `length` filter surfaces
 `len(None)` which explodes. The template expects `content=""` (empty
 string) for the tool-call-only case.
 
-**Why we didn't fix this in H-2.** The extractor is intentionally
-shape-preserving: `content=None` means "the model emitted no text
-tokens", which is distinct from `content=""` ("the model emitted an
-explicit empty string"). Coercing None → "" at the extractor level
-would ripple into the Chunks F/G code paths that already do the right
-thing for Qwen/Bonsai/Gemma/Hermes. The correct fix is a per-template
-coercion hook (something like "if the template is known to choke on
-None, normalise to ''") or an extractor-level flag. That belongs in a
-future chunk — Chunk H-2 is coverage expansion, not behaviour change.
+**Fix landed.** `_extract_content_parts` now coerces `content=None`
+to `content=""` when the assistant message has `tool_calls` populated
+AND we're taking the native-iteration branch (template iterates
+`message.tool_calls` directly). Templates that iterate `tool_calls`
+don't care whether content is `""` or `None` — they render the tool
+call off the list and ignore content for that turn — so the coercion
+is purely defensive. The synthesis branch (templates that don't
+iterate `tool_calls`, like Hermes) always carries a non-empty
+`<tool_call>` JSON string in content and is unchanged.
 
-**Current status.** The H2-1 parametrised row for Ministral is marked
-`pytest.mark.xfail(strict=False, raises=(TypeError, AssertionError))`
-with an explicit reason pointer back to this doc.
-
-**What would close this.** A small change to
-`_extract_content_parts` that looks up `tokenizer.chat_template` (or
-accepts an explicit coercion flag) and, when the template matches a
-known-None-hostile family, emits `content=""` instead of `content=None`
-on assistant turns that have tool_calls. Alternatively: detect the
-TypeError pattern and retry. Either is ~30 lines + one new test. Out of
-scope here.
+A secondary issue emerged during verification: Ministral's template
+also enforces strict user/assistant alternation over content-bearing
+turns (tool results and assistant-only-tool-calls are exempt from the
+count), and the existing 4-turn fixture (`user → assistant-tc → tool →
+user`) tripped that alternation check independently of content-None.
+The shared `_build_tool_call_history` fixture is now 3-turn (drops
+the trailing `user="Thanks!"`), which represents the canonical OpenAI
+tool-call round-trip shape — the next generation would produce the
+final assistant response — and renders identically across every
+other family (Qwen3.5-4B/35B, Gemma-4, Bonsai, Hermes-3, Llama-3.2).
 
 **Downstream impact.** H2-2 (plain chat smoke) on Ministral is
 unaffected — the smoke test doesn't send a `tool_calls`-shaped
 assistant turn. The model loads, chats, and unloads cleanly; the only
 failure mode is the specific tool-template round-trip.
 
-## B2. `@pytest.mark.slow` not yet a convention in this suite
+## B2. `context_length` detection doesn't descend into `text_config`
+
+**Resolved in `2946a07e`.**
+
+**Family.** `mlx-community/Ministral-3-3B-Instruct-2512-4bit`
+(and any future VLM-architectured model loaded via the text path).
+
+**Symptom.** `MlxLmBackend.context_length` returned `None` for
+Ministral-3 even though the model loaded and generated cleanly.
+
+**Root cause.** Ministral-3's `config.json` is shaped like a VLM —
+top-level architecture is `Mistral3ForConditionalGeneration` with
+vision / image-processor fields at the top level and
+`max_position_embeddings`, `hidden_size`, etc. nested under a
+`text_config` dict. Our config reader looked only at the top-level
+key. `mlx_lm` consumes the nested config internally so generation
+worked, but the Studio-level metadata surface was lossy.
+
+**Fix landed.** Both config reader call sites —
+`_read_mlx_max_position_embeddings` in `utils/models/model_config.py`
+and the inline read in `core/inference/mlx_lm.py` — now fall back to
+`config["text_config"]["max_position_embeddings"]` when the top-level
+key is absent or None. Ministral-3 now surfaces
+`context_length=262144` (its actual native context).
+
+**Downstream impact.** The H2-2 smoke test previously exempted
+Ministral from the `context_length is not None` check with a pointer
+back to this doc; that exemption is removed. `mlx_vlm` had a similar
+fallback for Qwen3.5-VL since Chunk D, so the VLM path was already
+covered — this fix closes the gap on the text-path side.
+
+## B3. `@pytest.mark.slow` not yet a convention in this suite
 
 **Observation.** `pyproject.toml` doesn't register a `slow` mark, and
 no other MLX test gates behind one today. The MoE / GLM-VLM tests
