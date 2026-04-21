@@ -70,3 +70,66 @@ def test_load_progress_on_unloaded():
     p = b.load_progress()
     assert p["phase"] is None
     assert p["fraction"] == 0.0
+
+
+def test_transcribe_with_whisper_raises_when_package_missing(monkeypatch):
+    """E9: whisper transcription surfaces a clear error when mlx-whisper
+    isn't installed. The route handler translates this to HTTP 503.
+    """
+    import sys
+
+    # Force the lazy import inside the method to fail.
+    monkeypatch.setitem(sys.modules, "mlx_whisper", None)
+    b = MlxAudioBackend()
+    with pytest.raises(RuntimeError, match = "mlx-whisper is not installed"):
+        b.transcribe_with_whisper(b"RIFF" + b"\x00" * 100)
+
+
+def test_transcribe_with_whisper_dispatches_to_mlx_whisper(monkeypatch, tmp_path):
+    """E9: backend method writes bytes to a tempfile and forwards to
+    mlx_whisper.transcribe, returning the 'text' field. No backend
+    state (model/processor) is needed.
+    """
+    import sys
+    import types
+
+    captured: dict = {}
+
+    def fake_transcribe(audio, *, path_or_hf_repo, **_kwargs):
+        captured["audio_path"] = audio
+        captured["repo"] = path_or_hf_repo
+        return {"text": "  hello world  ", "segments": [], "language": "en"}
+
+    fake_module = types.ModuleType("mlx_whisper")
+    fake_module.transcribe = fake_transcribe  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_module)
+
+    b = MlxAudioBackend()
+    # Default model-hint resolution uses MLX_WHISPER_MODEL env var then
+    # falls back to mlx-community/whisper-tiny.
+    monkeypatch.delenv("MLX_WHISPER_MODEL", raising = False)
+    text = b.transcribe_with_whisper(b"RIFF\x00\x00\x00\x24WAVEfmt ")
+    assert text == "hello world"  # stripped
+    assert captured["repo"] == "mlx-community/whisper-tiny"
+
+    # Explicit model_hint overrides the default.
+    text = b.transcribe_with_whisper(b"ID3\x03", model_hint = "mlx-community/whisper-small")
+    assert captured["repo"] == "mlx-community/whisper-small"
+
+    # MLX_WHISPER_MODEL env var takes precedence over the fallback.
+    monkeypatch.setenv("MLX_WHISPER_MODEL", "mlx-community/whisper-large-v3")
+    b.transcribe_with_whisper(b"RIFF\x00")
+    assert captured["repo"] == "mlx-community/whisper-large-v3"
+
+
+def test_transcribe_with_whisper_handles_non_dict_result(monkeypatch):
+    """E9: degraded return (e.g. future API change) surfaces as empty string."""
+    import sys
+    import types
+
+    fake_module = types.ModuleType("mlx_whisper")
+    fake_module.transcribe = lambda *a, **k: "legacy-string-return"  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_module)
+
+    b = MlxAudioBackend()
+    assert b.transcribe_with_whisper(b"RIFF\x00") == ""

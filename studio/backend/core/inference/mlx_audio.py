@@ -469,6 +469,90 @@ class MlxAudioBackend:
             "fraction": 1.0 if self._load_phase == "loaded" else 0.0,
         }
 
+    # ── Chunk E (E9): mlx-whisper as a parallel ASR path ─────────
+    #
+    # LFM2.5-Audio's self-transcription is conversational rather than
+    # verbatim (see PROBE_RESULTS.md). For real ASR, route to
+    # ``mlx-whisper`` — a dedicated Whisper port on MLX. This sits
+    # alongside the LFM2.5 ASR path; it doesn't replace it. Callers
+    # opt in via the ``X-ASR-Backend: whisper`` header or ``backend``
+    # body field on /v1/audio/transcriptions.
+    #
+    # The whisper model is loaded lazily on first call and kept
+    # process-lifetime (mlx-whisper doesn't expose a lifecycle
+    # surface). It does not affect LFM2.5-Audio memory residency.
+    def transcribe_with_whisper(
+        self,
+        audio_bytes: bytes,
+        *,
+        model_hint: str = "auto",
+    ) -> str:
+        """Transcribe *audio_bytes* using ``mlx-whisper`` — a dedicated
+        verbatim-ASR path independent of the loaded LFM2.5-Audio model.
+
+        Args:
+            audio_bytes: Raw WAV/MP3 bytes. Decoded via soundfile.
+            model_hint: Either ``"auto"`` (honour ``MLX_WHISPER_MODEL``
+                env var, default to ``mlx-community/whisper-tiny``) or
+                an explicit HF repo id / local path passed to
+                ``mlx_whisper.transcribe(path_or_hf_repo=...)``.
+
+        Returns:
+            Transcribed text. Empty string on failure to decode.
+
+        Raises:
+            RuntimeError: if ``mlx-whisper`` is not installed or the
+                model cannot be loaded.
+        """
+        try:
+            import mlx_whisper  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                f"mlx-whisper is not installed: {e}. Install via "
+                f"`pip install mlx-whisper` (macOS / Apple Silicon only)."
+            ) from e
+
+        if model_hint == "auto":
+            import os as _os
+
+            model_repo = _os.environ.get(
+                "MLX_WHISPER_MODEL", "mlx-community/whisper-tiny"
+            )
+        else:
+            model_repo = model_hint
+
+        import tempfile
+        import os
+
+        # mlx_whisper.transcribe accepts path, ndarray, or mx.array. We
+        # already accept bytes on the API surface; write to a tempfile
+        # so whisper's own audio loader handles format sniffing
+        # (WAV/MP3/FLAC) — cheaper than re-decoding via soundfile.
+        with tempfile.NamedTemporaryFile(
+            suffix = ".audio", delete = False
+        ) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        try:
+            result = mlx_whisper.transcribe(
+                tmp_path,
+                path_or_hf_repo = model_repo,
+            )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        # ``mlx_whisper.transcribe`` returns a dict with keys
+        # ``"text"``, ``"segments"``, ``"language"``. We only need the
+        # full concatenated text.
+        if not isinstance(result, dict):
+            return ""
+        text = result.get("text", "")
+        return text.strip() if isinstance(text, str) else ""
+
 
 # ── WAV helpers ──────────────────────────────────────────────────
 def _float32_to_wav_bytes(samples, sample_rate: int) -> bytes:

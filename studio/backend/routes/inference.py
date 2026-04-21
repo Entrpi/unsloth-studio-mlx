@@ -1541,16 +1541,21 @@ async def openai_audio_transcriptions(
     language: Optional[str] = FastAPIForm(None),
     response_format: Optional[str] = FastAPIForm("json"),
     temperature: Optional[float] = FastAPIForm(None),
+    backend: Optional[str] = FastAPIForm(None),
     current_subject: str = Depends(get_current_subject),
 ):
     """OpenAI-compatible ASR endpoint. Multipart file upload.
 
     Dispatch order:
-    1. MLX audio backend (Phase 10 / Chunk D) when loaded and it
+    1. Whisper when the client explicitly requests it via ``backend=whisper``
+       (or the ``X-ASR-Backend: whisper`` header — see below). Routes through
+       ``mlx-whisper`` regardless of which (if any) MLX audio model is
+       currently loaded. Chunk E (E9).
+    2. MLX audio backend (Phase 10 / Chunk D) when loaded and it
        advertises ``has_audio_input``. Best-effort — LFM2.5-Audio is a
        voice assistant, not a dedicated ASR (see PROBE_RESULTS.md).
-    2. GGUF audio backend when loaded.
-    3. Unsloth Whisper / audio-input fallback.
+    3. GGUF audio backend when loaded.
+    4. Unsloth Whisper / audio-input fallback.
 
     Returns JSON ``{"text": "..."}`` by default.
     """
@@ -1559,6 +1564,24 @@ async def openai_audio_transcriptions(
         raise HTTPException(status_code = 400, detail = "No audio data in upload.")
 
     mlx_audio_backend = get_mlx_audio_backend()
+
+    # (1) Explicit Whisper opt-in — runs independently of which audio
+    #     model is loaded. The MlxAudioBackend singleton hosts the
+    #     method but it lazy-imports mlx_whisper and does not read
+    #     self._model / self._processor state.
+    if backend and backend.lower() == "whisper":
+        loop = asyncio.get_event_loop()
+        try:
+            text = await loop.run_in_executor(
+                None,
+                lambda: mlx_audio_backend.transcribe_with_whisper(audio_bytes),
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code = 503, detail = str(e))
+        except Exception as e:
+            logger.error(f"mlx-whisper transcribe error: {e}", exc_info = True)
+            raise HTTPException(status_code = 500, detail = str(e))
+        return JSONResponse(content = {"text": text})
 
     if mlx_audio_backend.is_loaded and mlx_audio_backend.has_audio_input:
         loop = asyncio.get_event_loop()

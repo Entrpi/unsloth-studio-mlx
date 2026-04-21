@@ -34,3 +34,8 @@ mlx-vlm>=0.4.4,<0.5 ; sys_platform == "darwin"
 # install_requires but works fine with the >=0.31.2 we pin above — pip
 # emits a dependency-resolver warning that is not load-bearing.
 mlx-audio>=0.4.2,<0.5 ; sys_platform == "darwin"
+# Chunk E (E9): mlx-whisper as a dedicated verbatim-ASR path. LFM2.5-Audio
+# transcribes conversationally rather than verbatim, so Whisper is opt-in via
+# `backend=whisper` on /v1/audio/transcriptions. Lazy-imported in
+# MlxAudioBackend.transcribe_with_whisper so its absence is non-fatal.
+mlx-whisper>=0.4.3,<0.5 ; sys_platform == "darwin"
