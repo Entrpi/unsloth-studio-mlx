@@ -66,6 +66,7 @@ def test_backend_property_defaults() -> None:
     assert b.cache_type_kv is None
     assert b.speculative_type is None
     assert b.detect_audio_type() is None
+    # Phase 3: load_progress is None when no load is in flight.
     assert b.load_progress() is None
 
 
@@ -1109,6 +1110,274 @@ def test_generate_omits_draft_model_when_none() -> None:
             )
     assert "draft_model" not in captured
     assert "num_draft_tokens" not in captured
+
+
+# ── Phase 3: remote HF pulls, load_progress, hf_variant ─────────────
+
+
+def test_extract_mlx_variant_common_suffixes() -> None:
+    from core.inference.mlx_lm import _extract_mlx_variant
+
+    assert _extract_mlx_variant("mlx-community/Qwen2.5-7B-Instruct-4bit") == "4bit"
+    assert _extract_mlx_variant("prism-ml/Ternary-Bonsai-8B-mlx-2bit") == "mlx-2bit"
+    assert _extract_mlx_variant("foo/bar-8bit") == "8bit"
+    assert _extract_mlx_variant("foo/bar-FP16") == "fp16"
+    # Case-insensitive.
+    assert _extract_mlx_variant("foo/bar-4BIT") == "4bit"
+
+
+def test_extract_mlx_variant_no_match() -> None:
+    from core.inference.mlx_lm import _extract_mlx_variant
+
+    assert _extract_mlx_variant("unsloth/foo-bar") is None
+    assert _extract_mlx_variant("") is None
+    assert _extract_mlx_variant("plain-name") is None
+
+
+def test_load_progress_downloading_phase_shape() -> None:
+    b = _fresh_backend()
+    b._load_phase = "downloading"
+    b._download_bytes_loaded = 1024
+    b._download_bytes_total = 4096
+    p = b.load_progress()
+    assert p is not None
+    assert p["phase"] == "downloading"
+    assert p["bytes_loaded"] == 1024
+    assert p["bytes_total"] == 4096
+    assert p["fraction"] == pytest.approx(0.25, abs = 1e-4)
+
+
+def test_load_progress_loading_phase_shape() -> None:
+    """Loading phase samples RSS; we don't assert the exact byte count
+    (depends on the test process) but the shape must be right and
+    fraction must be 0..1."""
+    b = _fresh_backend()
+    b._load_phase = "loading"
+    b._weights_bytes_total = 8 * 1024**3
+    p = b.load_progress()
+    assert p is not None
+    assert p["phase"] == "loading"
+    assert p["bytes_total"] == 8 * 1024**3
+    assert 0.0 <= p["fraction"] <= 1.0
+
+
+def test_load_progress_loaded_terminal() -> None:
+    b = _fresh_backend()
+    b._load_phase = "loaded"
+    b._download_bytes_total = 1000
+    b._weights_bytes_total = 2000
+    p = b.load_progress()
+    assert p is not None
+    assert p["phase"] == "loaded"
+    # Prefer weights_bytes_total when both are known.
+    assert p["bytes_total"] == 2000
+    assert p["fraction"] == 1.0
+
+
+def test_load_progress_includes_warnings() -> None:
+    b = _fresh_backend()
+    b._load_phase = "loading"
+    b._load_warnings = ["low RAM"]
+    b._weights_bytes_total = 1024
+    p = b.load_progress()
+    assert p is not None
+    assert p.get("warnings") == ["low RAM"]
+
+
+def test_hf_variant_parsed_from_model_identifier_after_load() -> None:
+    """After a successful synthetic load, hf_variant is populated from
+    the identifier tail."""
+    import importlib.util
+    import platform as _platform
+
+    if not (
+        _platform.system() == "Darwin"
+        and _platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_lm") is not None
+    ):
+        pytest.skip("mlx_lm not available on this platform")
+
+    import json as _json
+    import tempfile
+    from pathlib import Path as _Path
+
+    from unittest import mock
+
+    base = _Path(tempfile.mkdtemp(prefix = "mlx-base-"))
+    (base / "config.json").write_text(
+        _json.dumps({"quantization": {"bits": 4, "group_size": 64}})
+    )
+
+    class _FakeTokenizer:
+        chat_template = None
+
+        def apply_chat_template(self, *a, **kw):
+            return "p"
+
+    def _fake_mlx_load(path, *args, **kwargs):
+        return object(), _FakeTokenizer()
+
+    b = _fresh_backend()
+    with mock.patch("mlx_lm.load", _fake_mlx_load):
+        ok = b.load_model(
+            local_path = str(base),
+            model_identifier = "mlx-community/Fake-Model-4bit",
+        )
+    assert ok is True
+    assert b.hf_variant == "4bit"
+    b.unload_model()
+    assert b.hf_variant is None
+
+
+def test_download_mlx_uses_allow_patterns() -> None:
+    """Verify ``_download_mlx`` forwards the expected allow_patterns to
+    snapshot_download and that the progress tqdm subclass updates
+    counters."""
+    from unittest import mock
+
+    captured: Dict[str, Any] = {}
+
+    def _fake_snapshot(**kwargs):
+        captured["kwargs"] = kwargs
+        # Simulate the tqdm class being instantiated with a 10-byte
+        # total, then updated once with n=5 — exercises both counters.
+        tqdm_class = kwargs.get("tqdm_class")
+        if tqdm_class is not None:
+            bar = tqdm_class(total = 10)
+            bar.update(5)
+        return "/tmp/fake-downloaded-dir"
+
+    b = _fresh_backend()
+    with mock.patch("huggingface_hub.snapshot_download", _fake_snapshot):
+        out = b._download_mlx("mlx-community/Test-Repo", hf_token = None)
+    assert out == "/tmp/fake-downloaded-dir"
+    kw = captured["kwargs"]
+    assert kw["repo_id"] == "mlx-community/Test-Repo"
+    patterns = kw["allow_patterns"]
+    assert "*.safetensors" in patterns
+    assert "config.json" in patterns
+    assert "*.jinja" in patterns
+    # Counters ticked: total==10 from tqdm init, loaded==5 from update.
+    assert b._download_bytes_total >= 10
+    assert b._download_bytes_loaded >= 5
+
+
+def test_ram_warning_fires_when_total_below_1_5x(tmp_path) -> None:
+    """When total RAM < 1.5x model size, a warning must be appended to
+    ``_load_warnings`` so ``load_progress`` can surface it."""
+    import importlib.util
+    import json as _json
+    import platform as _platform
+
+    if not (
+        _platform.system() == "Darwin"
+        and _platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_lm") is not None
+    ):
+        pytest.skip("mlx_lm not available on this platform")
+
+    from unittest import mock
+
+    # Synthesize a base MLX dir with a fake safetensors to drive the
+    # weight-size sum.
+    (tmp_path / "config.json").write_text(
+        _json.dumps({"quantization": {"bits": 2, "group_size": 128}})
+    )
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"\x00" * 1024)
+
+    class _FakeTokenizer:
+        chat_template = None
+
+        def apply_chat_template(self, *a, **kw):
+            return "p"
+
+    def _fake_mlx_load(path, *args, **kwargs):
+        return object(), _FakeTokenizer()
+
+    # Patch the safetensors sum helper AND psutil so the ratio check
+    # triggers deterministically (100 GB "model" on an 8 GB "box").
+    from core.inference.mlx_lm import MlxLmBackend
+
+    class _VM:
+        total = 8 * 1024**3
+        available = 4 * 1024**3
+
+    b = _fresh_backend()
+    with mock.patch("mlx_lm.load", _fake_mlx_load):
+        with mock.patch.object(
+            MlxLmBackend,
+            "_sum_safetensors_bytes",
+            staticmethod(lambda _p: 100 * 1024**3),
+        ):
+            with mock.patch("psutil.virtual_memory", return_value = _VM()):
+                ok = b.load_model(
+                    local_path = str(tmp_path),
+                    model_identifier = "fake",
+                )
+    assert ok is True
+    # Warning recorded AND visible in load_progress.
+    assert any("RAM" in w for w in b._load_warnings)
+    p = b.load_progress()
+    assert p is not None
+    assert p.get("warnings"), "expected warnings in load_progress"
+
+
+def test_remote_mlx_download_triggers_when_path_is_not_dir() -> None:
+    """When ``local_path`` looks like an HF repo id (contains '/') and
+    doesn't exist on disk, ``load_model`` must call ``_download_mlx``
+    before attempting the local ``mlx_lm.load``."""
+    import importlib.util
+    import platform as _platform
+
+    if not (
+        _platform.system() == "Darwin"
+        and _platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_lm") is not None
+    ):
+        pytest.skip("mlx_lm not available on this platform")
+
+    import json as _json
+    import tempfile
+    from pathlib import Path as _Path
+
+    from unittest import mock
+
+    # Pre-stage a "downloaded" directory that _download_mlx can return.
+    pseudo = _Path(tempfile.mkdtemp(prefix = "mlx-pseudo-"))
+    (pseudo / "config.json").write_text(
+        _json.dumps({"quantization": {"bits": 4, "group_size": 64}})
+    )
+
+    class _FakeTokenizer:
+        chat_template = None
+
+        def apply_chat_template(self, *a, **kw):
+            return "p"
+
+    def _fake_mlx_load(path, *args, **kwargs):
+        return object(), _FakeTokenizer()
+
+    download_called = {"n": 0, "arg": None}
+
+    def _fake_download(self, repo, hf_token = None):
+        download_called["n"] += 1
+        download_called["arg"] = repo
+        return str(pseudo)
+
+    from core.inference.mlx_lm import MlxLmBackend
+
+    b = _fresh_backend()
+    with mock.patch("mlx_lm.load", _fake_mlx_load):
+        with mock.patch.object(MlxLmBackend, "_download_mlx", _fake_download):
+            ok = b.load_model(
+                local_path = "mlx-community/Fake-Model-4bit",
+                model_identifier = "mlx-community/Fake-Model-4bit",
+            )
+    assert ok is True
+    assert download_called["n"] == 1
+    assert download_called["arg"] == "mlx-community/Fake-Model-4bit"
+    b.unload_model()
 
 
 def test_enable_thinking_omitted_when_none() -> None:

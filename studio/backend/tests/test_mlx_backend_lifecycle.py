@@ -72,10 +72,19 @@ def test_load_unload_roundtrip():
     assert backend.chat_template is not None
     assert len(backend.chat_template) > 0
     assert backend.cache_type_kv is None
+    # Phase 3: hf_variant derived from the directory name suffix.
+    assert backend.hf_variant == "mlx-2bit"
+    # load_progress reports "loaded" phase after a successful load.
+    prog = backend.load_progress()
+    assert prog is not None
+    assert prog.get("phase") == "loaded"
 
     assert backend.unload_model() is True
     assert backend.is_loaded is False
     assert backend.model_identifier is None
+    # Phase 3: after unload, load_progress returns None ("no load in flight").
+    assert backend.load_progress() is None
+    assert backend.hf_variant is None
 
 
 @pytest.mark.skipif(not MLX_LM_AVAILABLE, reason = "mlx_lm or model not available")

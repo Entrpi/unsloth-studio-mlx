@@ -35,6 +35,7 @@ from __future__ import annotations
 import gc
 import json
 import platform
+import re
 import threading
 import time
 from pathlib import Path
@@ -46,6 +47,29 @@ logger = get_logger(__name__)
 
 # Sentinel for a metadata event at the end of the generator stream.
 MetadataEvent = Dict[str, Any]
+
+
+# Phase 3 — hf_variant extraction. MLX repos commonly ship with a quant
+# suffix: ``-4bit`` / ``-2bit`` / ``-mlx-2bit`` / ``-8bit``. This regex
+# matches at the end of the repo / dir name. Mirrors the shape of
+# ``llama_cpp.py:_extract_quant_label`` but tuned for MLX naming.
+_MLX_VARIANT_RE = re.compile(r"-(\d+bit|mlx-\d+bit|fp16|bf16)$", re.IGNORECASE)
+
+
+def _extract_mlx_variant(name: str) -> Optional[str]:
+    """Return the MLX quant suffix of a repo/dir name, or None.
+
+    Examples:
+
+    - ``"mlx-community/Qwen2.5-7B-Instruct-4bit"`` → ``"4bit"``
+    - ``"prism-ml/Ternary-Bonsai-8B-mlx-2bit"`` → ``"mlx-2bit"``
+    - ``"unsloth/foo-bar"`` → ``None``
+    """
+    if not name:
+        return None
+    tail = name.split("/")[-1]
+    m = _MLX_VARIANT_RE.search(tail)
+    return m.group(1).lower() if m else None
 
 
 # ── Phase 8 — Quantized KV cache ─────────────────────────────────────
@@ -255,6 +279,22 @@ class MlxLmBackend:
         self._supports_reasoning: bool = False
         self._reasoning_always_on: bool = False
         self._reasoning_default: bool = True
+        # Phase 3 — load progress tracking. The GGUF backend drives its
+        # load-progress endpoint off /proc VmRSS; MLX is in-process so
+        # we instead track two distinct phases:
+        #   downloading → bytes_loaded / bytes_total from a custom tqdm
+        #                 class wired through snapshot_download
+        #   loading     → VmRSS / weights_bytes_total from psutil
+        #   loaded      → final phase (counters frozen at final values)
+        self._load_phase: Optional[str] = None
+        self._download_bytes_loaded: int = 0
+        self._download_bytes_total: int = 0
+        self._weights_bytes_total: int = 0
+        self._load_warnings: List[str] = []
+        # Phase 3 — hf_variant surface. Derived from the tail of the
+        # repo/path name at load time. Mirrors the GGUF surface which
+        # exposes the quant label on the backend so the UI can tag it.
+        self._hf_variant: Optional[str] = None
         # Phase 8 — quantized KV cache settings. Set by ``load_model`` from
         # the ``cache_type_kv`` request field (mirrors GGUF behaviour where
         # KV quantization is a load-time decision because ``stream_generate``
@@ -298,7 +338,10 @@ class MlxLmBackend:
 
     @property
     def hf_variant(self) -> Optional[str]:
-        return None
+        """MLX quant suffix parsed at load time (e.g. ``"4bit"``,
+        ``"mlx-2bit"``). ``None`` when the dir/repo name has no
+        recognizable quant tail."""
+        return self._hf_variant
 
     @property
     def context_length(self) -> Optional[int]:
@@ -377,8 +420,61 @@ class MlxLmBackend:
         return None
 
     def load_progress(self) -> Optional[dict]:
-        """MLX load is fast (<2s for 8B 2-bit); no progress bar needed."""
-        return None
+        """Return live MLX load progress (remote HF + local load), or
+        ``None`` when no load is in flight.
+
+        Shape mirrors the GGUF progress endpoint
+        (``llama_cpp.py:load_progress``):
+
+        - ``phase``: ``"downloading" | "loading" | "loaded"``
+        - ``bytes_loaded`` / ``bytes_total`` / ``fraction``: clamp to 0..1
+
+        During ``downloading`` the counters come from a snapshot_download
+        tqdm subclass. During ``loading`` we sample ``psutil.rss`` against
+        the sum of local ``*.safetensors`` sizes — best-effort (mlx_lm.load
+        is a black box) but gives the UI a non-frozen bar.
+
+        The optional ``warnings`` list carries RAM-pressure notes the
+        load_model path generated (e.g. "model size exceeds 1.5x
+        available RAM — expect swap").
+        """
+        phase = self._load_phase
+        if phase is None:
+            return None
+
+        if phase == "downloading":
+            bl = int(self._download_bytes_loaded)
+            bt = int(self._download_bytes_total)
+        elif phase == "loading":
+            # Best-effort RSS sampling. If psutil isn't importable, we
+            # return bytes_loaded=0 and let the frontend show a spinner.
+            bl = 0
+            try:
+                import os
+
+                import psutil  # type: ignore
+
+                bl = int(psutil.Process(os.getpid()).memory_info().rss)
+            except Exception:
+                bl = 0
+            bt = int(self._weights_bytes_total)
+        else:  # "loaded"
+            bl = int(self._weights_bytes_total or self._download_bytes_total)
+            bt = int(self._weights_bytes_total or self._download_bytes_total)
+
+        fraction = 0.0
+        if bt > 0:
+            fraction = max(0.0, min(1.0, bl / bt))
+
+        out: Dict[str, Any] = {
+            "phase": phase,
+            "bytes_loaded": bl,
+            "bytes_total": bt,
+            "fraction": round(fraction, 4),
+        }
+        if self._load_warnings:
+            out["warnings"] = list(self._load_warnings)
+        return out
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
@@ -386,6 +482,128 @@ class MlxLmBackend:
     def _platform_ok() -> bool:
         """True iff the host can run MLX (Apple Silicon macOS)."""
         return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+    @staticmethod
+    def _sum_safetensors_bytes(dir_path: Path) -> int:
+        """Best-effort sum of ``*.safetensors`` file sizes in a dir.
+
+        Used to drive both:
+
+        - The ``loading`` phase progress heuristic (sample RSS against
+          this total).
+        - The RAM-warning check (compare to ``psutil.total``).
+
+        Returns 0 on any OSError to keep the caller's code path simple.
+        """
+        total = 0
+        try:
+            for p in dir_path.iterdir():
+                if p.is_file() and p.suffix == ".safetensors":
+                    try:
+                        total += p.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            return 0
+        return total
+
+    def _download_mlx(
+        self,
+        repo: str,
+        hf_token: Optional[str] = None,
+    ) -> str:
+        """Download a remote MLX repo via ``huggingface_hub.snapshot_download``
+        while feeding per-shard bytes into the backend's progress counters.
+
+        We restrict ``allow_patterns`` to the files MLX actually needs —
+        the weights shards (``*.safetensors``), ``config.json``,
+        tokenizer artifacts, and any ``*.jinja`` chat-template file.
+        This avoids pulling unrelated repo contents (READMEs, images,
+        eval tensors) and keeps the progress counters accurate.
+
+        Progress is wired through a custom ``tqdm_class`` that updates
+        ``self._download_bytes_loaded`` and ``self._download_bytes_total``
+        as huggingface_hub streams each shard. The tqdm subclass is
+        strictly additive; if the upstream tqdm API changes, the
+        counters just stop updating — the download still succeeds.
+
+        Args:
+            repo: HF repo id (e.g. ``mlx-community/Qwen2.5-7B-4bit``).
+            hf_token: Optional HF token for gated repos.
+
+        Returns:
+            Absolute path to the downloaded snapshot directory.
+        """
+        try:
+            from huggingface_hub import snapshot_download  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                f"huggingface_hub is required for remote MLX downloads: {e}"
+            ) from e
+
+        # Reset counters.
+        self._download_bytes_loaded = 0
+        self._download_bytes_total = 0
+
+        backend = self
+
+        # Custom tqdm subclass that writes into the backend counters. We
+        # fall back to a trivial class if tqdm is unavailable; the
+        # download still works, just with frozen counters.
+        try:
+            from tqdm.auto import tqdm as _base_tqdm  # type: ignore
+        except ImportError:
+            _base_tqdm = None
+
+        if _base_tqdm is not None:
+
+            class _HFProgress(_base_tqdm):  # type: ignore[misc]
+                """tqdm subclass that mirrors bytes into backend counters.
+
+                huggingface_hub instantiates one tqdm per shard. Because
+                of that we track a backend-wide total across bars:
+                ``total`` accumulates into ``_download_bytes_total`` on
+                bar init, and ``update`` bumps ``_download_bytes_loaded``
+                by the per-call ``n``. The result is a rolling count
+                across the full snapshot download.
+                """
+
+                def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401
+                    super().__init__(*args, **kwargs)
+                    total = getattr(self, "total", None)
+                    if isinstance(total, (int, float)) and total > 0:
+                        backend._download_bytes_total += int(total)
+
+                def update(self, n: int = 1) -> Any:  # noqa: D401
+                    backend._download_bytes_loaded += int(n)
+                    return super().update(n)
+
+            tqdm_class: Any = _HFProgress
+        else:
+            tqdm_class = None
+
+        logger.info(f"MLX: downloading {repo} via snapshot_download")
+        local_dir = snapshot_download(
+            repo_id = repo,
+            token = hf_token,
+            allow_patterns = [
+                "*.safetensors",
+                "*.safetensors.index.json",
+                "config.json",
+                "tokenizer*",
+                "special_tokens_map.json",
+                "*.json",
+                "*.jinja",
+                "chat_template*",
+                "generation_config.json",
+            ],
+            tqdm_class = tqdm_class,
+        )
+        logger.info(
+            f"MLX: download complete: {repo} → {local_dir} "
+            f"({self._download_bytes_loaded / 1e9:.2f} GB)"
+        )
+        return local_dir
 
     @staticmethod
     def _draft_mem_preflight(draft_dir: Path) -> None:
@@ -571,16 +789,78 @@ class MlxLmBackend:
                 )
                 self._unload_locked()
 
+            # Phase 3 — initialize load progress state. Reset from any
+            # prior load so a stale terminal "loaded" state doesn't leak.
+            self._load_phase = None
+            self._download_bytes_loaded = 0
+            self._download_bytes_total = 0
+            self._weights_bytes_total = 0
+            self._load_warnings = []
+
+            # Phase 3 — remote HF repo path. If the local dir doesn't
+            # exist but the identifier looks like an HF repo id (has a
+            # slash, not a filesystem path), download it. We don't
+            # second-guess the caller's identifier: if they said "load
+            # this remote", we try. Detection of "is this actually an
+            # MLX repo" happens in ModelConfig.from_identifier before
+            # we get here.
             path = Path(local_path)
             if not path.is_dir():
-                raise RuntimeError(
-                    f"MLX model path is not a directory: {local_path}"
+                looks_like_repo = (
+                    "/" in local_path
+                    and not local_path.startswith("/")
+                    and not local_path.startswith(".")
                 )
+                if looks_like_repo:
+                    self._load_phase = "downloading"
+                    try:
+                        downloaded = self._download_mlx(
+                            local_path, hf_token = hf_token
+                        )
+                        path = Path(downloaded)
+                    except Exception as e:
+                        self._load_phase = None
+                        logger.error(
+                            f"MLX snapshot_download failed for {local_path}: {e}"
+                        )
+                        return False
+                if not path.is_dir():
+                    self._load_phase = None
+                    raise RuntimeError(
+                        f"MLX model path is not a directory: {local_path}"
+                    )
+
+            # Phase 3 — RAM-pressure warning. Compare weight-shard bytes
+            # to total unified memory; if the ratio falls below 1.5x we
+            # expect macOS to swap.
+            self._weights_bytes_total = self._sum_safetensors_bytes(path)
+            try:
+                import psutil as _ps  # type: ignore
+
+                vm = _ps.virtual_memory()
+                if (
+                    self._weights_bytes_total > 0
+                    and vm.total > 0
+                    and vm.total < 1.5 * self._weights_bytes_total
+                ):
+                    warn = (
+                        f"MLX model size ({self._weights_bytes_total / 1e9:.1f} GB) "
+                        f"is close to total RAM ({vm.total / 1e9:.1f} GB); "
+                        f"expect swap / slow inference."
+                    )
+                    logger.warning(warn)
+                    self._load_warnings.append(warn)
+            except ImportError:
+                pass
+
+            # Now switch to loading phase.
+            self._load_phase = "loading"
 
             # Lazy import — keeps the module importable on non-Darwin CI.
             try:
                 from mlx_lm import load as _mlx_load  # type: ignore
             except ImportError as e:
+                self._load_phase = None
                 raise RuntimeError(
                     f"mlx_lm is not installed in this Python env: {e}"
                 ) from e
@@ -603,6 +883,7 @@ class MlxLmBackend:
             try:
                 model, tokenizer = _mlx_load(str(path), **load_kwargs)
             except Exception as e:
+                self._load_phase = None
                 logger.error(f"mlx_lm.load failed for {local_path}: {e}")
                 return False
             load_s = time.time() - t0
@@ -635,6 +916,7 @@ class MlxLmBackend:
             if draft_model_path:
                 draft_dir = Path(draft_model_path)
                 if not draft_dir.is_dir():
+                    self._load_phase = None
                     logger.error(
                         f"MLX draft model path is not a directory: "
                         f"{draft_model_path}"
@@ -643,6 +925,7 @@ class MlxLmBackend:
                 try:
                     self._draft_mem_preflight(draft_dir)
                 except RuntimeError as e:
+                    self._load_phase = None
                     logger.error(f"MLX draft memory preflight failed: {e}")
                     return False
                 try:
@@ -653,6 +936,7 @@ class MlxLmBackend:
                         f"from {draft_dir}"
                     )
                 except Exception as e:
+                    self._load_phase = None
                     logger.error(f"mlx_lm.load failed for draft {draft_dir}: {e}")
                     return False
                 resolved_draft = str(draft_dir)
@@ -687,6 +971,15 @@ class MlxLmBackend:
             self._draft_model = draft_model
             self._draft_tokenizer = draft_tokenizer
             self._draft_path = resolved_draft
+            # Phase 3 — derive hf_variant from the repo/dir name (tail
+            # after the last /). Prefer the user-supplied identifier
+            # over the local cache path so "-mlx-2bit" from a repo id
+            # isn't lost to a hashed cache dir.
+            self._hf_variant = _extract_mlx_variant(
+                model_identifier
+            ) or _extract_mlx_variant(str(path))
+            # Phase 3 — load is complete; freeze progress at "loaded".
+            self._load_phase = "loaded"
 
             # Phase 8: map the UI KV-dtype label to mlx-lm's
             # (kv_bits, kv_group_size) pair and stash for the generate
@@ -738,6 +1031,14 @@ class MlxLmBackend:
         self._draft_model = None
         self._draft_tokenizer = None
         self._draft_path = None
+        # Phase 3 — clear load progress + hf_variant so a subsequent
+        # load_progress() returns None (== "no load in flight").
+        self._load_phase = None
+        self._download_bytes_loaded = 0
+        self._download_bytes_total = 0
+        self._weights_bytes_total = 0
+        self._load_warnings = []
+        self._hf_variant = None
         # Phase 4: clear reasoning state. A subsequent load_model of a
         # different model must not inherit the previous model's flags.
         self._chat_template = None
