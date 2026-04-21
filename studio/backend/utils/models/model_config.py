@@ -2196,6 +2196,66 @@ class ModelConfig:
                     gguf_variant = variant,
                 )
 
+            # Phase 3 — remote MLX detection. Probe config.json from the
+            # repo; if it has the MLX quantization block, return an
+            # MLX-flagged ModelConfig. We don't download anything here —
+            # the actual snapshot_download runs inside the MLX backend's
+            # load_model. This branch fires BEFORE the Unsloth /
+            # transformers fallback so MLX repos don't get misrouted.
+            try:
+                from huggingface_hub import hf_hub_download
+
+                cfg_path = hf_hub_download(
+                    identifier,
+                    "config.json",
+                    token = hf_token,
+                )
+                with open(cfg_path, "r", encoding = "utf-8") as f:
+                    remote_cfg = json.load(f)
+                quant = (
+                    remote_cfg.get("quantization")
+                    if isinstance(remote_cfg, dict)
+                    else None
+                )
+                if (
+                    isinstance(quant, dict)
+                    and "bits" in quant
+                    and "group_size" in quant
+                ):
+                    native_ctx = remote_cfg.get("max_position_embeddings")
+                    if not isinstance(native_ctx, int) or native_ctx <= 0:
+                        native_ctx = None
+                    display_name = identifier.split("/")[-1]
+                    logger.info(
+                        f"Detected remote MLX repo '{identifier}' "
+                        f"(bits={quant.get('bits')}, "
+                        f"group_size={quant.get('group_size')}, "
+                        f"native_context_length={native_ctx})"
+                    )
+                    return cls(
+                        identifier = identifier,
+                        display_name = display_name,
+                        # For MLX remote repos we keep ``path=identifier``
+                        # so the backend can pass it to snapshot_download.
+                        # ``mlx_path`` is intentionally None until the
+                        # download completes inside MlxLmBackend.
+                        path = identifier,
+                        is_local = False,
+                        is_cached = False,
+                        is_vision = False,
+                        is_lora = False,
+                        is_mlx = True,
+                        mlx_path = None,
+                        native_context_length = native_ctx,
+                    )
+            except Exception as e:
+                # Any failure (network, gated repo without token, missing
+                # config.json) just falls through to the existing Unsloth
+                # / transformers path. MLX detection is opportunistic.
+                logger.debug(
+                    f"Remote MLX detection for '{identifier}' skipped: {e}"
+                )
+
         # Auto-detect LoRA for local paths (check adapter_config.json on disk)
         if not is_lora and is_local:
             detected_base = (

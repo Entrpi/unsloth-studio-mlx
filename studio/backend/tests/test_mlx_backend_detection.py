@@ -168,3 +168,88 @@ def test_detect_mlx_adapter_not_a_directory(tmp_path: Path) -> None:
     f = tmp_path / "notdir"
     f.write_text("not a dir")
     assert _detect_mlx_adapter(f) is False
+
+
+# ── Phase 3 — remote HF MLX detection ───────────────────────────────
+
+
+def test_remote_hf_mlx_detected_via_probed_config(tmp_path: Path) -> None:
+    """When the remote HF probe returns an MLX-shaped config.json, the
+    resulting ModelConfig must carry ``is_mlx=True`` / ``mlx_path=None``
+    (download deferred to the backend)."""
+    from unittest import mock
+
+    # Stage a fake config.json on disk that the patched hf_hub_download
+    # returns the path to. Mirrors the real HF cache shape.
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "quantization": {"bits": 4, "group_size": 64},
+                "max_position_embeddings": 32768,
+            }
+        )
+    )
+
+    def _fake_hf_hub_download(repo_id, filename, *args, **kwargs):
+        assert filename == "config.json"
+        return str(cfg)
+
+    # Also stub detect_gguf_model_remote so we don't touch the network
+    # in the GGUF branch.
+    with mock.patch(
+        "utils.models.model_config.detect_gguf_model_remote",
+        return_value = None,
+    ):
+        with mock.patch(
+            "huggingface_hub.hf_hub_download", _fake_hf_hub_download
+        ):
+            model_cfg = ModelConfig.from_identifier(
+                "mlx-community/Fake-Model-4bit"
+            )
+
+    assert model_cfg is not None
+    assert model_cfg.is_mlx is True
+    assert model_cfg.mlx_path is None  # download deferred
+    assert model_cfg.path == "mlx-community/Fake-Model-4bit"
+    assert model_cfg.native_context_length == 32768
+    assert model_cfg.is_local is False
+
+
+def test_remote_hf_non_mlx_falls_through(tmp_path: Path) -> None:
+    """A remote repo whose config.json lacks the MLX quantization block
+    must NOT be misclassified as MLX."""
+    from unittest import mock
+
+    cfg = tmp_path / "config.json"
+    # Standard transformers config — no quantization block.
+    cfg.write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "max_position_embeddings": 4096,
+            }
+        )
+    )
+
+    def _fake_hf_hub_download(repo_id, filename, *args, **kwargs):
+        return str(cfg)
+
+    with mock.patch(
+        "utils.models.model_config.detect_gguf_model_remote",
+        return_value = None,
+    ):
+        with mock.patch(
+            "huggingface_hub.hf_hub_download", _fake_hf_hub_download
+        ):
+            # The function will proceed into the transformers / Unsloth
+            # fallback, which may or may not return something depending
+            # on environment. We just assert MLX is not claimed.
+            try:
+                model_cfg = ModelConfig.from_identifier(
+                    "some/plain-transformers-repo"
+                )
+            except Exception:
+                model_cfg = None
+    if model_cfg is not None:
+        assert model_cfg.is_mlx is False
