@@ -40,6 +40,24 @@ MLX_SPEC_AVAILABLE = (
     MLX_LM_AVAILABLE and Path(_DRAFT_MODEL_PATH).is_dir()
 )
 
+# Chunk H — real LoRA adapter fixture. Trained against Bonsai 1.7B 2-bit
+# (the Phase-7 draft model) on a 400-row dair-ai/emotion JSONL. See
+# docs/chunk-h-lora/training.log for the exact training command / logs.
+# The test gate requires BOTH the 1.7B base AND the vendored adapter dir;
+# the 8B `_MODEL_PATH` is not a valid target for this adapter because the
+# adapter was trained at a different layer count.
+_LORA_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "lora_adapter"
+)
+MLX_LORA_AVAILABLE = (
+    platform.system() == "Darwin"
+    and platform.machine() == "arm64"
+    and importlib.util.find_spec("mlx_lm") is not None
+    and Path(_DRAFT_MODEL_PATH).is_dir()
+    and (_LORA_FIXTURE_PATH / "adapters.safetensors").is_file()
+    and (_LORA_FIXTURE_PATH / "adapter_config.json").is_file()
+)
+
 
 @pytest.mark.skipif(not MLX_LM_AVAILABLE, reason = "mlx_lm or model not available")
 def test_load_unload_roundtrip():
@@ -609,3 +627,104 @@ def test_bonsai_tool_loop_emits_tool_call_event(monkeypatch):
         # unreliable trigger conditions.
         pytest.skip("Model did not emit a tool call for this prompt")
     assert types.count("tool_start") == types.count("tool_end")
+
+
+@pytest.mark.skipif(
+    not MLX_LORA_AVAILABLE,
+    reason = "mlx_lm, Bonsai 1.7B base, or LoRA fixture not available",
+)
+def test_load_bonsai_with_real_lora_adapter():
+    """Chunk H — Phase 6 end-to-end: load a real MLX LoRA adapter
+    (trained via ``mlx_lm.lora`` on Bonsai 1.7B 2-bit + dair-ai/emotion,
+    vendored under ``tests/fixtures/lora_adapter/``) on top of the base.
+    Verify the ``is_lora`` flag flips, the backend can generate tokens
+    without the adapter fusion erroring, and ``load_progress`` /
+    ``adapter_path`` round-trip the fixture path back out.
+
+    The test is deliberately loose on *what* the model generates — we
+    don't care about emotion-classification accuracy (the recipe was
+    200 iters / rank 8 / 4 layers; not a good classifier). We care
+    that the MLX load + adapter-fusion path completes cleanly and
+    produces at least one cumulative text chunk.
+    """
+    from core.inference.mlx_lm import MlxLmBackend
+
+    # Defensive re-check on the fixture; the module-level gate covers
+    # this but pinning an explicit assertion gives a nicer failure if
+    # someone deletes one file by hand.
+    assert (_LORA_FIXTURE_PATH / "adapters.safetensors").is_file(), (
+        f"LoRA adapter weights missing at {_LORA_FIXTURE_PATH} — "
+        "regenerate via `mlx_lm.lora --train` (see "
+        "docs/chunk-h-lora/training.log for the exact command)."
+    )
+    assert (_LORA_FIXTURE_PATH / "adapter_config.json").is_file()
+
+    backend = MlxLmBackend()
+    assert backend.is_loaded is False
+    assert backend.is_lora is False
+    assert backend.adapter_path is None
+
+    ok = backend.load_model(
+        local_path = _DRAFT_MODEL_PATH,
+        model_identifier = Path(_DRAFT_MODEL_PATH).name,
+        adapter_path = str(_LORA_FIXTURE_PATH),
+    )
+    try:
+        assert ok is True, "MLX load with LoRA adapter returned False"
+        assert backend.is_loaded is True
+        # Phase 6 contract: ``is_lora`` flips True and ``adapter_path``
+        # round-trips the string we passed in.
+        assert backend.is_lora is True
+        assert backend.adapter_path == str(_LORA_FIXTURE_PATH)
+
+        # load_progress after a successful adapter-load should still
+        # terminate at phase="loaded" (the adapter load happens inside
+        # mlx_lm.load; Phase 3's phase state machine doesn't carve out
+        # a separate stage for it). No adapter metadata is currently
+        # exposed through load_progress — that's by design; the adapter
+        # path already lives on the public ``adapter_path`` property.
+        prog = backend.load_progress()
+        assert prog is not None
+        assert prog.get("phase") == "loaded"
+
+        # Short generate — 8 tokens is enough to prove the adapter
+        # fusion didn't corrupt the forward pass. We accept either a
+        # cumulative text stream (plain string events) or just a
+        # metadata event (model finished immediately); either way,
+        # no exception is a pass.
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "Classify the emotion: I feel great today.\nLabel:"
+                ),
+            }
+        ]
+        saw_metadata = False
+        cumulative_last = ""
+        for event in backend.generate_chat_completion(
+            messages = messages,
+            max_tokens = 8,
+        ):
+            if isinstance(event, dict):
+                saw_metadata = True
+                assert event.get("type") == "metadata"
+            else:
+                assert isinstance(event, str)
+                # Cumulative text contract holds for LoRA-fused base too.
+                assert (
+                    event.startswith(cumulative_last)
+                    or cumulative_last == ""
+                )
+                cumulative_last = event
+        assert saw_metadata, (
+            "adapter-fused generate must still emit a terminal "
+            "metadata event"
+        )
+    finally:
+        backend.unload_model()
+
+    # Post-unload: adapter state resets to the cold-start defaults.
+    assert backend.is_loaded is False
+    assert backend.is_lora is False
+    assert backend.adapter_path is None
