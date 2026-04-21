@@ -1935,6 +1935,25 @@ def _extract_content_parts(
                     # ship the list natively so the template renders
                     # its own markup.
                     entry["tool_calls"] = norm
+                    # Chunk H-2 (B1): some native-iteration templates —
+                    # Ministral-3's Mistral-2512 dialect is the current
+                    # known case — execute ``message['content'] | length``
+                    # unconditionally on the assistant branch even when
+                    # ``tool_calls`` is present. Jinja's ``length`` filter
+                    # raises ``TypeError: object of type 'NoneType' has
+                    # no len()`` when content is None (the exact shape
+                    # our extractor emits for "model issued tool_calls
+                    # with no accompanying prose"). Coerce to "" so the
+                    # template's ``content is string`` / ``length``
+                    # branches both succeed. Templates that iterate
+                    # ``tool_calls`` don't care whether content is "" or
+                    # None, so this widening is purely defensive — it
+                    # never loses information (None and "" both mean
+                    # "assistant emitted no text") and never changes the
+                    # rendered output for the Qwen / Bonsai / Gemma /
+                    # Llama-3.2 families that already worked.
+                    if entry.get("content") is None:
+                        entry["content"] = ""
                 else:
                     # Camp (b): template ignores tool_calls — synthesise
                     # <tool_call> content so the assistant turn still
