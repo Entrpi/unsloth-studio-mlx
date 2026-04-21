@@ -268,9 +268,247 @@ Build on the Phase 1 checklist above.
     Assert the server emits a 200 (the flag is forwarded) and the UI's
     thinking toggle becomes visible/active after load.
 
-## Follow-ups (remaining phases)
+## Follow-ups (remaining phases after Chunk B)
 
-- Phase 3: remote HF-hub download + load_progress UI.
 - Phase 5: tool calling (XML parser extraction, in-process OpenAI/Anthropic
   passthrough, agentic loop).
-- Phases 6–10 as per `/tmp/mlx-parity-roadmap.md`.
+- Phases 9–10 as per `/tmp/mlx-parity-roadmap.md` (vision, audio).
+
+---
+
+# Chunk B (Phases 3 + 6 + 7 + 8)
+
+Four orthogonal phases on top of Chunk A. Built in order 8 → 6 → 7 → 3
+to minimize merge churn (Phase 3 touches route/config/frontend, so it
+wraps the finalized load signature rather than re-doing Phases 6/7/8
+arguments afterwards).
+
+## Phase 8 — Quantized KV cache
+
+Adds KV-cache quantization pass-through for MLX. Mirrors the GGUF UI's
+`cache_type_kv` dropdown (`f16`/`bf16`/`q8_0`/`q5_1`/`q4_1`/`q4_0`).
+
+- `_cache_type_kv_to_mlx(value) -> (kv_bits, kv_group_size)` in
+  `mlx_lm.py` maps the UI dropdown strings to mlx-lm's `(int, int)`.
+  `f16`/`bf16` → `(None, 64)` meaning "don't pass the kwargs". `q5_1`
+  logs a warning and rounds **down** to 4-bit (mlx-lm has no 5-bit KV
+  path; rounding down preserves the user's "smaller cache" intent).
+- `MlxLmBackend.cache_type_kv` property returns `None` / `"q8_0"` /
+  `"q4_0"` / `f"q{bits}_0"` depending on the loaded state.
+- `load_model(cache_type_kv=...)` stores `_kv_bits` / `_kv_group_size` /
+  `_quantized_kv_start` on the backend; `generate_chat_completion` adds
+  the kwargs to `stream_generate` **only when `kv_bits is not None`**.
+  This preserves bit-for-bit behavior of Chunk A when quantization is
+  off (empty-kwargs fast path).
+- Route: `LoadRequest.cache_type_kv` → `load_model(cache_type_kv=...)`;
+  `LoadResponse.cache_type_kv` surfaces the effective value so the UI
+  learns about the `q5_1 → q4_0` rounding.
+- Frontend: added `activeIsMlx` to the chat runtime store; the main
+  `isGguf` gate in `chat-settings-sheet.tsx` becomes `isGgufOrMlx` so
+  KV cache dtype, speculative, and context-length controls now show
+  for MLX too. No visual refinement yet; the existing dropdown is
+  re-used.
+- `stream_generate` probe on 0.31.2: explicit kwarg `draft_model`;
+  `kv_bits`/`kv_group_size`/`quantized_kv_start` forwarded via
+  `**kwargs` into `generate_step` (and `speculative_generate_step`),
+  which accept them as explicit parameters.
+
+## Phase 6 — LoRA adapter loading
+
+- `_detect_mlx_adapter(path)` in `model_config.py`: True when the
+  directory has both `adapters.safetensors` **and**
+  `adapter_config.json`. Keying on `adapters.safetensors` (plural)
+  specifically — HuggingFace PEFT writes `adapter_model.safetensors`
+  (singular) so there's no collision with PEFT adapters. Base MLX
+  models have neither so there's no collision there either.
+- `ModelConfig` gains `is_mlx_lora: bool` + `mlx_adapter_path:
+  Optional[str]`.
+- `MlxLmBackend.load_model(adapter_path=...)` threads the path through
+  to `mlx_lm.load(..., adapter_path=...)`. `is_lora` property returns
+  True iff an adapter was loaded.
+- `LoadRequest.adapter_path` new schema field; route forwards.
+  `LoadResponse.is_mlx_lora` new schema field surfaces the backend's
+  `is_lora` state.
+- **Opportunistic `backend_kind` enum — deferred.** Adding a new enum
+  alongside the boolean flags (`is_gguf`, `is_mlx`, `is_mlx_lora`,
+  `is_lora`) without frontend consumers would just add a field to
+  sign off on. Better to wait until Phase 9 (vision) lands a fourth
+  distinct backend and forces the collapse.
+- Integration testing: no local MLX LoRA adapters available. Covered
+  by 10 unit tests: detection (5), backend `is_lora` property (3),
+  and `mlx_lm.load` kwarg-threading with a mock (2). The integration
+  path will light up once a user drops an MLX LoRA into the model
+  picker in a real Studio session.
+
+## Phase 7 — Speculative decoding
+
+Pairs the Bonsai 8B base with the Bonsai 1.7B MLX 2-bit as draft —
+the headline Chunk B demo.
+
+- `MlxLmBackend.load_model(draft_model_path=...)`: when non-None, loads
+  a second model via `mlx_lm.load` and stores `_draft_model` +
+  `_draft_tokenizer` alongside the base. Single lock guards both.
+- `_draft_mem_preflight`: before loading, sum the draft's
+  `*.safetensors` sizes; refuse with `RuntimeError("draft model would
+  exceed 75% of available memory...")` if combined footprint
+  `(total - available) + draft_bytes` crosses 75% of total RAM. No-op
+  when `psutil` isn't importable (graceful degradation).
+- `stream_generate(draft_model=..., num_draft_tokens=3)` — `draft_model`
+  is an explicit kwarg on 0.31.2; `num_draft_tokens` forwards via
+  `**kwargs` into `speculative_generate_step`.
+- `speculative_type` property returns `"mlx-draft-model"` (distinct
+  from GGUF's `"ngram-simple"` / `"ngram-mod"` labels) when a draft
+  is loaded.
+- `unload_model` drops the draft alongside the base.
+- Vocab-size mismatch between base and draft logs a warning at load
+  time. mlx-lm requires the same tokenizer; mismatched vocab sizes
+  will typically fail at token-verification time.
+- Route: `LoadRequest.draft_model_path` → `load_model(...)`;
+  `LoadResponse.speculative_type` surfaces the active mode.
+- Frontend: added `draftModelPath` / `loadedDraftModelPath` to the
+  runtime store; the settings sheet's Speculative Decoding dropdown
+  maps MLX "On" → `mlx-draft-model` and shows a path input
+  (`placeholder="/absolute/path/to/mlx-draft-dir"`) only when both
+  MLX is active and the dropdown is "On".
+- Integration test (`test_load_with_draft_and_stream_tokens`): loads
+  Bonsai 8B + Bonsai 1.7B, asserts `speculative_type==
+  "mlx-draft-model"`, streams 32 tokens, asserts non-empty output.
+  Skipped automatically when RAM headroom < ~25% (the 75% preflight
+  cap), since a 32 GB M5 under baseline load often can't fit both.
+  The preflight itself is exercised by dedicated unit tests.
+
+## Phase 3 — Remote-HF pulls, load_progress, memory warnings
+
+- `_extract_mlx_variant(name)` in `mlx_lm.py`: regex-parses the trailing
+  quant suffix (`-4bit`, `-mlx-2bit`, `-fp16`, …). Exposed as
+  `MlxLmBackend.hf_variant` after load.
+- `_download_mlx(repo, hf_token)`: wraps
+  `huggingface_hub.snapshot_download` with:
+  - `allow_patterns = ["*.safetensors",
+    "*.safetensors.index.json", "config.json", "tokenizer*",
+    "special_tokens_map.json", "*.json", "*.jinja",
+    "chat_template*", "generation_config.json"]` — tight enough to
+    skip READMEs and eval tensors, loose enough to catch whatever
+    tokenizer layout the repo uses.
+  - A custom `tqdm_class` subclass that writes per-shard totals into
+    `_download_bytes_total` on init and per-update bumps into
+    `_download_bytes_loaded`. Strictly additive; if the tqdm API
+    drifts, counters go stale but the download still succeeds.
+- `ModelConfig.from_identifier` remote-HF branch now probes
+  `config.json` via `hf_hub_download`; when the MLX `quantization
+  {"bits","group_size"}` block is present, returns an `is_mlx=True`
+  ModelConfig with `mlx_path=None` (download deferred to the
+  backend) and `native_context_length` from `max_position_embeddings`.
+- `load_model`:
+  - Accepts non-existent `local_path` that looks like a repo id
+    (has a `/`, not a filesystem path) — routes through
+    `_download_mlx`.
+  - Sets `_load_phase` to `"downloading"` → `"loading"` → `"loaded"`
+    across the load.
+  - Computes `_weights_bytes_total` from local safetensors after
+    download. Compares to `psutil.virtual_memory().total`; when
+    `total < 1.5 × weight bytes`, appends a RAM-pressure warning to
+    `_load_warnings` (surfaced via `load_progress().warnings`).
+- `load_progress()`:
+  - `"downloading"` → counters from the HF tqdm subclass.
+  - `"loading"` → samples `psutil.Process().memory_info().rss`
+    against `_weights_bytes_total` for a best-effort bar.
+  - `"loaded"` → fraction=1.0 with final byte counts.
+  - `None` → no load in flight.
+  - Additive `warnings: List[str]` field when `_load_warnings` has
+    entries.
+- Route: `/api/inference/load-progress` checks the MLX backend first;
+  when an MLX load is in flight it delegates. The MLX-only
+  `warnings` field is filtered out before handing to the existing
+  `LoadProgressResponse` (no frontend schema break).
+- Reset semantics: `unload_model` clears all progress + warning
+  state so a subsequent `load_progress()` returns `None`.
+
+## Chunk B smoke-test checklist
+
+Build on Chunk A's checklist. All curl commands assume the default
+local port `http://127.0.0.1:8000`.
+
+### Phase 8 — Quantized KV cache
+
+```bash
+# Load Bonsai with 8-bit quantized KV:
+curl -sN http://127.0.0.1:8000/api/inference/load \
+  -H 'content-type: application/json' \
+  -d '{
+    "model_path": "/Users/ent/.lmstudio/models/prism-ml/Ternary-Bonsai-8B-mlx-2bit",
+    "cache_type_kv": "q8_0",
+    "max_seq_length": 0
+  }'
+# Expect: LoadResponse with cache_type_kv=="q8_0".
+
+# q5_1 rounds down to q4_0 with a warning in logs:
+curl -sN http://127.0.0.1:8000/api/inference/load \
+  -H 'content-type: application/json' \
+  -d '{
+    "model_path": "/Users/ent/.lmstudio/models/prism-ml/Ternary-Bonsai-8B-mlx-2bit",
+    "cache_type_kv": "q5_1"
+  }'
+# Expect: LoadResponse with cache_type_kv=="q4_0".
+```
+
+### Phase 6 — LoRA adapter loading
+
+```bash
+# (Requires an MLX LoRA adapter at /path/to/adapter — not shipped in
+# this repo.) The backend routes adapter_path through to
+# mlx_lm.load(..., adapter_path=...).
+curl -sN http://127.0.0.1:8000/api/inference/load \
+  -H 'content-type: application/json' \
+  -d '{
+    "model_path": "/Users/ent/.lmstudio/models/prism-ml/Ternary-Bonsai-8B-mlx-2bit",
+    "adapter_path": "/path/to/mlx-lora-adapter"
+  }'
+# Expect: LoadResponse with is_mlx=true AND is_mlx_lora=true.
+```
+
+### Phase 7 — Speculative decoding (Bonsai 8B + 1.7B)
+
+```bash
+curl -sN http://127.0.0.1:8000/api/inference/load \
+  -H 'content-type: application/json' \
+  -d '{
+    "model_path": "/Users/ent/.lmstudio/models/prism-ml/Ternary-Bonsai-8B-mlx-2bit",
+    "draft_model_path": "/Users/ent/.lmstudio/models/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit"
+  }'
+# Expect: LoadResponse with speculative_type=="mlx-draft-model".
+
+# Stream a chat completion — throughput should be higher than Bonsai 8B alone:
+curl -sN http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "Ternary-Bonsai-8B-mlx-2bit",
+    "messages": [{"role": "user", "content": "Explain speculative decoding in one sentence."}],
+    "stream": true,
+    "max_tokens": 64
+  }'
+```
+
+### Phase 3 — Remote HF MLX + load_progress
+
+```bash
+# Kick off a remote download (any public mlx-community repo works):
+curl -sN http://127.0.0.1:8000/api/inference/load \
+  -H 'content-type: application/json' \
+  -d '{
+    "model_path": "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+  }' &
+LOAD_PID=$!
+
+# Poll progress in a second shell:
+while kill -0 $LOAD_PID 2>/dev/null; do
+  curl -s http://127.0.0.1:8000/api/inference/load-progress
+  echo
+  sleep 1
+done
+# Expect: a sequence of {phase="downloading", bytes_loaded, bytes_total, fraction},
+# then {phase="loading"}, then {phase="loaded"}.
+
+# Final load response carries hf_variant (exposed via backend property,
+# not yet routed to LoadResponse — follow-up).
+```
