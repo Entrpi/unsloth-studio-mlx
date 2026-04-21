@@ -370,6 +370,40 @@ ContentPart = Annotated[
 """Union type for multimodal content parts, discriminated by the 'type' field."""
 
 
+# ── Tool-call models (OpenAI function-calling wire format) ──────
+
+
+class FunctionCall(BaseModel):
+    """OpenAI ``tool_call.function`` shape.
+
+    ``arguments`` is typed as ``str | dict`` because OpenAI's wire
+    format carries a JSON-encoded string but many clients (including
+    llama-server's structured ``delta.tool_calls``) sometimes emit the
+    already-decoded dict. Accept both and leave the decision of whether
+    to encode to the consumer.
+    """
+
+    name: str = Field(..., description = "Tool / function name")
+    arguments: Union[str, dict] = Field(
+        default = "",
+        description = (
+            "JSON-encoded arguments string (OpenAI spec) or already-parsed "
+            "dict. Backends normalise to string before calling execute_tool."
+        ),
+    )
+
+
+class ToolCall(BaseModel):
+    """A single structured tool call the assistant decided to make."""
+
+    id: str = Field(..., description = "Opaque call id (client echoes on tool result)")
+    type: Literal["function"] = Field(
+        default = "function",
+        description = "Always 'function' in OpenAI's current spec",
+    )
+    function: FunctionCall
+
+
 # ── Messages ─────────────────────────────────────────────────────
 
 
@@ -383,6 +417,13 @@ class ChatMessage(BaseModel):
     to ``None`` with ``tool_calls`` populated. ``role="tool"`` messages
     carry the result of a client-executed tool call and require
     ``tool_call_id`` per the OpenAI spec.
+
+    ``reasoning_content`` carries the model's ``<think>`` text as a
+    separate field (OpenAI's unofficial reasoning-content convention
+    used by llama-server and vLLM). When the caller round-trips a
+    message into a fresh turn, Studio lifts it back into inline
+    ``<think>...</think>`` tags; the backends do not reason about this
+    field directly.
     """
 
     role: Literal["system", "user", "assistant", "tool"] = Field(
@@ -397,12 +438,46 @@ class ChatMessage(BaseModel):
     )
     tool_calls: Optional[list[dict]] = Field(
         None,
-        description = "OpenAI assistant messages: structured tool calls the model decided to make.",
+        description = (
+            "OpenAI assistant messages: structured tool calls the model "
+            "decided to make. Stored as plain dicts (OpenAI wire format) "
+            "so clients carrying provider-specific extra fields round-trip "
+            "unchanged. Typed ``ToolCall`` instances are accepted on input "
+            "and normalised to dicts via ``model_dump`` below."
+        ),
     )
     name: Optional[str] = Field(
         None,
         description = "OpenAI tool-result messages: name of the tool whose result this is.",
     )
+    reasoning_content: Optional[str] = Field(
+        None,
+        description = (
+            "[x-unsloth] Reasoning text a prior assistant turn emitted via "
+            "``<think>...</think>`` tags. Round-trips verbatim when Studio "
+            "is used as a conversation store."
+        ),
+    )
+
+    @model_validator(mode = "before")
+    @classmethod
+    def _normalize_tool_calls(cls, data):
+        """Accept typed ``ToolCall`` instances on input and collapse to
+        plain dicts so every downstream consumer sees one shape."""
+        if not isinstance(data, dict):
+            return data
+        tcs = data.get("tool_calls")
+        if tcs is None:
+            return data
+        norm: list = []
+        for tc in tcs:
+            if hasattr(tc, "model_dump"):
+                norm.append(tc.model_dump(exclude_none = True))
+            else:
+                norm.append(tc)
+        data = dict(data)
+        data["tool_calls"] = norm
+        return data
 
     @model_validator(mode = "after")
     def _validate_role_shape(self) -> "ChatMessage":
@@ -553,11 +628,40 @@ class ChatCompletionRequest(BaseModel):
 # ── Streaming response chunks ────────────────────────────────────
 
 
+class ToolCallFunctionDelta(BaseModel):
+    """Incremental function payload inside a streaming ``tool_calls`` delta."""
+
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+
+
+class ToolCallDelta(BaseModel):
+    """Partial tool-call payload emitted during streaming.
+
+    Matches OpenAI's ``delta.tool_calls[i]`` shape: each delta carries an
+    ``index`` to identify which call it belongs to (callers with several
+    concurrent tool calls see interleaved deltas), an ``id`` / ``type``
+    that arrive on the first delta, and a ``function`` object whose
+    ``name`` arrives on the first delta and whose ``arguments`` stream
+    character-by-character across subsequent deltas.
+    """
+
+    index: int = 0
+    id: Optional[str] = None
+    type: Optional[Literal["function"]] = "function"
+    function: Optional[ToolCallFunctionDelta] = None
+
+
 class ChoiceDelta(BaseModel):
     """Delta content for a streaming chunk."""
 
     role: Optional[str] = None
     content: Optional[str] = None
+    #: OpenAI streaming ``tool_calls`` deltas. Populated only on chunks
+    #: that carry tool-call payload; plain text chunks leave this
+    #: ``None`` so ``model_dump(exclude_none=True)`` skips the field.
+    tool_calls: Optional[list[ToolCallDelta]] = None
+    reasoning_content: Optional[str] = None
 
 
 class ChunkChoice(BaseModel):
@@ -565,7 +669,10 @@ class ChunkChoice(BaseModel):
 
     index: int = 0
     delta: ChoiceDelta
-    finish_reason: Optional[Literal["stop", "length"]] = None
+    # Add ``tool_calls`` to the finish-reason Literal so
+    # Pydantic doesn't coerce the string away when the backend signals
+    # that the turn ended because the model wants to call a tool.
+    finish_reason: Optional[Literal["stop", "length", "tool_calls"]] = None
 
 
 class ChatCompletionChunk(BaseModel):

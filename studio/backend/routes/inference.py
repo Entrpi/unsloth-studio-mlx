@@ -1146,12 +1146,24 @@ def _decode_audio_base64(b64: str) -> np.ndarray:
 
 def _extract_content_parts(
     messages: list,
+    *,
+    preserve_tool_history: bool = False,
 ) -> tuple[str, list[dict], "Optional[str]"]:
     """
     Parse OpenAI-format messages into components the inference backend expects.
 
     Handles both plain-string ``content`` and multimodal content-part arrays
     (``[{type: "text", ...}, {type: "image_url", ...}]``).
+
+    Args:
+        messages: List of ChatMessage instances.
+        preserve_tool_history: When True, keep ``tool_calls`` /
+            ``tool_call_id`` / ``name`` / ``reasoning_content`` fields on
+            the messages the backend sees. Used by the tool-calling path
+            so the backend can feed a complete conversation (including a
+            prior assistant's tool_calls and the subsequent tool
+            results) back into ``apply_chat_template``. Default False
+            preserves Phase-1 behaviour for non-tool chat paths.
 
     Returns:
         system_prompt:  The system message text (empty string if none provided).
@@ -1174,12 +1186,29 @@ def _extract_content_parts(
                 )
             continue
 
+        # ── Tool-role messages (tool results) ─────────────────
+        if msg.role == "tool":
+            if not preserve_tool_history:
+                # Legacy chat paths never expect a role="tool" message;
+                # drop it to avoid confusing the non-tool template.
+                continue
+            entry = {
+                "role": "tool",
+                "content": msg.content if isinstance(msg.content, str) else "",
+            }
+            if msg.tool_call_id:
+                entry["tool_call_id"] = msg.tool_call_id
+            if msg.name:
+                entry["name"] = msg.name
+            chat_messages.append(entry)
+            continue
+
         # ── User / assistant messages ─────────────────────────
+        entry: dict = {"role": msg.role}
+
         if isinstance(msg.content, str):
-            # Plain string content — pass through
-            chat_messages.append({"role": msg.role, "content": msg.content})
+            entry["content"] = msg.content
         elif isinstance(msg.content, list):
-            # Multimodal content parts
             text_parts: list[str] = []
             for part in msg.content:
                 if part.type == "text":
@@ -1187,14 +1216,35 @@ def _extract_content_parts(
                 elif part.type == "image_url" and first_image_b64 is None:
                     url = part.image_url.url
                     if url.startswith("data:"):
-                        # data:image/png;base64,<DATA> → extract <DATA>
                         first_image_b64 = url.split(",", 1)[1] if "," in url else None
                     else:
                         logger.warning(
                             f"Remote image URLs not yet supported: {url[:80]}..."
                         )
-            combined_text = "\n".join(text_parts) if text_parts else ""
-            chat_messages.append({"role": msg.role, "content": combined_text})
+            entry["content"] = "\n".join(text_parts) if text_parts else ""
+        else:
+            entry["content"] = msg.content
+
+        # Assistant tool-calling metadata: only surface when the caller
+        # opted in, so the non-tool chat paths keep their compact
+        # {"role","content"} shape and don't risk feeding an unknown
+        # field into a chat template.
+        if preserve_tool_history and msg.role == "assistant":
+            if msg.tool_calls:
+                # Normalize ToolCall instances back to dicts so the
+                # tokenizer's apply_chat_template sees plain JSON-like
+                # structures (Jinja can't render Pydantic models).
+                norm: list[dict] = []
+                for tc in msg.tool_calls:
+                    if hasattr(tc, "model_dump"):
+                        norm.append(tc.model_dump(exclude_none = True))
+                    elif isinstance(tc, dict):
+                        norm.append(tc)
+                entry["tool_calls"] = norm
+            if msg.reasoning_content:
+                entry["reasoning_content"] = msg.reasoning_content
+
+        chat_messages.append(entry)
 
     return system_prompt, chat_messages, first_image_b64
 
