@@ -9,11 +9,22 @@ Loads MLX checkpoints via ``mlx_lm.load`` and streams chat completions via
 ``core.inference.llama_cpp.LlamaCppBackend`` so the route can branch on
 ``is_mlx``/``is_gguf`` without changing the Unsloth / transformers path.
 
-Phase 1 scope (see /tmp/mlx-backend-implementation-plan.md):
+Phase 1 scope:
 - Local MLX directories only (no remote-HF MLX download).
 - Text-in / text-out only. Vision and audio are rejected.
 - No tool calling, no reasoning/<think> wrapping, no speculative decoding.
 - No LoRA adapters, no training.
+
+Chunk A (Phase 2 + Phase 4) extensions:
+- Phase 2: ``_build_mlx_sampler_and_processors`` helper wires
+  ``make_logits_processors`` for repetition/presence/frequency penalties and
+  ``make_sampler`` for temperature/top_p/top_k/min_p. Stop-string enforcement
+  happens in-loop by scanning the cumulative decoded text.
+- Phase 4: reasoning capability is introspected from
+  ``tokenizer.chat_template`` at load time. ``enable_thinking`` is forwarded
+  to ``apply_chat_template`` via ``chat_template_kwargs`` when the model
+  supports it. Literal ``<think>`` tags in the stream pass through
+  unmodified — the frontend parses them directly.
 
 The module is importable on any platform: ``mlx_lm`` is lazy-imported inside
 ``load_model``. Instantiating ``MlxLmBackend`` does not import ``mlx_lm``.
@@ -35,6 +46,120 @@ logger = get_logger(__name__)
 
 # Sentinel for a metadata event at the end of the generator stream.
 MetadataEvent = Dict[str, Any]
+
+
+def _build_mlx_sampler_and_processors(
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+    repetition_penalty: float,
+    repetition_context_size: Optional[int] = None,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    logit_bias: Optional[Dict[int, float]] = None,
+):
+    """Build an ``(sampler, logits_processors)`` pair for ``stream_generate``.
+
+    This is the single place in the backend that knows the mlx-lm sampling
+    API. Phases 6/7/8 add kwargs here; callers in ``generate_chat_completion``
+    never import ``mlx_lm.sample_utils`` directly.
+
+    Semantics:
+
+    - ``temperature <= 0`` → greedy (``make_sampler(temp=0)`` returns an
+      argmax sampler upstream, confirmed by reading the source of
+      ``mlx_lm.sample_utils.make_sampler`` on 0.31.2).
+    - ``top_k <= 0``, ``min_p <= 0``, ``top_p >= 1.0`` are all treated as
+      "off" by ``make_sampler`` (upstream guards).
+    - A logits processor is added ONLY when its value is non-default, so the
+      empty-list fast path is honored in ``stream_generate``. Specifically:
+
+      * ``repetition_penalty > 1.0`` → adds the repetition processor. A
+        value of ``1.0`` is a no-op mathematically but the upstream
+        ``make_logits_processors`` naively adds it when ``penalty != 0``;
+        we gate here to avoid the per-token cost.
+      * ``presence_penalty != 0`` / ``frequency_penalty != 0`` → adds the
+        corresponding processor.
+      * ``logit_bias`` truthy → adds the bias processor.
+
+    - If the installed mlx-lm rejects a kwarg (signature drift between
+      patch releases), we drop the offending kwarg with a ``debug`` log
+      and retry with a smaller subset. Mirrors the defensive pattern that
+      the Phase-1 sampler already used.
+
+    Returns:
+        Tuple of (sampler, processors_list). Either may be empty/None to
+        signal "no special handling" to ``stream_generate``.
+    """
+    from mlx_lm.sample_utils import (  # type: ignore
+        make_logits_processors,
+        make_sampler,
+    )
+
+    # ── Sampler ───────────────────────────────────────────────────────
+    try:
+        sampler = make_sampler(
+            temp = float(temperature) if temperature and temperature > 0 else 0.0,
+            top_p = float(top_p) if top_p and top_p > 0 else 0.0,
+            top_k = int(top_k) if top_k and top_k > 0 else 0,
+            min_p = float(min_p) if min_p and min_p > 0 else 0.0,
+        )
+    except TypeError as e:
+        logger.debug(
+            f"make_sampler kwargs signature drift ({e}); retrying with temp/top_p only"
+        )
+        try:
+            sampler = make_sampler(
+                temp = float(temperature) if temperature and temperature > 0 else 0.0,
+                top_p = float(top_p) if top_p and top_p > 0 else 0.0,
+            )
+        except Exception as e2:
+            logger.debug(f"make_sampler fallback also failed ({e2}); using default")
+            sampler = None
+
+    # ── Logits processors (penalties + bias) ──────────────────────────
+    # Only include a kwarg when it represents an actual change from
+    # neutral, so the returned processor list is empty in the common
+    # "defaults everywhere" case.
+    lp_kwargs: Dict[str, Any] = {}
+    if repetition_penalty is not None and float(repetition_penalty) > 1.0:
+        lp_kwargs["repetition_penalty"] = float(repetition_penalty)
+        if repetition_context_size is not None and repetition_context_size > 0:
+            lp_kwargs["repetition_context_size"] = int(repetition_context_size)
+    if presence_penalty is not None and float(presence_penalty) != 0.0:
+        lp_kwargs["presence_penalty"] = float(presence_penalty)
+    if frequency_penalty is not None and float(frequency_penalty) != 0.0:
+        lp_kwargs["frequency_penalty"] = float(frequency_penalty)
+    if logit_bias:
+        lp_kwargs["logit_bias"] = dict(logit_bias)
+
+    if not lp_kwargs:
+        return sampler, []
+
+    try:
+        processors = make_logits_processors(**lp_kwargs)
+    except TypeError as e:
+        # Defensive: if an individual kwarg is rejected by an older/newer
+        # mlx-lm, drop it and retry. Log at debug to mirror the Phase-1
+        # pattern at mlx_lm.py:357-365.
+        logger.debug(
+            f"make_logits_processors kwargs rejected ({e}); retrying with reduced set"
+        )
+        _safe: Dict[str, Any] = {}
+        for k, v in lp_kwargs.items():
+            try:
+                make_logits_processors(**{k: v})
+                _safe[k] = v
+            except TypeError:
+                logger.debug(f"  dropping unsupported kwarg: {k}")
+        try:
+            processors = make_logits_processors(**_safe)
+        except Exception as e2:
+            logger.debug(f"make_logits_processors fallback failed ({e2}); using empty list")
+            processors = []
+
+    return sampler, list(processors or [])
 
 
 class MlxLmBackend:
@@ -278,7 +403,10 @@ class MlxLmBackend:
         min_p: float = 0.01,
         max_tokens: Optional[int] = None,
         repetition_penalty: float = 1.0,
+        repetition_context_size: Optional[int] = None,
         presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        logit_bias: Optional[Dict[int, float]] = None,
         stop: Optional[List[str]] = None,
         cancel_event: Optional[threading.Event] = None,
         enable_thinking: Optional[bool] = None,
@@ -293,20 +421,28 @@ class MlxLmBackend:
         - After the text stream ends, yields exactly one metadata dict
           with ``{"type": "metadata", "usage": {...}, "timings": {...}}``.
 
-        Phase-1 limitations:
+        Chunk A (Phase 2 + Phase 4) behavior:
 
         - ``image_b64`` is rejected (not supported).
-        - ``enable_thinking`` is silently ignored (Bonsai has no
-          ``<think>`` tag plumbing in Phase 1).
-        - ``stop`` strings are not honored yet — MLX's stream_generate
-          does not natively accept custom stop strings; the route can
-          still truncate on its side if needed. We pass them through
-          ``mlx_lm`` if it supports the ``stop`` kwarg and silently
-          swallow TypeError otherwise for forward compatibility.
-        - ``repetition_penalty``, ``presence_penalty``, ``top_k`` are
-          passed through ``sampler`` / ``logits_processors`` when
-          supported by the installed mlx-lm version. Unsupported
-          values are dropped with a debug log rather than raising.
+        - ``enable_thinking`` is threaded into ``apply_chat_template`` via
+          ``chat_template_kwargs={"enable_thinking": bool}`` when the
+          model advertises ``supports_reasoning``. When the backend does
+          NOT support reasoning (plain chat template) the kwarg is
+          dropped silently — no schema breakage, no template errors.
+          Literal ``<think>...</think>`` tags emitted by the model pass
+          through the stream unmodified; the frontend parses them.
+        - ``stop`` strings are enforced **backend-side** by scanning the
+          cumulative decoded text after each token tick. When a stop
+          match is found, we truncate cumulative at the match boundary,
+          yield the truncated string once, and terminate the loop with
+          ``finish_reason="stop"`` baked into the metadata event.
+          (``mlx-lm`` has no native ``stop`` kwarg on 0.31.2 — confirmed
+          against the upstream source.)
+        - ``temperature``, ``top_p``, ``top_k``, ``min_p``,
+          ``repetition_penalty``, ``presence_penalty``,
+          ``frequency_penalty``, and ``logit_bias`` are forwarded through
+          :func:`_build_mlx_sampler_and_processors`. ``temperature <= 0``
+          yields a greedy / argmax sampler upstream.
         """
         if image_b64:
             raise ValueError(
@@ -318,7 +454,6 @@ class MlxLmBackend:
         # Lazy imports
         try:
             from mlx_lm import stream_generate  # type: ignore
-            from mlx_lm.sample_utils import make_sampler  # type: ignore
         except ImportError as e:
             raise RuntimeError(f"mlx_lm is not installed: {e}") from e
 
@@ -327,12 +462,21 @@ class MlxLmBackend:
 
         # Build the prompt via the tokenizer's chat template. Fall back to
         # a minimal ChatML-style prompt if the model has no template.
+        # When the model advertises reasoning support AND the caller
+        # explicitly set ``enable_thinking``, pass it through
+        # ``chat_template_kwargs``. When the model doesn't support
+        # reasoning we skip the kwarg entirely: some templates reject
+        # unknown kwargs.
+        apply_kwargs: Dict[str, Any] = {
+            "add_generation_prompt": True,
+            "tokenize": False,
+        }
+        if self.supports_reasoning and enable_thinking is not None:
+            apply_kwargs["chat_template_kwargs"] = {
+                "enable_thinking": bool(enable_thinking)
+            }
         try:
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt = True,
-                tokenize = False,
-            )
+            prompt = tokenizer.apply_chat_template(messages, **apply_kwargs)
         except Exception as e:
             logger.warning(
                 f"apply_chat_template failed ({e}); falling back to manual prompt"
@@ -345,24 +489,18 @@ class MlxLmBackend:
             parts.append("<|assistant|>\n")
             prompt = "\n".join(parts)
 
-        # Build the sampler. ``make_sampler`` is stable across 0.31.x.
-        sampler = None
-        try:
-            sampler = make_sampler(
-                temp = float(temperature),
-                top_p = float(top_p),
-                top_k = int(top_k) if top_k and top_k > 0 else 0,
-                min_p = float(min_p) if min_p and min_p > 0 else 0.0,
-            )
-        except TypeError:
-            # Older mlx-lm sample_utils has a smaller arg set.
-            try:
-                sampler = make_sampler(temp = float(temperature), top_p = float(top_p))
-            except Exception as e:
-                logger.debug(
-                    f"Could not construct MLX sampler ({e}); using default"
-                )
-                sampler = None
+        # Build the sampler and logits processors via the single helper.
+        sampler, processors = _build_mlx_sampler_and_processors(
+            temperature = temperature,
+            top_p = top_p,
+            top_k = top_k,
+            min_p = min_p,
+            repetition_penalty = repetition_penalty,
+            repetition_context_size = repetition_context_size,
+            presence_penalty = presence_penalty,
+            frequency_penalty = frequency_penalty,
+            logit_bias = logit_bias,
+        )
 
         # Kwargs for stream_generate — filter out Nones.
         sg_kwargs: Dict[str, Any] = {"prompt": prompt}
@@ -370,6 +508,17 @@ class MlxLmBackend:
             sg_kwargs["max_tokens"] = int(max_tokens)
         if sampler is not None:
             sg_kwargs["sampler"] = sampler
+        if processors:
+            sg_kwargs["logits_processors"] = processors
+
+        # Normalize stop strings: accept str | list[str] | None; strip empties.
+        stop_strings: List[str] = []
+        if stop:
+            if isinstance(stop, str):
+                stop_strings = [stop]
+            else:
+                stop_strings = [s for s in stop if isinstance(s, str) and s]
+        max_stop_len = max((len(s) for s in stop_strings), default = 0)
 
         # Generation loop. stream_generate is a plain Python generator;
         # the caller (route) drives it from a worker thread via
@@ -377,16 +526,44 @@ class MlxLmBackend:
         # free. We accumulate resp.text and yield the cumulative string.
         cumulative = ""
         last_resp: Any = None
+        finish_reason = "stop"  # default; may be overridden by cancel path.
         try:
             for resp in stream_generate(model, tokenizer, **sg_kwargs):
                 last_resp = resp
                 if cancel_event is not None and cancel_event.is_set():
                     logger.debug("MLX generation cancelled by client")
+                    finish_reason = "cancelled"
                     break
                 text = getattr(resp, "text", "") or ""
-                if text:
-                    cumulative += text
-                    yield cumulative
+                if not text:
+                    continue
+                cumulative += text
+
+                # Stop-string enforcement: scan the tail of the cumulative
+                # decoded string for any configured stop sequence. The tail
+                # window is "max stop string length + the text we just
+                # appended" — this guarantees we catch a match that spans
+                # a tokenization boundary without rescanning the full
+                # buffer each tick. At 47 tok/s the cost is negligible
+                # either way, but keeping it tail-bounded means long
+                # transcripts don't drag the tick time up.
+                if stop_strings:
+                    scan_start = max(
+                        0, len(cumulative) - (max_stop_len + len(text))
+                    )
+                    hay = cumulative[scan_start:]
+                    earliest_rel: Optional[int] = None
+                    for s in stop_strings:
+                        idx = hay.find(s)
+                        if idx != -1 and (earliest_rel is None or idx < earliest_rel):
+                            earliest_rel = idx
+                    if earliest_rel is not None:
+                        cut = scan_start + earliest_rel
+                        cumulative = cumulative[:cut]
+                        yield cumulative
+                        break
+
+                yield cumulative
         except Exception as e:
             logger.error(f"MLX stream_generate raised: {e}")
             raise
@@ -407,4 +584,9 @@ class MlxLmBackend:
                 "predicted_per_second": getattr(last_resp, "generation_tps", None),
             }
 
-        yield {"type": "metadata", "usage": usage, "timings": timings}
+        yield {
+            "type": "metadata",
+            "usage": usage,
+            "timings": timings,
+            "finish_reason": finish_reason,
+        }
