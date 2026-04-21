@@ -1359,3 +1359,28 @@ skip when the audio tools aren't installed.
   continuation in ~30 s cold, well under the MoE file's 60 s budget.
 - Both rows unload cleanly and the suite can run them sequentially
   without OOM pressure on 32 GB.
+
+## Chunk H-2 — B3 closure (Gemma-4 parser dialect)
+
+Closed inline after the Gemma-4 matrix addition landed. The shared
+`_tool_call_parser` now recognises Gemma-4's
+`<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>` dialect
+alongside the existing JSON (`<tool_call>{...}</tool_call>`) and XML
+(`<function=…><parameter=…>…</parameter></function>`) dialects. The
+fix normalises Gemma-quotes to standard JSON quotes, quotes bare object
+keys via regex, and runs `json.loads` on the result — handling nested
+objects, arrays, booleans, numbers, and nulls without further work.
+
+The Gemma E2E test (`test_mlx_gemma_tool_calling.py`) previously had a
+soft, aspirational check inside `if tool_starts:`. It's now the primary
+signal: the test asserts `tool_name == "get_weather"` and arguments
+contain `"Paris"` unconditionally. Gemma-4 reliably emits the call
+against a clear "use the function" prompt, so the assertion is stable.
+
+- 10 new `TestGemmaDialect` parser unit tests.
+- `TOOL_CLOSED_PATS` / `TOOL_ALL_PATS` / `TOOL_XML_SIGNALS` updated; the
+  pattern-count structural test (`test_patterns_are_exported`) was
+  bumped from 2/4 to 3/6 accordingly.
+- Full MLX suite: 302 passed, 4 skipped (MLX_SLOW_TESTS-gated), 0
+  xfailed. +11 tests vs Chunk H-2 Gemma-4 tip.
+- `docs/chunk-h2-matrix/blockers.md` marks B3 as resolved.

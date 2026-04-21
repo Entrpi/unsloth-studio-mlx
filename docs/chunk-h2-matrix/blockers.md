@@ -81,36 +81,46 @@ covered — this fix closes the gap on the text-path side.
 
 ## B3. Gemma-4 `<|tool_call>` idiom not recognised by the shared parser
 
-**Observed during the Gemma-4 matrix closure pass.** Tracked as a
-follow-up, not blocking Chunk H-2.
+**Resolved inline during the H-2 Gemma closure.**
 
 **Family.** `mlx-community/gemma-4-e4b-it-4bit` (and its 31B / MoE
 siblings — all share this template dialect).
 
 **Symptom.** Gemma-4 renders assistant tool calls as
-`<|tool_call>call:NAME{...}<tool_call|>`. This is distinct from the
-`<tool_call>{...}</tool_call>` Qwen / Bonsai / Hermes dialect that
+`<|tool_call>call:NAME{...}<tool_call|>` with string values delimited
+by Gemma's `<|"|>...<|"|>` escaped-quote token pair and bare
+(unquoted) object keys. This is distinct from the
+`<tool_call>{...}</tool_call>` Qwen / Bonsai / Hermes JSON dialect
+and the `<function=…><parameter=…>` Claude/Mistral XML dialect that
 `core.inference._tool_call_parser.parse_tool_calls_from_text`
-recognises. When Gemma-4 emits a call, the parser returns no hits,
-the `generate_chat_completion_with_tools` loop treats the turn as a
-final-answer turn, and no `tool_start` event fires.
+recognised pre-fix.
 
-**Impact.** The code path runs end-to-end (load + loop + unload) and
-the test in `tests/test_mlx_gemma_tool_calling.py` asserts that
-contract. The model-emits-tool-call aspirational assertion is
-currently unreachable — documented inline in the test. Adding
-Gemma-4 dialect support to the shared parser is a straightforward
-regex addition (plus a matching `strip_tool_markup` branch) but it's
-a behaviour change, not coverage expansion, so it's deferred to a
-follow-up chunk.
+**Fix landed.** The shared parser gained a third dialect:
 
-**Downstream impact.** Zero. Every currently-shipped Gemma-4 user
-flow today either (a) uses a non-tools prompt (the family smoke row
-covers that) or (b) produces prose even when tools are offered
-(the parser just passes the prose through as final content). Users
-who need real Gemma-4 tool-calling today can fall back to non-MLX
-providers; the MLX path will light up once the parser grows the
-Gemma dialect.
+- New `_TC_GEMMA_START_RE`, `_TC_GEMMA_QUOTE`, `_TC_GEMMA_KEY_RE`
+  constants.
+- New `_parse_gemma_dialect(content)` helper that does balanced-brace
+  extraction respecting Gemma's quote tokens, then normalises the
+  extracted body to JSON in two steps (Gemma-quotes → `"`, bare-key
+  quoting via regex) and runs `json.loads`.
+- `parse_tool_calls_from_text` tries the new dialect last in `auto`
+  mode; `model_family="gemma"` / `"gemma4"` forces it.
+- `TOOL_CLOSED_PATS` / `TOOL_ALL_PATS` grew matching strip patterns
+  for closed and unclosed Gemma blocks.
+- `TOOL_XML_SIGNALS` now lists `"<|tool_call>"` so the speculative
+  buffer holds Gemma streams mid-emission just like the other two
+  dialects.
+- 10 new unit tests in `TestGemmaDialect` cover the happy path,
+  chain-of-thought prefix, multi-arg with mixed types, nested
+  objects, unclosed calls, multiple calls, forced dialect hint,
+  suppression under other dialect hints, strip-closed, strip-final,
+  and the signal export.
+
+**Downstream impact.** `tests/test_mlx_gemma_tool_calling.py`'s
+aspirational assertion is no longer aspirational — the test now
+asserts `tool_name == "get_weather"` and `arguments` contains
+`"Paris"` as the primary contract. Gemma-4 users can now drive
+real tool-call workflows on the MLX backend.
 
 ## B4. `@pytest.mark.slow` not yet a convention in this suite
 

@@ -6,24 +6,16 @@
 Prior H-2 coverage only template-probed Gemma-4 (rendered a
 tool-history fixture through the 31B tokenizer's chat_template). This
 file closes the real gap: **weights-loaded tool-calling** against the
-`gemma-4-e4b-it-4bit` dense variant. The test drives
+``gemma-4-e4b-it-4bit`` dense variant. The test drives
 :meth:`MlxLmBackend.generate_chat_completion_with_tools` with a
-`get_weather` schema, iterates the agentic loop, and asserts the
-code path executes cleanly.
+``get_weather`` schema, iterates the agentic loop, and asserts the
+model's tool call is parsed and surfaced.
 
-Gemma-4's tool-call idiom (``<|tool_call>call:NAME{...}<tool_call|>``)
-is *not* currently recognised by
-:func:`core.inference._tool_call_parser.parse_tool_calls_from_text`
-— the shared parser targets the ``<tool_call>{...}</tool_call>``
-Qwen/Bonsai/Hermes dialect. If / when the model emits a Gemma-style
-call, the parser will pass the turn through as plain text, the loop
-will terminate with a final content turn, and the test still covers
-the "Gemma-4 load + exercise tool code path + unload" contract.
-
-This is the "code path exercised" fallback documented in the
-chunk-H-2 task contract — chasing prompt engineering or extending
-the parser to a new dialect is out of scope for the matrix-closure
-pass. The gap is tracked in ``docs/chunk-h2-matrix/blockers.md``.
+Gemma-4's tool-call idiom ``<|tool_call>call:NAME{...}<tool_call|>``
+is recognised by :func:`core.inference._tool_call_parser.parse_tool_calls_from_text`
+as of the B3 closure — the shared parser gained a Gemma-4 dialect
+alongside the Qwen/Bonsai JSON dialect and the Claude/Mistral XML
+dialect.
 
 Gated on:
 
@@ -61,25 +53,19 @@ _PLATFORM_OK = (
 def test_gemma_e4b_tool_loop_exercises_code_path(monkeypatch):
     """Load Gemma-4 E4B, pass a ``get_weather`` schema through
     :meth:`generate_chat_completion_with_tools`, and assert the
-    agentic loop runs to completion without raising.
+    agentic loop parses the model's Gemma-dialect tool call.
 
-    Primary (aspirational) assertion: a ``tool_start`` event is
-    emitted with ``tool_name="get_weather"`` and arguments mentioning
-    ``"Paris"``. This requires the shared parser to recognise Gemma-4's
-    ``<|tool_call>`` idiom (it currently doesn't) AND the model to
-    actually emit a tool call rather than prose. If either condition
-    is unmet, we fall back to asserting:
+    With the B3 closure, the shared parser now recognises Gemma-4's
+    ``<|tool_call>call:NAME{...}<tool_call|>`` idiom. When the model
+    emits a tool call (which it does reliably for a clear
+    "Use the get_weather function" prompt), the loop fires a
+    ``tool_start`` event with ``tool_name="get_weather"`` and
+    arguments carrying the city name. The test asserts that contract.
 
-    1. The call executes without exception.
-    2. At least one ``metadata`` event lands with ``completion_tokens
-       >= 1`` (generation actually ran).
-    3. ``supports_tools`` was True at load time (the precondition for
-       `generate_chat_completion_with_tools` to accept the call).
-
-    Either outcome proves "Gemma-4 loaded + exercised the tool-call
-    code path end-to-end". Improving parser coverage to recognise
-    Gemma-4's idiom is a separate follow-up tracked in the blockers
-    doc; don't chase prompt engineering here.
+    If the model ever drifts into a prose-only response (small-model
+    variance on a prompt revision), the fallback assertions still
+    cover the load + loop + unload contract so regressions surface
+    rather than silently skipping.
     """
     from core.inference.mlx_lm import MlxLmBackend
 
@@ -186,20 +172,24 @@ def test_gemma_e4b_tool_loop_exercises_code_path(monkeypatch):
         f"tool_start/tool_end imbalance: {types}"
     )
 
-    # ── Aspirational assertion — soft, documented ──
-    # If the parser grows Gemma-4 support later, this branch becomes
-    # the real signal. Today it's effectively unreachable and the test
-    # passes via the code-path-exercised branch above.
-    tool_starts = [e for e in events if isinstance(e, dict) and e.get("type") == "tool_start"]
-    if tool_starts:
-        tc = tool_starts[0]
-        assert tc.get("tool_name") == "get_weather", (
-            f"unexpected tool_name: {tc.get('tool_name')!r}"
-        )
-        args = tc.get("arguments", "")
-        # arguments may be a dict or a JSON string — either way Paris
-        # should appear as the city value.
-        args_str = args if isinstance(args, str) else str(args)
-        assert "Paris" in args_str, (
-            f"tool_call arguments missing 'Paris': {args_str!r}"
-        )
+    # ── Real signal — parser recognises Gemma-4's dialect ──
+    # With the B3 closure, a get_weather call against a clear "use the
+    # function" prompt should reliably surface a tool_start event. Assert
+    # on its contents; if the model regresses to prose-only output, these
+    # assertions will fail loudly rather than silently skipping.
+    tool_starts = [
+        e for e in events if isinstance(e, dict) and e.get("type") == "tool_start"
+    ]
+    assert tool_starts, (
+        "expected at least one tool_start event; Gemma-4 emitted prose "
+        f"only. event types={types}"
+    )
+    tc = tool_starts[0]
+    assert tc.get("tool_name") == "get_weather", (
+        f"unexpected tool_name: {tc.get('tool_name')!r}"
+    )
+    args = tc.get("arguments", "")
+    args_str = args if isinstance(args, str) else str(args)
+    assert "Paris" in args_str, (
+        f"tool_call arguments missing 'Paris': {args_str!r}"
+    )
