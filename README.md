@@ -1,64 +1,72 @@
 # unsloth-studio-mlx
 
-**Development fork of [`unslothai/unsloth`](https://github.com/unslothai/unsloth) focused on MLX backend enablement for Unsloth Studio on Apple Silicon, plus cross-platform streaming / telemetry improvements that apply everywhere Studio runs.**
+> A development fork of [`unslothai/unsloth`](https://github.com/unslothai/unsloth). Everything here is destined for upstream via a single PR. The story of why this exists follows — then the upstream README below.
 
-This fork exists to stage a cohesive body of work — spanning backend streaming architecture, MLX tool-calling, telemetry UX, and cross-platform GPU sampling — before a single PR back to upstream. Everything here is destined for `unslothai/unsloth`; we track upstream continuously and will rebase before opening the PR.
+## How this started
 
-Development happens on the **`mlx-studio-enablement`** branch. The `main` branch here mirrors `unslothai/unsloth:main` — no direct commits.
+One afternoon we wanted to try Ternary Bonsai 8B locally. The model claims a lot for its 1.58-bit footprint and we had it running via LM Studio on an M-series Mac in minutes. The obvious next step was to drive it from Unsloth Studio — same interface, same chat history, full local UX.
 
-## What this fork adds on top of upstream
+It didn't go smoothly. Studio's MLX backend was a thin shell: no tool-calling, no vision, context length pinned at 4096 even when the model advertised 131K, no progress surface, and a model picker that labelled every MLX checkpoint as "Local" with no quant or size detail. The work started as "let's test Ternary Bonsai" and almost immediately became "let's make MLX a first-class backend."
 
-**MLX tool-calling (chat + agentic loop):**
-- `MlxVlmBackend.generate_chat_completion_with_tools` — full agentic tool loop for vision-language MLX models, mirroring `MlxLmBackend`'s shape (image_b64 passthrough on iteration 0, shared parser, hold-back semantics, per-tool timeout wrapper with responsive cancel).
-- 5-dialect tool-call parser covering JSON-in-`<tool_call>` (Qwen / Hermes / Bonsai), XML `<function=>`, Gemma-4 native `<|tool_call>call:…`, loose-JSON envelope fallback, and GLM-4/4.6/4.7 `<tool_call>name\n<arg_key>…`.
-- Gemma-4 channel-thought extraction (`<|channel>thought…<channel|>` → `reasoning_content`).
-- Globally-unique tool-call IDs across agentic iterations (fixes a reproducible assistant-ui crash on multi-iteration tool loops).
+This fork is what came out of that. Most of it is the MLX enablement itself. A surprising amount of it is the debugging infrastructure we built to chase bugs we didn't know existed when we started — and which turned out to be genuinely useful for any user of Studio, not just MLX users on Macs.
 
-**Streaming architecture — SSE health:**
-- 5-second SSE keepalive comments (`:ka\n\n`) during silent periods (tool execution, prompt re-eval) so browsers / reverse-proxies don't idle-close.
-- 15-second frontend inactivity watchdog that surfaces "connection stalled" rather than hanging forever.
-- Wall-clock-bounded `_fetch_page_text` with cancel_event propagation and explicit socket close to prevent CLOSE_WAIT leaks.
-- Structured `{"type":"progress","phase":…}` events for iteration boundaries ("Re-reading conversation…" / "Generating…" chips during the otherwise-opaque prompt-eval window).
+## What broke along the way, and what we did about it
 
-**Live telemetry — token counter + GPU sparkline:**
-- Dedicated `/ws/telemetry` WebSocket (separate from chat SSE) for session state, pre-filter token counts, and device-wide GPU stats.
-- Pre-filter token counter (counts raw tokens from `stream_generate` before hold-back, so the counter ticks during held-back reasoning).
-- GPU sparkline with severity color-coding (muted / amber / destructive bands at 50% / 85% thresholds) and a compact WifiOff badge when the telemetry stream goes silent.
+**The context length was a lie.** The MLX backend validation path was unconditionally clamping `min(native_context, n_ctx)` where the frontend was sending `n_ctx=4096` as a legacy default. On Ternary Bonsai that meant 4K of usable context on a 131K-capable model. Fix: route MLX through the same "0 = native" branch the frontend already used for GGUF. One-liner in hindsight; non-obvious until we realised the numbers the UI showed didn't match what the backend was doing.
 
-**Cross-platform GPU sampling (robust for 100K+ user base):**
-- macOS Apple Silicon: `IOReport` via ctypes (`/usr/lib/libIOReport.dylib`, no sudo — the mechanism `mactop` / `macmon` use).
-- Linux NVIDIA (incl. DGX Spark aarch64): `pynvml` with `nvidia-smi` subprocess fallback.
-- Linux AMD: `/sys/class/drm/card*/device/gpu_busy_percent`.
-- Linux Intel: sysfs engine busy counters.
-- Windows: `pynvml` primary, PDH (`\GPU Engine`) secondary for any-GPU coverage.
-- Platform-aware fallback chain with `STUDIO_TELEMETRY_GPU_SOURCE` override.
+**The model picker lied too.** MLX repos showed as "Local" with no badge, no quant, no size — while GGUF models got full detail. We built a proper MLX picker: detect repos via their naming conventions (`-MLX-Nbit`, `mlx-community/*`), enumerate sibling quants (2-bit, 4-bit, 6-bit, 8-bit, bf16), show them in the dropdown alongside GGUF with the same relevance bubbling, and make the loaded-model chip show the same detail (`MLX · 4bit · 19.5 GB`) as GGUF chips. Along the way we discovered the "Downloaded" section was hiding MLX models in chat-only mode because the gate had been written as `!chatOnly` when it should have been "only the plain HuggingFace PyTorch weights that can't run in chat-only." Fixed.
 
-**Model-picker parity:**
-- MLX repos surface alongside GGUF in the dropdown on Apple Silicon (search, download, load).
-- MLX variant picker (2 / 4 / 5 / 6 / 8-bit / bf16 sibling-repo enumeration across `unsloth/*-MLX-*` and `mlx-community/*` repos).
-- Loaded-model chip shows consistent `MLX · 4bit · 19.5 GB` detail for models from LM Studio / custom paths — parity with the existing GGUF chip.
+**Tool calling didn't work for any modern model.** Ternary Bonsai worked because it emits Qwen-style `<tool_call>{JSON}</tool_call>` and that was the one dialect Studio parsed. The moment we tried Gemma-4 E4B, nothing happened — Gemma emits `<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>` with unquoted keys and escaped-quote string delimiters. We wrote a Gemma-4 dialect parser. Then tried GLM-4.6V-Flash: *another* dialect, `<tool_call>name\n<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`. Another parser. Then the channel-thinking blocks (`<|channel>thought…<channel|>`). And the cases where the model emits unparseable JSON envelopes like `{"tool_name":"…","params":{…}}` that had to be recognised as a fallback dialect.
 
-**Feature-flag posture:**
-Every new surface is gated behind an env-var knob with a documented rollback value — see [`docs/env-vars.md`](docs/env-vars.md) for the full reference.
+By the end we had five tool-call dialects and a ~900-line parser. [A research agent confirmed what we already suspected](docs/chunk-h2-matrix/sglang-parser-migration.md): everyone else (vLLM, SGLang, mistral.rs) has arrived at the same per-family-parser architecture. The long-term path is to vendor SGLang's framework so we get ~20 families for free; that decision is documented for a future chunk.
 
-## Status
+**The UI got stuck after the second tool call, and the backend looked fine.** This one took the longest. Reports were "GPU idle but the chat is still thinking." Our first theory was an SSE transport issue — long silent periods during prompt re-eval, browsers idle-closing the connection. We built a 5-second SSE keepalive (racing the generator against a timeout with `asyncio.shield` so the generator doesn't get cancelled). Then a frontend 15-second inactivity watchdog. Then a thread-safety hotfix because our first keepalive implementation spun up concurrent `next(gen)` calls on the same Python generator, which isn't thread-safe and occasionally deadlocked. All of that was correct, but it wasn't the bug.
 
-- ~122 commits on `mlx-studio-enablement` vs upstream branchpoint.
-- Full backend test suite: +~400 new tests, all passing. Identical environmental failure set on `main` and this branch (flash-attn Linux, CUDA-gated GPU tests, etc. — not introduced by this fork).
-- Frontend TypeScript + build clean.
-- Verified end-to-end via Chrome preview against multiple real models (GLM-4.6V-Flash, Gemma-4 E4B, Ternary Bonsai, Qwen3-1.7B).
-- Deferred items documented: [`docs/chunk-h2-matrix/sglang-parser-migration.md`](docs/chunk-h2-matrix/sglang-parser-migration.md) (next-generation parser framework), plus follow-ups in [`docs/chunk-h2-matrix/parity-audit.md`](docs/chunk-h2-matrix/parity-audit.md).
+The actual bug only surfaced when we drove the full repro in Chrome via preview tools: opened DevTools, spawned an SSE-tee to capture the wire, forced a `New Chat` click, and caught this in the React error boundary:
+
+> `Duplicate key toolCallId-call_0 in tapResources`
+
+Our tool-call parser assigned IDs per-invocation (`call_0`, `call_1`, ...), and the agentic loop re-invoked it fresh every iteration. So iter=0's first tool call and iter=1's first tool call both arrived at assistant-ui with `toolCallId: "call_0"`. assistant-ui keys its active-tool-parts map by that ID. The second one crashed it. The error boundary swallowed the visible crash, but the state tree corrupted mid-stream and iter=2+ content got dropped. The keepalives and watchdog covered different failure modes that *didn't* exist in this code path; they're still correct, they just weren't *this* bug.
+
+The fix is a three-line counter that makes IDs globally unique across iterations. The debugging harness we built to find it — the Chrome preview driver, the SSE-tee hook, the DOM snapshot comparisons — turned out to be much more valuable than the original planned feature.
+
+**The UI gave no signal during the 30-second pauses.** During a tool execution, and then during the prompt re-eval after it, the stream produced zero bytes and the UI showed nothing. Even with keepalives fixing the transport layer, the *user* had no way to know anything was happening. So we added structured progress events — `{"type":"progress","phase":"prompt_eval"|"generating","iter":N}` — and rendered them as chips above the composer ("Re-reading conversation…" / "Generating…"). Additive to the SSE event set; external OpenAI clients ignore unknown event types. Zero intrusion, but the chat suddenly feels responsive during what used to be dead air.
+
+**We wanted to see the work happening.** The progress chip was honest but vague. The next question was: *how many tokens has the model actually produced?* So we instrumented the inner generation loop to count raw tokens *before* the parser's hold-back logic strips anything, and built a token-counter chip that shows `242 tok · 28.4 t/s · iter 0: 287 tok`. The "pre-filter" distinction matters — during reasoning that the parser holds back, the visible text isn't growing but the model is absolutely working. The counter ticks anyway. This told us we weren't stuck during multi-second silences; the model was just thinking.
+
+**And then we wanted to see the GPU.** A sparkline next to the stop button, classic `mactop` vibe. The first implementation used MLX's active-memory counter as a proxy and reported a binary "100% while generating, 0% otherwise." Bad — pinned at 100% for whole tool-call-loop sessions, conveys nothing. We went down the `mactop` rabbit hole, discovered it uses Apple's private `IOReport.framework` via CGO, reverse-engineered the Go binding, and wrote a pure-Python ctypes equivalent against `/usr/lib/libIOReport.dylib`. No sudo, no entitlements, matches `powermetrics` to the tenth of a percent. With severity colour bands at 50% and 85% the chart actually says something: idle-ish while Chrome composits the UI, spikes to red when inference starts, drops back.
+
+Then we thought about the 100K+ non-Mac users and added `pynvml` for NVIDIA (covers Linux x86_64, Linux aarch64 — the DGX Spark case — WSL, and Windows in one package), plus AMD sysfs (`gpu_busy_percent`), Intel sysfs engine counters, and Windows PDH as the any-GPU fallback. Each backend is a 30-60 line probe + reader behind a platform-aware dispatch chain. The sparkline still hides gracefully when no backend succeeds. And when the telemetry WebSocket drops or goes silent for >10s, the chip collapses to a `WifiOff` badge — because a chart showing frozen data is worse than a chart showing "disconnected."
+
+**The debugging harness is now a product feature.** The token counter, the GPU sparkline, the progress chips, the WebSocket telemetry endpoint — we built them to see what was happening while we chased the `Duplicate key` ghost. They ended up being the most-visible UX improvements in this chunk, because they answer the question every user of a local inference tool has looking at a spinning icon: *is anything actually happening?* The answer is now: "yes, at 28.4 t/s on a GPU that's 97% busy in iter=2 of the agentic loop, 1234 tokens produced."
+
+## What's in the fork (tl;dr)
+
+If the story above was too long, here's the shape of it:
+
+- **Full MLX tool-calling** — agentic loops on both `MlxLmBackend` and `MlxVlmBackend`, 5-dialect parser (Qwen / Claude-XML / Gemma-4 / loose-JSON / GLM-4), Gemma-4 channel-thought extraction, globally-unique tool-call IDs across iterations.
+- **SSE keepalive + inactivity watchdog** — no more idle-closed streams during long tool executions.
+- **Structured progress events** — `prompt_eval` / `generating` chips during the otherwise-opaque silent periods.
+- **Live telemetry WebSocket** — `/ws/telemetry` carries GPU stats, session state, pre-filter token counts; separate from chat SSE so it outlives turns and fans out to multiple tabs.
+- **GPU sparkline** — real utilisation on every platform Studio runs on: IOReport on Apple Silicon, `pynvml` on NVIDIA anywhere, AMD/Intel sysfs on Linux, PDH on Windows. Severity colour bands. Disconnected badge when the stream dies.
+- **Pre-filter token counter** — counts raw tokens from the generator before hold-back mutation; keeps ticking during held-back reasoning.
+- **Model picker parity** — MLX quants alongside GGUF in search, variant picker for sibling repos, loaded-model chip shows `MLX · 4bit · 19.5 GB`.
+- **Hardened fetch path** — `_fetch_page_text` with wall-clock deadline, `cancel_event` propagation, explicit socket close — fixes a CLOSE_WAIT leak we found by accident.
+- **Every new surface is feature-flagged** — documented with rollback values in [`docs/env-vars.md`](docs/env-vars.md).
+
+## Honest status
+
+~122 commits on `mlx-studio-enablement` vs the branchpoint. Full backend test suite adds ~400 tests; 965 pass, 22 environmental failures that match `unslothai/unsloth:main` exactly (flash-attn Linux, CUDA-gated GPU tests, pre-existing vision cache). Frontend TypeScript + build clean. Verified end-to-end via Chrome preview against GLM-4.6V-Flash, Gemma-4 E4B, Ternary Bonsai, and Qwen3-1.7B — which is how several of the bugs above got found.
+
+Deferred follow-ups are documented, not silently skipped:
+- [`docs/chunk-h2-matrix/sglang-parser-migration.md`](docs/chunk-h2-matrix/sglang-parser-migration.md) — the next-generation parser architecture
+- [`docs/chunk-h2-matrix/parity-audit.md`](docs/chunk-h2-matrix/parity-audit.md) — smaller P1/P2 gaps (VLM passthrough, MlxAudio hf_variant, GGUF LoRA, etc.)
 
 ## Relationship to upstream
 
-- Canonical Unsloth development: [`unslothai/unsloth`](https://github.com/unslothai/unsloth).
-- This repo's `main` branch mirrors upstream; no drift.
-- All work lands on `mlx-studio-enablement`. When upstream reviewers are ready, we'll rebase on latest `unslothai/unsloth:main` and open the PR.
-- License: inherited from upstream. Studio-specific source is AGPL-3.0 (see `studio/LICENSE.AGPL-3.0`); other paths retain their original licenses.
+Canonical Unsloth development lives at [`unslothai/unsloth`](https://github.com/unslothai/unsloth). The `main` branch here is a pristine mirror; `mlx-studio-enablement` (the default branch you're reading this on) is where the work is. License is inherited unchanged — Studio source stays AGPL-3.0, upstream paths keep their licenses. When upstream reviewers are ready, we'll rebase on latest `main` and open one PR.
 
-## Installing / running
-
-Same as upstream — follow the instructions below. The MLX enhancements in this fork are additive: macOS Apple Silicon users get the new MLX picker + chip detail + IOReport GPU sampling; other platforms get the cross-platform GPU sampling and the streaming keepalive / telemetry improvements.
+Install instructions are the same as upstream — see the Unsloth README below.
 
 ---
 
