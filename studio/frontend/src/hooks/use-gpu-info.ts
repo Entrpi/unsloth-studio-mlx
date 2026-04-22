@@ -8,6 +8,13 @@ export interface GpuInfo {
   name: string;
   memoryTotalGb: number;
   systemRamAvailableGb: number;
+  /**
+   * True iff the backend reported this host can run MLX (Apple Silicon
+   * macOS). Used by the model picker to decide whether to surface MLX
+   * quant suggestions — on Linux / Windows / DGX Spark the MLX sections
+   * are hidden entirely since the weights couldn't be loaded anyway.
+   */
+  isAppleSilicon: boolean;
 }
 
 const DEFAULT_GPU: GpuInfo = {
@@ -15,6 +22,7 @@ const DEFAULT_GPU: GpuInfo = {
   name: "Unknown",
   memoryTotalGb: 0,
   systemRamAvailableGb: 0,
+  isAppleSilicon: false,
 };
 
 // Module-level cache so multiple components share one fetch.
@@ -31,7 +39,12 @@ async function fetchGpuOnce(): Promise<GpuInfo> {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const gpuData = data?.gpu;
-      if (!gpuData?.available || !gpuData.devices?.length) return DEFAULT_GPU;
+      if (!gpuData?.available || !gpuData.devices?.length) {
+        // Even when no GPU is present, preserve the Apple Silicon signal
+        // so the picker can gate MLX rows correctly in edge cases (e.g.
+        // Metal disabled, headless Mac).
+        return { ...DEFAULT_GPU, isAppleSilicon: Boolean(data?.is_apple_silicon) };
+      }
       const devices = gpuData.devices as Array<{ name?: string; memory_total_gb?: number }>;
       const totalGb = devices.reduce((sum, d) => sum + (d.memory_total_gb ?? 0), 0);
       const info: GpuInfo = {
@@ -39,6 +52,7 @@ async function fetchGpuOnce(): Promise<GpuInfo> {
         name: devices[0]?.name ?? "Unknown",
         memoryTotalGb: totalGb,
         systemRamAvailableGb: data?.memory?.available_gb ?? 0,
+        isAppleSilicon: Boolean(data?.is_apple_silicon),
       };
       cachedGpu = info;
       return info;

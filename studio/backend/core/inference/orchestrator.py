@@ -86,6 +86,10 @@ class InferenceOrchestrator:
         self._static_models = get_default_models()
         self._top_gguf_cache: Optional[list[str]] = None
         self._top_hub_cache: Optional[list[str]] = None
+        # MLX cache — populated only on Apple Silicon Darwin. Drawn from
+        # both unsloth/*MLX* and mlx-community/*. None on non-Apple-Silicon
+        # hosts so the frontend knows to hide MLX entries from suggestions.
+        self._top_mlx_cache: Optional[list[str]] = None
         self._top_models_ready = threading.Event()
 
         # Version tracking for subprocess reuse
@@ -103,26 +107,67 @@ class InferenceOrchestrator:
     # Default models (top GGUFs fetched dynamically from HF)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_apple_silicon() -> bool:
+        """True iff the host can run MLX (Apple Silicon macOS).
+
+        Mirrors ``MlxLmBackend._platform_ok`` so we only surface MLX
+        suggestions on machines that can actually load them — DGX Spark
+        (aarch64 Linux) is correctly rejected.
+        """
+        import sys
+        import platform as _platform
+
+        return sys.platform == "darwin" and _platform.machine().lower() in (
+            "arm64",
+            "aarch64",
+        )
+
+    @staticmethod
+    def _is_mlx_repo_id(repo_id: str) -> bool:
+        """Detect MLX repos by naming convention.
+
+        Mirrors the frontend ``isMlxRepo`` heuristic. MLX has no universal
+        suffix but these conventions cover essentially every
+        unsloth / mlx-community / lmstudio-community upload:
+
+        - ``-mlx-Nbit`` / ``-MLX-Nbit`` quant suffix.
+        - ``mlx-community/`` org prefix (unquantized bf16 weights).
+        - ``-MLX-`` anywhere in the slug.
+        """
+        import re as _re
+
+        if not repo_id:
+            return False
+        if repo_id.lower().startswith("mlx-community/"):
+            return True
+        if _re.search(r"-MLX(?:-|$)", repo_id, _re.IGNORECASE):
+            return True
+        return False
+
     @property
     def default_models(self) -> list[str]:
         # Wait up to 5s for background HF fetch to finish
         self._top_models_ready.wait(timeout = 5)
         top_gguf = self._top_gguf_cache or []
         top_hub = self._top_hub_cache or []
+        top_mlx = self._top_mlx_cache or []
         # Curated static defaults first (editorial picks like new models),
-        # then HF download-ranked models to backfill.
+        # then HF download-ranked models to backfill. MLX lives between
+        # GGUF and the generic hub pool so search-bubbling interleaves
+        # MLX quants alongside GGUF quants of the same family.
         # Send extras so the frontend still has 4 per category
         # after removing already-downloaded models.
         result: list[str] = []
         seen: set[str] = set()
-        for m in self._static_models + top_gguf + top_hub:
+        for m in self._static_models + top_gguf + top_mlx + top_hub:
             if m not in seen:
                 result.append(m)
                 seen.add(m)
         return result
 
     def _fetch_top_models(self) -> None:
-        """Fetch top GGUF and non-GGUF repos from unsloth by downloads."""
+        """Fetch top GGUF, MLX, and non-GGUF repos from unsloth + mlx-community."""
         try:
             import httpx
 
@@ -132,22 +177,29 @@ class InferenceOrchestrator:
                     "author": "unsloth",
                     "sort": "downloads",
                     "direction": "-1",
-                    "limit": "80",
+                    "limit": "120",
                 },
                 timeout = 15,
             )
             if resp.status_code == 200:
                 models = resp.json()
-                # Top 40 GGUFs - frontend pages through them on-demand via
+                # Top GGUFs — frontend pages through them on-demand via
                 # infinite scroll, so we send a deep pool.
                 gguf_ids = [
                     m["id"] for m in models if m.get("id", "").upper().endswith("-GGUF")
                 ][:40]
-                # Top 40 non-GGUF hub models
+                # Unsloth MLX (``-MLX-Nbit`` / ``-MLX`` slug).
+                unsloth_mlx_ids = [
+                    m["id"]
+                    for m in models
+                    if self._is_mlx_repo_id(m.get("id", ""))
+                ][:30]
+                # Top non-GGUF, non-MLX hub models for the generic pool.
                 hub_ids = [
                     m["id"]
                     for m in models
                     if not m.get("id", "").upper().endswith("-GGUF")
+                    and not self._is_mlx_repo_id(m.get("id", ""))
                 ][:40]
                 if gguf_ids:
                     self._top_gguf_cache = gguf_ids
@@ -155,6 +207,36 @@ class InferenceOrchestrator:
                 if hub_ids:
                     self._top_hub_cache = hub_ids
                     logger.info("Top hub models: %s", hub_ids)
+                # MLX is only meaningful on Apple Silicon; on everything
+                # else leave the cache as ``None`` so the frontend hides
+                # the entries rather than shipping unreachable rows.
+                if self._is_apple_silicon():
+                    mlx_ids = list(unsloth_mlx_ids)
+                    try:
+                        community_resp = httpx.get(
+                            "https://huggingface.co/api/models",
+                            params = {
+                                "author": "mlx-community",
+                                "sort": "downloads",
+                                "direction": "-1",
+                                "limit": "30",
+                            },
+                            timeout = 15,
+                        )
+                        if community_resp.status_code == 200:
+                            for m in community_resp.json():
+                                rid = m.get("id", "")
+                                if rid and rid not in mlx_ids:
+                                    mlx_ids.append(rid)
+                    except Exception as e:
+                        # Offline / rate-limited — keep the unsloth MLX
+                        # entries we already have and log at debug.
+                        logger.debug(
+                            "mlx-community fetch failed: %s", e
+                        )
+                    if mlx_ids:
+                        self._top_mlx_cache = mlx_ids[:30]
+                        logger.info("Top MLX models: %s", self._top_mlx_cache)
         except Exception as e:
             logger.warning("Failed to fetch top models: %s", e)
         finally:

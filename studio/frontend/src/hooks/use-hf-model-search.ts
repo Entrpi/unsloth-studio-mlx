@@ -14,19 +14,26 @@ export interface HfModelResult {
   totalParams?: number;
   estimatedSizeBytes?: number;
   isGguf: boolean;
+  /** True when HF tagged the repo with ``mlx`` or the id matches MLX naming. */
+  isMlx?: boolean;
 }
 
-const EXCLUDED_TAGS = new Set([
+const BASE_EXCLUDED_TAGS = [
   "gptq",
   "awq",
   "exl2",
-  "mlx",
   "onnx",
   "openvino",
   "coreml",
   "tflite",
   "ctranslate2",
-]);
+];
+// "mlx" is excluded by default because on non-Apple-Silicon hosts MLX
+// weights can't load anyway. On Apple Silicon the picker opts in via
+// ``includeMlx`` so MLX rows bubble alongside GGUF matches. Kept in a
+// single source of truth to avoid drift.
+const EXCLUDED_TAGS = new Set([...BASE_EXCLUDED_TAGS, "mlx"]);
+const EXCLUDED_TAGS_WITH_MLX = new Set(BASE_EXCLUDED_TAGS);
 
 // Embedding / sentence-transformer models ship with onnx/openvino as additional
 // export formats — they should not be excluded by the tag check above.
@@ -77,7 +84,8 @@ function estimateSizeFromDtypes(
   return total > 0 ? total : undefined;
 }
 
-function makeMapModel(excludeGguf: boolean) {
+function makeMapModel(excludeGguf: boolean, includeMlx: boolean) {
+  const excluded = includeMlx ? EXCLUDED_TAGS_WITH_MLX : EXCLUDED_TAGS;
   return (raw: unknown): HfModelResult | null => {
     const m = raw as {
       name: string;
@@ -87,7 +95,7 @@ function makeMapModel(excludeGguf: boolean) {
       tags?: string[];
     };
     const isEmbedding = m.tags?.some((t) => EMBEDDING_TAGS.has(t));
-    if (!isEmbedding && m.tags?.some((t) => EXCLUDED_TAGS.has(t))) {
+    if (!isEmbedding && m.tags?.some((t) => excluded.has(t))) {
       return null;
     }
     const isGguf =
@@ -96,6 +104,10 @@ function makeMapModel(excludeGguf: boolean) {
     if (excludeGguf && isGguf) {
       return null;
     }
+    const isMlx =
+      Boolean(m.tags?.some((tag) => tag.toLowerCase() === "mlx")) ||
+      /-MLX(?:-|$)/i.test(m.name) ||
+      m.name.toLowerCase().startsWith("mlx-community/");
     return {
       id: m.name,
       downloads: m.downloads,
@@ -103,6 +115,7 @@ function makeMapModel(excludeGguf: boolean) {
       totalParams: m.safetensors?.total,
       estimatedSizeBytes: estimateSizeFromDtypes(m.safetensors?.parameters),
       isGguf,
+      isMlx,
     };
   };
 }
@@ -269,10 +282,23 @@ export function useHfModelSearch(
     task?: PipelineType;
     accessToken?: string;
     excludeGguf?: boolean;
+    /**
+     * When true, ``mlx`` tag / naming is kept in search results so MLX
+     * repos bubble to the top alongside GGUF matches. Callers should set
+     * this on Apple Silicon hosts only; on other platforms MLX rows are
+     * filtered out since the weights couldn't be loaded anyway.
+     */
+    includeMlx?: boolean;
     priorityIds?: readonly string[];
   },
 ) {
-  const { task, accessToken, excludeGguf = false, priorityIds } = options ?? {};
+  const {
+    task,
+    accessToken,
+    excludeGguf = false,
+    includeMlx = false,
+    priorityIds,
+  } = options ?? {};
 
   // Parse publisher detection once and share between the iterator factory
   // and the secondary sort gate (avoids duplicating the regex + logic).
@@ -314,7 +340,10 @@ export function useHfModelSearch(
     [trimmed, searchQuery, pinnedId, task, accessToken, priorityIds],
   );
 
-  const mapModel = useMemo(() => makeMapModel(excludeGguf), [excludeGguf]);
+  const mapModel = useMemo(
+    () => makeMapModel(excludeGguf, includeMlx),
+    [excludeGguf, includeMlx],
+  );
   const search = useHfPaginatedSearch(createIter, mapModel);
 
   // Secondary sort guarantee: unsloth models always float to the top.

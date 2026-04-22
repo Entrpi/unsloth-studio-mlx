@@ -10,6 +10,7 @@ import type {
   ListModelsResponse,
   LoadModelRequest,
   LoadModelResponse,
+  MlxVariantsResponse,
   OpenAIChatChunk,
   OpenAIChatCompletionsRequest,
   UnloadModelRequest,
@@ -305,6 +306,16 @@ export async function listGgufVariants(
   if (hfToken) params.set("hf_token", hfToken);
   const response = await authFetch(`/api/models/gguf-variants?${params}`);
   return parseJsonOrThrow<GgufVariantsResponse>(response);
+}
+
+export async function listMlxVariants(
+  repoId: string,
+  hfToken?: string,
+): Promise<MlxVariantsResponse> {
+  const params = new URLSearchParams({ repo_id: repoId });
+  if (hfToken) params.set("hf_token", hfToken);
+  const response = await authFetch(`/api/models/mlx-variants?${params}`);
+  return parseJsonOrThrow<MlxVariantsResponse>(response);
 }
 
 function parseSseEvent(rawEvent: string): string[] {

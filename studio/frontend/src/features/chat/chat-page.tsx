@@ -500,6 +500,12 @@ export function ChatPage(): ReactElement {
   const activeGgufVariant = useChatRuntimeStore(
     (state) => state.activeGgufVariant,
   );
+  const activeHfVariant = useChatRuntimeStore(
+    (state) => state.activeHfVariant,
+  );
+  const activeBackendKind = useChatRuntimeStore(
+    (state) => state.activeBackendKind,
+  );
   const ggufContextLength = useChatRuntimeStore(
     (state) => state.ggufContextLength,
   );
@@ -849,6 +855,8 @@ export function ChatPage(): ReactElement {
                 loraModels={loraModels}
                 value={inferenceParams.checkpoint}
                 activeGgufVariant={activeGgufVariant}
+                activeHfVariant={activeHfVariant}
+                activeBackendKind={activeBackendKind}
                 onValueChange={handleCheckpointChange}
                 onEject={handleEject}
                 onFoldersChange={refreshLocalModels}

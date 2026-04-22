@@ -344,6 +344,17 @@ class LoadResponse(BaseModel):
         None,
         description = "Active speculative decoding mode (e.g. 'ngram-simple', 'ngram-mod'), or None if disabled",
     )
+    hf_variant: Optional[str] = Field(
+        None,
+        description = (
+            "Generic quant variant for the loaded model — populated for "
+            "both GGUF (e.g. 'Q4_K_M', 'UD-IQ1_S') and MLX "
+            "(e.g. '4bit', '8bit', 'mlx-2bit'). Used by the UI to render "
+            "the loaded-model chip with quant detail regardless of which "
+            "backend owns the model. ``gguf_variant`` remains populated "
+            "on ``InferenceStatusResponse`` for back-compat."
+        ),
+    )
 
 
 class UnloadResponse(BaseModel):
@@ -447,6 +458,14 @@ class InferenceStatusResponse(BaseModel):
     )
     gguf_variant: Optional[str] = Field(
         None, description = "GGUF quantization variant (e.g. Q4_K_M)"
+    )
+    hf_variant: Optional[str] = Field(
+        None,
+        description = (
+            "Generic quant variant for the active model — populated for "
+            "both GGUF and MLX backends. Used by the UI to render the "
+            "loaded-model chip with quant detail uniformly."
+        ),
     )
     is_audio: bool = Field(
         False, description = "Whether the active model is a TTS audio model"

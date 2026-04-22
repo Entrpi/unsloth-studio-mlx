@@ -17,6 +17,7 @@ import {
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useMemo, useState } from "react";
+import type { BackendKind } from "@/features/chat/types/api";
 import type {
   LoraModelOption,
   ModelOption,
@@ -32,6 +33,14 @@ interface ModelSelectorProps {
   value?: string;
   defaultValue?: string;
   activeGgufVariant?: string | null;
+  /**
+   * Generic quant variant (GGUF or MLX). Rendered on the trigger button
+   * so both backends get a consistent chip. Falls back to
+   * ``activeGgufVariant`` when unset so existing callers keep working.
+   */
+  activeHfVariant?: string | null;
+  /** Primary backend identifier so the chip's format badge is accurate. */
+  activeBackendKind?: BackendKind | null;
   onValueChange?: (value: string, meta: ModelSelectorChangeMeta) => void;
   onEject?: () => void;
   onFoldersChange?: () => void;
@@ -173,6 +182,8 @@ export function ModelSelector({
   value,
   defaultValue,
   activeGgufVariant,
+  activeHfVariant,
+  activeBackendKind,
   onValueChange,
   onEject,
   onFoldersChange,
@@ -199,12 +210,24 @@ export function ModelSelector({
       all.set(model.id, model);
     }
     for (const lora of loraModels) {
-      // Strip "/ suffix" from display name (e.g. "foo_123/foo" → "foo_123")
-      const displayName = lora.name.includes("/")
-        ? lora.name.split("/")[0].trim()
-        : lora.name;
-      // Show type tag instead of base model name
+      // Strip "/suffix" from display names like ``foo_123/foo`` →
+      // ``foo_123``. For LM Studio local entries whose ``name`` is the
+      // full ``author/repo`` (e.g. ``mlx-community/Llama-3.2-3B-Instruct-4bit``)
+      // keep the repo segment — the first segment is just an org name
+      // and would make the chip read "mlx-community" which is useless.
       const isLocal = lora.source === "local";
+      let displayName = lora.name;
+      if (displayName.includes("/")) {
+        const parts = displayName.split("/").map((s) => s.trim()).filter(Boolean);
+        if (isLocal && parts.length >= 2) {
+          // ``author/repo`` → ``repo``: the repo segment carries the
+          // quant suffix which the chip uses to render ``MLX · 4bit``.
+          displayName = parts[parts.length - 1];
+        } else {
+          // Legacy exported/trained naming: ``foo_123/foo`` → ``foo_123``
+          displayName = parts[0];
+        }
+      }
       const isTraining = lora.source === "training";
       const isExported = lora.source === "exported";
       const isMerged = lora.exportType === "merged";
@@ -232,12 +255,53 @@ export function ModelSelector({
   const currentModel = useMemo(() => {
     if (!selected) return undefined;
     const found = optionById.get(selected);
-    if (activeGgufVariant) {
-      const desc = `GGUF · ${activeGgufVariant}`;
-      return found ? { ...found, description: desc } : { id: selected, name: selected, description: desc };
+    // Chunk H-2 MLX parity — build the chip description from the
+    // active backend + the generic ``activeHfVariant`` so loaded MLX
+    // models get the same detail treatment as GGUF. We fall back to
+    // the legacy ``activeGgufVariant`` for backend builds that haven't
+    // rolled out ``hf_variant`` yet.
+    const kind = activeBackendKind ?? null;
+    const isMlxKind =
+      kind === "mlx" ||
+      kind === "mlx+lora" ||
+      kind === "mlx+vlm" ||
+      kind === "mlx+audio";
+    const isGgufKind = kind === "gguf";
+    const variant = activeHfVariant ?? activeGgufVariant ?? null;
+
+    // Prefer the pretty display name populated by the backend model list
+    // (``options`` map) over the full path identifier. When the user
+    // loads from a local path we want the repo-dir segment, not the
+    // whole ``/Users/.../mlx-community/foo`` path; the optionById entry
+    // usually already carries a cleaned ``name``.
+    let resolvedName = found?.name ?? selected;
+    if (!found) {
+      const tail = selected.split(/[\\/]/).filter(Boolean).pop();
+      if (tail) resolvedName = tail;
     }
-    return found ?? { id: selected, name: selected };
-  }, [selected, optionById, activeGgufVariant]);
+
+    let desc: string | undefined = found?.description;
+    if (variant && (isGgufKind || isMlxKind)) {
+      const formatTag = isGgufKind ? "GGUF" : "MLX";
+      desc = `${formatTag} · ${variant}`;
+    } else if (isMlxKind) {
+      // MLX load without an explicit variant (e.g. unquantized bf16) —
+      // still surface the backend tag so the chip doesn't read as
+      // "Local" for LM-Studio-originated MLX models.
+      desc = "MLX";
+    } else if (isGgufKind && !desc) {
+      desc = "GGUF";
+    }
+
+    if (found) return { ...found, name: resolvedName, description: desc };
+    return { id: selected, name: resolvedName, description: desc };
+  }, [
+    selected,
+    optionById,
+    activeGgufVariant,
+    activeHfVariant,
+    activeBackendKind,
+  ]);
 
   function handleSelect(id: string, meta: ModelSelectorChangeMeta) {
     if (onValueChange) {

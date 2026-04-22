@@ -108,6 +108,8 @@ from models.models import (
     BrowseFoldersResponse,
     GgufVariantDetail,
     GgufVariantsResponse,
+    MlxVariantDetail,
+    MlxVariantsResponse,
     ModelType,
     ScanFolderInfo,
     AddScanFolderRequest,
@@ -1896,6 +1898,101 @@ async def get_gguf_variants(
         raise HTTPException(
             status_code = 500,
             detail = f"Failed to list GGUF variants: {str(e)}",
+        )
+
+
+@router.get("/mlx-variants", response_model = MlxVariantsResponse)
+async def get_mlx_variants(
+    repo_id: str = Query(
+        ..., description = "HuggingFace MLX repo ID (e.g. 'unsloth/gemma-4-E4B-it-UD-MLX-4bit')"
+    ),
+    hf_token: Optional[str] = Query(
+        None, description = "HuggingFace token for private repos"
+    ),
+    current_subject: str = Depends(get_current_subject),
+):
+    """
+    List available MLX quant sibling repos for a given MLX repo id.
+
+    MLX quants live in separate repos per bit-width rather than as
+    sibling files (which is how GGUF organizes quants), so this endpoint
+    enumerates author-owned repos with matching base stems and different
+    bit-width suffixes.
+    """
+    try:
+        from utils.models.model_config import list_mlx_variants
+
+        if not _is_valid_repo_id(repo_id):
+            raise HTTPException(
+                status_code = 400, detail = f"Invalid repo_id format: {repo_id}"
+            )
+
+        variants = list_mlx_variants(repo_id, hf_token = hf_token)
+
+        # Default: prefer 4-bit when available (matches mlx-lm convention),
+        # otherwise fall back to the largest sibling.
+        default_variant: Optional[str] = None
+        if variants:
+            for v in variants:
+                if v.quant == "4bit":
+                    default_variant = v.quant
+                    break
+            if default_variant is None:
+                default_variant = variants[0].quant
+
+        # Check HF cache for each sibling to mark downloaded rows.
+        cached_bytes_by_repo: dict[str, int] = {}
+        try:
+            from huggingface_hub import constants as hf_constants
+
+            cache_dir = Path(hf_constants.HF_HUB_CACHE)
+            for v in variants:
+                target = f"models--{v.repo_id.replace('/', '--')}".lower()
+                for entry in cache_dir.iterdir():
+                    if entry.name.lower() == target:
+                        snapshots = entry / "snapshots"
+                        total = 0
+                        if snapshots.is_dir():
+                            for snap in snapshots.iterdir():
+                                for f in snap.rglob("*.safetensors"):
+                                    try:
+                                        total += f.stat().st_size
+                                    except OSError:
+                                        pass
+                        cached_bytes_by_repo[v.repo_id] = total
+                        break
+        except Exception:
+            pass
+
+        def _is_downloaded(v) -> bool:
+            cached = cached_bytes_by_repo.get(v.repo_id, 0)
+            if cached == 0 or v.size_bytes == 0:
+                return False
+            return cached >= v.size_bytes * 0.99
+
+        return MlxVariantsResponse(
+            repo_id = repo_id,
+            variants = [
+                MlxVariantDetail(
+                    repo_id = v.repo_id,
+                    quant = v.quant,
+                    size_bytes = v.size_bytes,
+                    downloaded = _is_downloaded(v),
+                )
+                for v in variants
+            ],
+            default_variant = default_variant,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error listing MLX variants for '{repo_id}': {e}", exc_info = True
+        )
+        raise HTTPException(
+            status_code = 500,
+            detail = f"Failed to list MLX variants: {str(e)}",
         )
 
 

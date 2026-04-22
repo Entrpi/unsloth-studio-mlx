@@ -300,6 +300,16 @@ async def get_system_info():
     # CPU & Memory
     memory = psutil.virtual_memory()
 
+    # Apple-Silicon signal for the frontend picker. Matches
+    # ``InferenceOrchestrator._is_apple_silicon`` and
+    # ``MlxLmBackend._platform_ok``: Darwin + arm64/aarch64 only,
+    # so aarch64 Linux (DGX Spark) is correctly excluded even though
+    # the machine type matches.
+    is_apple_silicon = (
+        sys.platform == "darwin"
+        and platform.machine().lower() in ("arm64", "aarch64")
+    )
+
     return {
         "platform": platform.platform(),
         "python_version": platform.python_version(),
@@ -307,6 +317,7 @@ async def get_system_info():
         # endpoint reports "rocm" on AMD hosts instead of "cuda", matching
         # the /api/hardware and /api/gpu-visibility endpoints.
         "device_backend": _backend_label(get_device()),
+        "is_apple_silicon": is_apple_silicon,
         "cpu_count": psutil.cpu_count(),
         "memory": {
             "total_gb": round(memory.total / 1e9, 2),

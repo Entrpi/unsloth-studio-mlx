@@ -111,6 +111,19 @@ export interface GgufVariantsResponse {
   default_variant: string | null;
 }
 
+export interface MlxVariantDetail {
+  repo_id: string;
+  quant: string;
+  size_bytes: number;
+  downloaded?: boolean;
+}
+
+export interface MlxVariantsResponse {
+  repo_id: string;
+  variants: MlxVariantDetail[];
+  default_variant: string | null;
+}
+
 export interface LoadModelResponse {
   status: string;
   model: string;
@@ -153,6 +166,13 @@ export interface LoadModelResponse {
   cache_type_kv?: string | null;
   chat_template?: string | null;
   speculative_type?: string | null;
+  /**
+   * Generic quant variant for the loaded model. Populated for both
+   * GGUF (``"Q4_K_M"``, ``"UD-IQ1_S"``) and MLX (``"4bit"``, ``"8bit"``)
+   * backends so the UI can render the chip with quant detail regardless
+   * of which backend owns the model.
+   */
+  hf_variant?: string | null;
 }
 
 export interface UnloadModelRequest {
@@ -173,6 +193,8 @@ export interface InferenceStatusResponse {
   /** Chunk F (F2) — primary source of truth for which backend owns the active model. */
   backend_kind?: BackendKind | null;
   gguf_variant?: string | null;
+  /** Generic quant variant (GGUF or MLX). Symmetric with LoadModelResponse.hf_variant. */
+  hf_variant?: string | null;
   is_audio?: boolean;
   audio_type?: string | null;
   has_audio_input?: boolean;

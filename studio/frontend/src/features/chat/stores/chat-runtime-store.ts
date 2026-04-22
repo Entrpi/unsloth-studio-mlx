@@ -151,6 +151,14 @@ type ChatRuntimeStore = {
   hfToken: string;
   modelsError: string | null;
   activeGgufVariant: string | null;
+  /**
+   * Generic quant variant surfaced by the backend (``hf_variant``
+   * field on ``LoadModelResponse`` / ``InferenceStatusResponse``).
+   * Populated for both GGUF (mirrors ``activeGgufVariant``) and MLX
+   * (e.g. ``"4bit"`` / ``"mlx-2bit"``) so the chip has one read site
+   * regardless of which backend owns the active model.
+   */
+  activeHfVariant: string | null;
   // Phase 3/7/8 — model-settings controls that previously gated on
   // ``isGguf`` (KV cache dtype, speculative decoding, context-length
   // slider) also want to show for MLX. Track whether the active backend
@@ -270,6 +278,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   hfToken: loadString(HF_TOKEN_KEY, ""),
   modelsError: null,
   activeGgufVariant: null,
+  activeHfVariant: null,
   activeIsMlx: false,
   activeIsMlxVlm: false,
   activeIsMlxAudio: false,
@@ -363,6 +372,11 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
         checkpoint: modelId,
       },
       activeGgufVariant: ggufVariant ?? null,
+      // activeHfVariant mirrors the GGUF path here; the MLX path sets
+      // it explicitly from ``LoadResponse.hf_variant`` in
+      // ``use-chat-model-runtime.ts`` because MLX variants don't flow
+      // through ``setCheckpoint``'s ``ggufVariant`` argument.
+      activeHfVariant: ggufVariant ?? null,
     })),
   setActiveThreadId: (activeThreadId) => set({ activeThreadId, contextUsage: null }),
   setSettingsPanelOpen: (settingsPanelOpen) => set({ settingsPanelOpen }),
@@ -373,6 +387,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
         checkpoint: "",
       },
       activeGgufVariant: null,
+      activeHfVariant: null,
       activeIsMlx: false,
       activeIsMlxVlm: false,
       activeIsMlxAudio: false,

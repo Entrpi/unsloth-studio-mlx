@@ -1490,6 +1490,137 @@ def list_gguf_variants(
     return variants, has_vision
 
 
+# ── MLX sibling-repo variant discovery ────────────────────────────────
+# MLX quants live in SEPARATE repos per bit-width (not sibling files like
+# GGUF) so "listing variants" = enumerating sibling repos that share a
+# base stem.
+_MLX_QUANT_SUFFIX_RE = _re.compile(
+    r"-(UD-)?MLX-(\d+(?:\.\d+)?bit)$", _re.IGNORECASE
+)
+_MLX_COMMUNITY_SUFFIX_RE = _re.compile(r"-(\d+(?:\.\d+)?)bit$", _re.IGNORECASE)
+
+
+def _mlx_base_stem(repo_id: str) -> Optional[tuple[str, str]]:
+    """Split an MLX repo id into (author, base_stem) with quant stripped.
+
+    - ``"unsloth/gemma-4-E4B-it-UD-MLX-4bit"`` → ``("unsloth", "gemma-4-E4B-it-MLX")``
+    - ``"mlx-community/Qwen2.5-7B-Instruct-4bit"`` → ``("mlx-community", "Qwen2.5-7B-Instruct")``
+
+    Stem normalization drops ``-UD-`` so sibling matching covers both
+    ``foo-MLX-Nbit`` and ``foo-UD-MLX-Nbit`` naming.
+    """
+    if "/" not in repo_id:
+        return None
+    author, name = repo_id.split("/", 1)
+    m = _MLX_QUANT_SUFFIX_RE.search(name)
+    if m:
+        return author, name[: m.start()] + "-MLX"
+    if author.lower() == "mlx-community":
+        m2 = _MLX_COMMUNITY_SUFFIX_RE.search(name)
+        return author, name[: m2.start()] if m2 else name
+    return None
+
+
+@dataclass
+class MlxVariantInfo:
+    """A single MLX quantization variant (one sibling repo)."""
+
+    repo_id: str  # Full HF repo id
+    quant: str  # e.g. "4bit", "8bit", "bf16"
+    size_bytes: int  # sum of *.safetensors in the repo
+
+
+_MLX_TAIL_RE = _re.compile(r"^-?(\d+(?:\.\d+)?bit|bf16|fp16)$", _re.IGNORECASE)
+
+
+def list_mlx_variants(
+    repo_id: str,
+    hf_token: Optional[str] = None,
+) -> list[MlxVariantInfo]:
+    """Enumerate sibling MLX quant repos for a given MLX repo id.
+
+    Derives a base stem (quant suffix stripped), queries HF for repos
+    owned by the same author whose names start with the stem, and
+    returns one ``MlxVariantInfo`` per sibling. Ordered largest quant
+    first (bf16 / 8-bit / 6-bit / 4-bit / …). Size is the sum of
+    ``*.safetensors`` from ``model_info``.
+    """
+    import httpx
+    from huggingface_hub import model_info as hf_model_info
+
+    split = _mlx_base_stem(repo_id)
+    if split is None:
+        return []
+    author, stem = split
+
+    try:
+        resp = httpx.get(
+            "https://huggingface.co/api/models",
+            params = {"author": author, "search": stem, "limit": "60"},
+            timeout = 10,
+            headers = {"Authorization": f"Bearer {hf_token}"}
+            if hf_token
+            else {},
+        )
+        if resp.status_code != 200:
+            return []
+        candidates = resp.json()
+    except Exception:
+        return []
+
+    stem_lower = stem.lower()
+    # For unsloth ``...-MLX`` stems, also try ``...-UD-MLX`` so "Ultra
+    # Discrete" sibling repos show up alongside plain ``-MLX-Nbit``
+    # entries.
+    alt_prefixes = (
+        [stem_lower, stem_lower[:-4] + "-ud-mlx"]
+        if stem_lower.endswith("-mlx")
+        else [stem_lower]
+    )
+
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for m in candidates:
+        rid = m.get("id", "")
+        if "/" not in rid or rid in seen:
+            continue
+        _, name = rid.split("/", 1)
+        name_lower = name.lower()
+        prefix = next(
+            (p for p in alt_prefixes if name_lower.startswith(p)), None
+        )
+        if prefix is None:
+            continue
+        quant_match = _MLX_TAIL_RE.search(name[len(prefix):])
+        if not quant_match:
+            continue
+        seen.add(rid)
+        unique.append((rid, quant_match.group(1).lower()))
+
+    # Resolve sizes; any failure → 0 and the UI renders "— GB".
+    variants: list[MlxVariantInfo] = []
+    for rid, quant in unique:
+        size = 0
+        try:
+            info = hf_model_info(rid, token = hf_token, files_metadata = True)
+            for sib in info.siblings or []:
+                if (sib.rfilename or "").lower().endswith(".safetensors"):
+                    size += sib.size or 0
+        except Exception:
+            pass
+        variants.append(
+            MlxVariantInfo(repo_id = rid, quant = quant, size_bytes = size)
+        )
+
+    # Sort by bit-width descending; bf16 / fp16 float above any quant.
+    def _key(v: MlxVariantInfo) -> float:
+        m = _re.match(r"(\d+(?:\.\d+)?)bit", v.quant)
+        return -float(m.group(1)) if m else -999.0
+
+    variants.sort(key = _key)
+    return variants
+
+
 def _resolve_gguf_dir(p: Path) -> Optional[Path]:
     """Resolve a path to the directory containing GGUF variants.
 

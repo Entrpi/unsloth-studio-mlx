@@ -391,6 +391,12 @@ export function useChatModelRuntime() {
           activeIsMlxVlm: _statusKind === "mlx+vlm",
           activeIsMlxAudio: _statusKind === "mlx+audio",
           activeBackendKind: _statusKind,
+          // Status restore path: ``hf_variant`` is populated for GGUF
+          // (mirrors ``gguf_variant``) and MLX. Fall back to the legacy
+          // ``gguf_variant`` field for older backend builds so a stale
+          // client still renders the chip correctly.
+          activeHfVariant:
+            statusRes.hf_variant ?? statusRes.gguf_variant ?? null,
           ggufContextLength: currentGgufContextLength,
           ggufMaxContextLength,
           ggufNativeContextLength,
@@ -634,6 +640,13 @@ export function useChatModelRuntime() {
               activeIsMlxVlm: _loadKind === "mlx+vlm",
               activeIsMlxAudio: _loadKind === "mlx+audio",
               activeBackendKind: _loadKind,
+              // Chunk H-2 MLX parity — surface the backend-reported
+              // quant variant for chip display. For GGUF this is the
+              // same as ``activeGgufVariant`` (set by ``setCheckpoint``);
+              // for MLX it comes from ``LoadResponse.hf_variant`` which
+              // ``setCheckpoint`` doesn't know about.
+              activeHfVariant:
+                loadResponse.hf_variant ?? ggufVariant ?? null,
               ggufContextLength: nativeCtx,
               ggufMaxContextLength,
               ggufNativeContextLength: reportedNativeCtx,

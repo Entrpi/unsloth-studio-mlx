@@ -27,6 +27,7 @@ import {
   listCachedModels,
   listGgufVariants,
   listLocalModels,
+  listMlxVariants,
   listRecommendedFolders,
   listScanFolders,
   removeScanFolder,
@@ -36,7 +37,10 @@ import type {
   CachedModelRepo,
   LocalModelInfo,
 } from "@/features/chat/api/chat-api";
-import type { GgufVariantDetail } from "@/features/chat/types/api";
+import type {
+  GgufVariantDetail,
+  MlxVariantDetail,
+} from "@/features/chat/types/api";
 import {
   useDebouncedValue,
   useGpuInfo,
@@ -426,6 +430,168 @@ function GgufVariantExpander({
   );
 }
 
+// ── MLX Variant Expander ─────────────────────────────────────
+//
+// MLX quants live in *separate* HF repos per bit-width (unlike GGUF
+// which has sibling files in the same repo), so the expander fetches
+// sibling repos via ``/api/models/mlx-variants`` and offers each as a
+// standalone selection. Clicking a variant loads/downloads that repo.
+
+function MlxVariantExpander({
+  repoId,
+  onSelect,
+  gpuGb,
+  systemRamGb,
+  currentValue,
+}: {
+  repoId: string;
+  onSelect: (id: string, meta: ModelSelectorChangeMeta) => void;
+  gpuGb?: number;
+  systemRamGb?: number;
+  currentValue?: string;
+}) {
+  const [variants, setVariants] = useState<MlxVariantDetail[] | null>(null);
+  const [defaultVariant, setDefaultVariant] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let canceled = false;
+    setLoading(true);
+    setError(null);
+    listMlxVariants(repoId)
+      .then((res) => {
+        if (canceled) return;
+        setVariants(res.variants);
+        setDefaultVariant(res.default_variant);
+      })
+      .catch((err) => {
+        if (canceled) return;
+        setError(
+          err instanceof Error ? err.message : "Failed to load MLX variants",
+        );
+      })
+      .finally(() => {
+        if (!canceled) setLoading(false);
+      });
+    return () => {
+      canceled = true;
+    };
+  }, [repoId]);
+
+  // Same fit classification as GGUF but applied per MLX sibling repo
+  // (unified memory on Apple Silicon means CPU offload isn't a thing,
+  // so "tight" still means "will likely swap but may run").
+  const gpuBudgetGb = (gpuGb ?? 0) * 0.7;
+  const totalBudgetGb = gpuBudgetGb + (systemRamGb ?? 0) * 0.7;
+  const getMlxFit = useCallback(
+    (sizeBytes: number): "fits" | "tight" | "oom" => {
+      if (!gpuGb || gpuGb <= 0) return "fits";
+      const gb = sizeBytes / 1024 ** 3;
+      if (gb <= 0 || gb <= gpuBudgetGb) return "fits";
+      if (gb <= totalBudgetGb) return "tight";
+      return "oom";
+    },
+    [gpuGb, gpuBudgetGb, totalBudgetGb],
+  );
+
+  const effectiveRecommended = useMemo(() => {
+    if (!variants || variants.length === 0) return defaultVariant;
+    if (!gpuGb || gpuGb <= 0) return defaultVariant;
+    const def = variants.find((v) => v.quant === defaultVariant);
+    if (def && getMlxFit(def.size_bytes) !== "oom") return defaultVariant;
+    const fitting = variants.filter((v) => getMlxFit(v.size_bytes) !== "oom");
+    if (fitting.length > 0) {
+      fitting.sort((a, b) => b.size_bytes - a.size_bytes);
+      return fitting[0].quant;
+    }
+    const sorted = [...variants].sort((a, b) => a.size_bytes - b.size_bytes);
+    return sorted[0].quant;
+  }, [variants, defaultVariant, gpuGb, getMlxFit]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 px-5 py-2">
+        <Spinner className="size-3 text-muted-foreground" />
+        <span className="text-xs text-muted-foreground">Loading MLX variants…</span>
+      </div>
+    );
+  }
+  if (error) {
+    return <div className="px-5 py-2 text-xs text-destructive">{error}</div>;
+  }
+  if (!variants || variants.length === 0) {
+    return (
+      <div className="px-5 py-2 text-xs text-muted-foreground">
+        No MLX variants found.
+      </div>
+    );
+  }
+
+  return (
+    <div className="pl-4 border-l-2 border-accent/50 ml-3 my-1">
+      <div className="px-2 py-1 flex items-center gap-1.5">
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          MLX Quantizations
+        </span>
+      </div>
+      {variants.map((v) => {
+        const fit = getMlxFit(v.size_bytes);
+        const oom = fit === "oom";
+        const tight = fit === "tight";
+        return (
+          <button
+            key={v.repo_id}
+            type="button"
+            onClick={() =>
+              onSelect(v.repo_id, {
+                source: "hub",
+                isLora: false,
+                isDownloaded: v.downloaded ?? false,
+                expectedBytes: v.size_bytes,
+              })
+            }
+            className={cn(
+              "flex w-full min-w-0 items-center justify-between gap-2 rounded-[6px] px-2.5 py-1 text-left text-sm transition-colors hover:bg-[#ececec] dark:hover:bg-[#2e3035]",
+              currentValue === v.repo_id && "bg-[#ececec] dark:bg-[#2e3035]",
+            )}
+          >
+            <span className="min-w-0 flex-1 truncate font-mono text-xs">
+              <span className={cn(oom && "!text-gray-500 dark:!text-gray-400")}>
+                {v.quant}
+              </span>
+              {v.downloaded ? (
+                <span className="ml-1.5 text-[9px] font-sans font-medium text-green-400">
+                  downloaded
+                </span>
+              ) : v.quant === effectiveRecommended ? (
+                <span className="ml-1.5 text-[9px] font-sans font-medium text-primary/70">
+                  recommended
+                </span>
+              ) : null}
+            </span>
+            <span className="flex items-center gap-1.5 shrink-0">
+              {oom && (
+                <span className="text-[9px] font-medium !text-red-700 !bg-red-50 dark:!text-red-400 dark:!bg-red-950 px-1.5 py-0.5 rounded">
+                  OOM
+                </span>
+              )}
+              {tight && (
+                <span className="text-[9px] font-medium !text-amber-400">
+                  TIGHT
+                </span>
+              )}
+              <span className="text-[10px] text-muted-foreground">
+                {formatBytes(v.size_bytes)}
+              </span>
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── Detect GGUF repos by naming convention or hub tag ────────────────────
 
 function hasGgufSuffix(id: string): boolean {
@@ -504,8 +670,15 @@ export function HubModelPicker({
   const gpu = useGpuInfo();
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query);
-  const { results, isLoading, isLoadingMore, fetchMore } =
-    useHfModelSearch(debouncedQuery);
+  // MLX rows are only useful on Apple Silicon — on everything else the
+  // weights can't load anyway, so we keep the default HF tag exclusion
+  // and hide MLX entries in the picker. DGX Spark (aarch64 Linux) falls
+  // into the "hide" bucket because ``isAppleSilicon`` is Darwin-only.
+  const includeMlx = gpu.isAppleSilicon;
+  const { results, isLoading, isLoadingMore, fetchMore } = useHfModelSearch(
+    debouncedQuery,
+    { includeMlx },
+  );
 
   // Sets of lowercased repo ids that the store or HF search have
   // confirmed are GGUF. Absence means "no hint" and lets hasGgufSuffix
@@ -539,8 +712,45 @@ export function HubModelPicker({
     [modelGgufIds, resultGgufIds],
   );
 
+  // Same treatment for MLX: pool hints from both the store-provided
+  // ``models`` list (backend-driven) and the live HF search results so
+  // MLX rows can be identified even before the picker knows about them.
+  const modelMlxIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const model of models) {
+      const mk = model.backendKind;
+      if (
+        mk === "mlx" ||
+        mk === "mlx+lora" ||
+        mk === "mlx+vlm" ||
+        mk === "mlx+audio"
+      ) {
+        ids.add(model.id.toLowerCase());
+      }
+    }
+    return ids;
+  }, [models]);
+  const resultMlxIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const result of results) {
+      if (result.isMlx) ids.add(result.id.toLowerCase());
+    }
+    return ids;
+  }, [results]);
+  const isKnownMlxRepo = useCallback(
+    (id: string): boolean => {
+      if (!includeMlx) return false;
+      const key = id.toLowerCase();
+      if (modelMlxIds.has(key) || resultMlxIds.has(key)) return true;
+      return isMlxRepo(id);
+    },
+    [modelMlxIds, resultMlxIds, includeMlx],
+  );
+
   // Track which GGUF repo is expanded for variant selection
   const [expandedGguf, setExpandedGguf] = useState<string | null>(null);
+  // MLX expands into a sibling-repo picker (different repo per quant).
+  const [expandedMlx, setExpandedMlx] = useState<string | null>(null);
 
   // Delete confirmation dialog state
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
@@ -740,8 +950,20 @@ export function HubModelPicker({
   const recommendedIds = useMemo(() => {
     const all = dedupe([...models.map((model) => model.id), value ?? ""])
       .filter((id) => !downloadedSet.has(id.toLowerCase()))
-      .filter((id) => !chatOnly || isKnownGgufRepo(id))
-      .filter((id) => !/-FP8[-.]|FP8-Dynamic/i.test(id));
+      // chat-only surface keeps GGUF + (on Apple Silicon) MLX. On
+      // non-Apple-Silicon MLX ids are already stripped upstream by the
+      // orchestrator, so no extra filter needed here.
+      .filter(
+        (id) =>
+          !chatOnly ||
+          isKnownGgufRepo(id) ||
+          (includeMlx && isKnownMlxRepo(id)),
+      )
+      .filter((id) => !/-FP8[-.]|FP8-Dynamic/i.test(id))
+      // Hide MLX rows entirely on non-Apple-Silicon hosts even if the
+      // backend somehow emitted them (defensive — the orchestrator
+      // cache is gated on the same predicate).
+      .filter((id) => includeMlx || !isMlxRepo(id));
     // Sort: GGUFs first, then hub models
     const gguf: string[] = [];
     const hub: string[] = [];
@@ -796,8 +1018,17 @@ export function HubModelPicker({
     const ids = showHfSection
       ? [...new Set([...visibleRecommendedIds, ...filteredRecommendedIds])]
       : visibleRecommendedIds;
-    return ids.filter((id) => !isKnownGgufRepo(id));
-  }, [visibleRecommendedIds, showHfSection, filteredRecommendedIds, isKnownGgufRepo]);
+    // Skip GGUF and MLX rows — both display a static format badge and
+    // don't need VRAM estimation (GGUF is variant-chosen by the
+    // submenu; MLX quant size comes from the MLX variants endpoint).
+    return ids.filter((id) => !isKnownGgufRepo(id) && !isKnownMlxRepo(id));
+  }, [
+    visibleRecommendedIds,
+    showHfSection,
+    filteredRecommendedIds,
+    isKnownGgufRepo,
+    isKnownMlxRepo,
+  ]);
   const { paramCountById: recommendedParamCountById } =
     useRecommendedModelVram(idsForVram);
 
@@ -812,9 +1043,22 @@ export function HubModelPicker({
     return results
       .map((result) => result.id)
       .filter((id) => !recommendedSet.has(id))
-      .filter((id) => !chatOnly || isKnownGgufRepo(id))
+      .filter(
+        (id) =>
+          !chatOnly ||
+          isKnownGgufRepo(id) ||
+          (includeMlx && isKnownMlxRepo(id)),
+      )
       .filter((id) => !/-FP8[-.]|FP8-Dynamic/i.test(id));
-  }, [recommendedSet, results, showHfSection, chatOnly, isKnownGgufRepo]);
+  }, [
+    recommendedSet,
+    results,
+    showHfSection,
+    chatOnly,
+    isKnownGgufRepo,
+    includeMlx,
+    isKnownMlxRepo,
+  ]);
 
   const metricsById = useMemo(
     () =>
@@ -912,17 +1156,26 @@ export function HubModelPicker({
     };
   }, [recommendedSentinel, hasMoreRecommended, recommendedPage, scrollRef]);
 
-  /** Handle clicking a model row — GGUF repos expand, others load directly. */
+  /**
+   * Handle clicking a model row — GGUF and MLX repos expand to a
+   * variant submenu; all other repos load directly.
+   *
+   * Expanders are mutually exclusive: opening one closes the other so
+   * the dropdown never has two submenus visible at once.
+   */
   const handleModelClick = useCallback(
     (id: string) => {
       if (isKnownGgufRepo(id)) {
-        // Toggle GGUF variant expander
+        setExpandedMlx(null);
         setExpandedGguf((prev) => (prev === id ? null : id));
+      } else if (isKnownMlxRepo(id)) {
+        setExpandedGguf(null);
+        setExpandedMlx((prev) => (prev === id ? null : id));
       } else {
         onSelect(id, { source: "hub", isLora: false });
       }
     },
-    [onSelect, isKnownGgufRepo],
+    [onSelect, isKnownGgufRepo, isKnownMlxRepo],
   );
 
   return (
@@ -1296,27 +1549,25 @@ export function HubModelPicker({
               ) : (
                 visibleRecommendedIds.map((id) => {
                   const vram = recommendedVramMap.get(id);
+                  const isGguf = isKnownGgufRepo(id);
+                  const isMlx = !isGguf && isKnownMlxRepo(id);
                   return (
                     <div key={id}>
                       <ModelRow
                         label={id}
                         meta={
-                          isKnownGgufRepo(id)
+                          isGguf
                             ? "GGUF"
-                            : (vram?.detail ?? extractParamLabel(id))
+                            : isMlx
+                              ? "MLX"
+                              : (vram?.detail ?? extractParamLabel(id))
                         }
                         selected={value === id}
-                        onClick={() => {
-                          if (isKnownGgufRepo(id)) {
-                            setExpandedGguf((prev) => (prev === id ? null : id));
-                          } else {
-                            handleModelClick(id);
-                          }
-                        }}
+                        onClick={() => handleModelClick(id)}
                         vramStatus={
-                          isKnownGgufRepo(id) ? null : (vram?.status ?? null)
+                          isGguf || isMlx ? null : (vram?.status ?? null)
                         }
-                        vramEst={isKnownGgufRepo(id) ? undefined : vram?.est}
+                        vramEst={isGguf || isMlx ? undefined : vram?.est}
                         gpuGb={gpu.available ? gpu.memoryTotalGb : undefined}
                       />
                       {expandedGguf === id && (
@@ -1327,6 +1578,17 @@ export function HubModelPicker({
                           systemRamGb={
                             gpu.available ? gpu.systemRamAvailableGb : undefined
                           }
+                        />
+                      )}
+                      {expandedMlx === id && (
+                        <MlxVariantExpander
+                          repoId={id}
+                          onSelect={onSelect}
+                          gpuGb={gpu.available ? gpu.memoryTotalGb : undefined}
+                          systemRamGb={
+                            gpu.available ? gpu.systemRamAvailableGb : undefined
+                          }
+                          currentValue={value}
                         />
                       )}
                     </div>
@@ -1349,33 +1611,25 @@ export function HubModelPicker({
               <ListLabel icon={<StarIcon className="size-3" />}>Recommended</ListLabel>
               {filteredRecommendedIds.map((id) => {
                 const vram = recommendedVramMap.get(id);
+                const isGguf = isKnownGgufRepo(id);
+                const isMlx = !isGguf && isKnownMlxRepo(id);
                 return (
                   <div key={id}>
                     <ModelRow
                       label={id}
                       meta={
-                        isKnownGgufRepo(id)
+                        isGguf
                           ? "GGUF"
-                          : isMlxRepo(id)
-                            ? (() => {
-                                const size =
-                                  vram?.detail ?? extractParamLabel(id);
-                                return size ? `MLX · ${size}` : "MLX";
-                              })()
+                          : isMlx
+                            ? "MLX"
                             : (vram?.detail ?? extractParamLabel(id))
                       }
                       selected={value === id}
-                      onClick={() => {
-                        if (isKnownGgufRepo(id)) {
-                          setExpandedGguf((prev) => (prev === id ? null : id));
-                        } else {
-                          handleModelClick(id);
-                        }
-                      }}
+                      onClick={() => handleModelClick(id)}
                       vramStatus={
-                        isKnownGgufRepo(id) ? null : (vram?.status ?? null)
+                        isGguf || isMlx ? null : (vram?.status ?? null)
                       }
-                      vramEst={isKnownGgufRepo(id) ? undefined : vram?.est}
+                      vramEst={isGguf || isMlx ? undefined : vram?.est}
                       gpuGb={gpu.available ? gpu.memoryTotalGb : undefined}
                     />
                     {expandedGguf === id && (
@@ -1386,6 +1640,17 @@ export function HubModelPicker({
                         systemRamGb={
                           gpu.available ? gpu.systemRamAvailableGb : undefined
                         }
+                      />
+                    )}
+                    {expandedMlx === id && (
+                      <MlxVariantExpander
+                        repoId={id}
+                        onSelect={onSelect}
+                        gpuGb={gpu.available ? gpu.memoryTotalGb : undefined}
+                        systemRamGb={
+                          gpu.available ? gpu.systemRamAvailableGb : undefined
+                        }
+                        currentValue={value}
                       />
                     )}
                   </div>
@@ -1409,6 +1674,7 @@ export function HubModelPicker({
                 hfIds.map((id) => {
                   const vram = vramMap.get(id);
                   const isSearchGguf = isKnownGgufRepo(id);
+                  const isSearchMlx = !isSearchGguf && isKnownMlxRepo(id);
                   return (
                     <div key={id}>
                       <ModelRow
@@ -1416,26 +1682,16 @@ export function HubModelPicker({
                         meta={
                           isSearchGguf
                             ? "GGUF"
-                            : isMlxRepo(id)
-                              ? (() => {
-                                  const size =
-                                    metricsById.get(id) ?? extractParamLabel(id);
-                                  return size ? `MLX · ${size}` : "MLX";
-                                })()
+                            : isSearchMlx
+                              ? "MLX"
                               : (metricsById.get(id) ?? extractParamLabel(id))
                         }
                         selected={value === id}
-                        onClick={() => {
-                          if (isSearchGguf) {
-                            setExpandedGguf((prev) => (prev === id ? null : id));
-                          } else {
-                            handleModelClick(id);
-                          }
-                        }}
+                        onClick={() => handleModelClick(id)}
                         vramStatus={
-                          isSearchGguf ? null : (vram?.status ?? null)
+                          isSearchGguf || isSearchMlx ? null : (vram?.status ?? null)
                         }
-                        vramEst={isSearchGguf ? undefined : vram?.est}
+                        vramEst={isSearchGguf || isSearchMlx ? undefined : vram?.est}
                         gpuGb={gpu.available ? gpu.memoryTotalGb : undefined}
                       />
                       {expandedGguf === id && (
@@ -1446,6 +1702,17 @@ export function HubModelPicker({
                           systemRamGb={
                             gpu.available ? gpu.systemRamAvailableGb : undefined
                           }
+                        />
+                      )}
+                      {expandedMlx === id && (
+                        <MlxVariantExpander
+                          repoId={id}
+                          onSelect={onSelect}
+                          gpuGb={gpu.available ? gpu.memoryTotalGb : undefined}
+                          systemRamGb={
+                            gpu.available ? gpu.systemRamAvailableGb : undefined
+                          }
+                          currentValue={value}
                         />
                       )}
                     </div>

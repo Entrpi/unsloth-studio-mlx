@@ -192,6 +192,39 @@ class GgufVariantsResponse(BaseModel):
     )
 
 
+class MlxVariantDetail(BaseModel):
+    """A single MLX quantization sibling repo."""
+
+    repo_id: str = Field(
+        ..., description = "Full HuggingFace repo id for this MLX quant variant"
+    )
+    quant: str = Field(
+        ..., description = "Quantization label (e.g., '4bit', '8bit', 'bf16')"
+    )
+    size_bytes: int = Field(0, description = "Sum of safetensors file sizes")
+    downloaded: bool = Field(
+        False,
+        description = "Whether this variant is already in the local HF cache",
+    )
+
+
+class MlxVariantsResponse(BaseModel):
+    """Response for listing MLX quant variants across sibling HF repos.
+
+    Unlike GGUF, MLX quants live in separate repos per bit-width. The
+    UI uses this to offer 2-bit / 4-bit / 6-bit / 8-bit alternatives
+    when the user picks an MLX repo from the suggestions dropdown.
+    """
+
+    repo_id: str = Field(..., description = "Input HuggingFace repo ID")
+    variants: List[MlxVariantDetail] = Field(
+        default_factory = list, description = "Available MLX sibling repos"
+    )
+    default_variant: Optional[str] = Field(
+        None, description = "Recommended default quantization variant"
+    )
+
+
 class LocalModelInfo(BaseModel):
     """Discovered local model candidate."""
 
