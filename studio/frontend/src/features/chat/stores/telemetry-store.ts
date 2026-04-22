@@ -57,7 +57,19 @@ export interface SessionState {
 
 interface TelemetryStore {
   connected: boolean;
-  gpu: { samples: GpuSample[]; source: string | null };
+  gpu: {
+    samples: GpuSample[];
+    source: string | null;
+    /**
+     * Wall-clock ``Date.now()`` of the most recent sample we received.
+     * ``null`` when we've never received one (connection never
+     * established, or just opened). Drives staleness UI distinct from
+     * the ``connected`` flag — a live WS with a silent backend still
+     * looks broken to users, so we treat "no sample in N seconds" the
+     * same as "WS disconnected".
+     */
+    lastReceivedAt: number | null;
+  };
   sessions: Record<string, SessionState>;
 
   setConnected: (c: boolean) => void;
@@ -73,7 +85,7 @@ interface TelemetryStore {
 
 export const useTelemetryStore = create<TelemetryStore>((set) => ({
   connected: false,
-  gpu: { samples: [], source: null },
+  gpu: { samples: [], source: null, lastReceivedAt: null },
   sessions: {},
 
   setConnected: (connected) => set({ connected }),
@@ -84,7 +96,9 @@ export const useTelemetryStore = create<TelemetryStore>((set) => ({
       if (next.length > GPU_RING_SIZE) {
         next.splice(0, next.length - GPU_RING_SIZE);
       }
-      return { gpu: { samples: next, source } };
+      return {
+        gpu: { samples: next, source, lastReceivedAt: Date.now() },
+      };
     }),
 
   setSessionState: (sessionId, state, iteration) =>

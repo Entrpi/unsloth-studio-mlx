@@ -16,15 +16,25 @@
 // the auth-form helperText colour). Under 50 % we stay muted.
 
 import type { FC } from "react";
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { WifiOffIcon } from "lucide-react";
 import { useGpuSamples } from "../hooks/use-telemetry-socket";
 
 const WIDTH = 72;
 const HEIGHT = 18;
 const PAD = 1;
-// After this many ms of no samples, fade the chip out — the backend
-// sampler is best-effort and losing the stream for >10s is a reliable
-// "something is wrong" signal worth communicating visually.
+// After this many ms of no samples, collapse the chip to a
+// disconnected badge — the backend sampler emits at 2 Hz so >10s of
+// silence is always a real stream problem (crashed sampler, closed
+// WS, backend crash, process suspension). We distinguish between
+// two flavours of "not live":
+//   • source === "unavailable" → backend told us it can't sample,
+//     chip hides entirely (existing behaviour; platform doesn't
+//     support our probes).
+//   • connected === false OR Date.now() - lastReceivedAt > STALE_MS
+//     → telemetry stream genuinely broken; render a compact
+//     disconnected badge so the user knows the chip isn't lying to
+//     them with a frozen last-known value.
 const STALE_MS = 10_000;
 
 // Severity thresholds (percent). Anything in between 50 and 85 is
@@ -67,26 +77,59 @@ function buildPath(values: number[]): string {
 }
 
 export const GpuSparkline: FC = () => {
-  const { samples, source } = useGpuSamples();
+  const { samples, source, lastReceivedAt, connected } = useGpuSamples();
 
-  const { values, latest, stale } = useMemo(() => {
+  // Wall-clock tick so ``isStale`` recomputes without a new sample —
+  // otherwise the chip could stay "fresh" forever if no further
+  // samples arrive. 1 s cadence is enough to flip from fresh → stale
+  // within ~1 s of the threshold.
+  const [now, setNow] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const { values, latest } = useMemo(() => {
     const v: number[] = [];
     for (const s of samples) {
       if (s.util !== null && Number.isFinite(s.util)) v.push(s.util);
     }
     const lastSample = samples[samples.length - 1] ?? null;
-    const latestUtil = lastSample?.util ?? null;
-    // ``ts`` is server monotonic seconds — we use wall-clock elapsed
-    // since the LAST frame arrived as a proxy (we don't sync clocks).
-    // The telemetry hook updates the store on every frame, so "no
-    // sample in STALE_MS ms" is truly quiet.
-    const isStale = samples.length === 0;
-    return { values: v, latest: latestUtil, stale: isStale };
+    return { values: v, latest: lastSample?.util ?? null };
   }, [samples]);
 
+  // Backend told us GPU sampling isn't supported on this platform
+  // (e.g. Intel Mac, no-GPU container) — hide completely.
   if (source === "unavailable") return null;
-  // Hide until we have at least 2 data points; a single-point sparkline
-  // looks broken.
+
+  // Stream disconnected OR silent for too long — collapse to a
+  // compact disconnected badge rather than lingering on frozen data.
+  const streamStale =
+    !connected ||
+    lastReceivedAt === null ||
+    now - lastReceivedAt > STALE_MS;
+
+  if (streamStale) {
+    const reason = !connected
+      ? "telemetry disconnected"
+      : lastReceivedAt === null
+      ? "waiting for telemetry"
+      : `no samples for ${Math.round((now - lastReceivedAt) / 1000)}s`;
+    return (
+      <div
+        className="flex items-center gap-1 rounded-full border border-muted-foreground/15 bg-muted/20 px-2 py-0.5 text-[10px] text-muted-foreground/70"
+        title={`GPU telemetry — ${reason}`}
+        data-testid="gpu-sparkline"
+        data-severity="disconnected"
+      >
+        <WifiOffIcon className="size-3" aria-hidden="true" />
+        <span className="sr-only">GPU telemetry disconnected</span>
+      </div>
+    );
+  }
+
+  // Hide until we have at least 2 data points; a single-point
+  // sparkline looks broken.
   if (values.length < 2 && !latest) return null;
 
   const path = buildPath(values);
@@ -104,7 +147,6 @@ export const GpuSparkline: FC = () => {
       title={`GPU ${latestText}${source ? ` (${source})` : ""}`}
       data-testid="gpu-sparkline"
       data-severity={severity}
-      style={{ opacity: stale ? 0.35 : 1, transition: "opacity 600ms" }}
     >
       <span className="tabular-nums">GPU {latestText}</span>
       <svg

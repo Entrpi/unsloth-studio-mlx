@@ -17,6 +17,7 @@
 import { useEffect, useRef } from "react";
 import { getAuthToken, hasAuthToken } from "@/features/auth/session";
 import { useChatRuntimeStore } from "../stores/chat-runtime-store";
+import { useShallow } from "zustand/react/shallow";
 import { useTelemetryStore, type GpuSample, type TokensEvent } from "../stores/telemetry-store";
 
 const WS_PATH = "/ws/telemetry";
@@ -198,7 +199,20 @@ export function useTelemetrySocket(): void {
 // ── Selectors ──────────────────────────────────────────────────────
 
 export function useGpuSamples() {
-  return useTelemetryStore((s) => s.gpu);
+  // ``useShallow`` — the selector returns a NEW object literal on
+  // every call, so without shallow-equality Zustand re-renders every
+  // subscriber on every unrelated store update (token ticks,
+  // session transitions) AND React's render cycle can ping-pong
+  // through useEffect → setState → store-subscribe → re-render
+  // until the max-update-depth guard fires (React error #185).
+  return useTelemetryStore(
+    useShallow((s) => ({
+      samples: s.gpu.samples,
+      source: s.gpu.source,
+      lastReceivedAt: s.gpu.lastReceivedAt,
+      connected: s.connected,
+    })),
+  );
 }
 
 export function useSessionTelemetry(sessionId: string | null | undefined) {
