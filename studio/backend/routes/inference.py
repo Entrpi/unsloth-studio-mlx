@@ -5453,6 +5453,24 @@ async def _mlx_agentic_stream(
         logger.error("MLX agentic stream error: %s", e, exc_info = True)
         err = {"error": {"message": _friendly_error(e), "type": "server_error"}}
         yield f"data: {json.dumps(err)}\n\n"
+        # Also flush the final-chunk + [DONE] sentinel so the
+        # frontend's EventSource / fetch-stream reader correctly
+        # exits its "still loading" state. Without [DONE] the UI
+        # spinner stays spinning forever even though the backend
+        # has given up on the turn.
+        try:
+            err_final = ChatCompletionChunk(
+                id = completion_id,
+                created = created,
+                model = model_name,
+                choices = [
+                    ChunkChoice(delta = ChoiceDelta(), finish_reason = "stop"),
+                ],
+            )
+            yield f"data: {err_final.model_dump_json(exclude_none = True)}\n\n"
+        except Exception:
+            pass
+        yield "data: [DONE]\n\n"
     finally:
         # Always cancel the background disconnect poller so it doesn't
         # outlive the stream (and hold a reference to ``request``).

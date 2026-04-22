@@ -10,6 +10,8 @@ Supports web search (DuckDuckGo), Python code execution, and terminal commands.
 import ast
 import http.client
 import os
+import time
+from typing import List
 
 os.environ["UNSLOTH_IS_PRESENT"] = "1"
 
@@ -377,6 +379,7 @@ def execute_tool(
             arguments.get("query", ""),
             url = arguments.get("url"),
             timeout = effective_timeout,
+            cancel_event = cancel_event,
         )
     if name == "python":
         return _python_exec(
@@ -495,12 +498,26 @@ def _validate_and_resolve_host(hostname: str, port: int) -> tuple[bool, str, str
 
 
 def _fetch_page_text(
-    url: str, max_chars: int = _MAX_PAGE_CHARS, timeout: int = 30
+    url: str,
+    max_chars: int = _MAX_PAGE_CHARS,
+    timeout: int = 30,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Fetch a URL and return plain text content (HTML tags stripped).
 
     Blocks private/loopback/link-local targets (SSRF protection) and caps
     the download size to avoid unbounded memory usage.
+
+    ``timeout`` is a **wall-clock deadline** for the entire fetch
+    (connect + redirects + body read), NOT just a per-socket-op
+    timeout. urllib's ``timeout=`` kwarg only bounds *individual*
+    read operations, so a slow-drip server that sends a byte every
+    few seconds can hang forever within urllib's per-call window.
+    We maintain a deadline across all hops and chunk the body read
+    so we can check both the deadline AND ``cancel_event`` between
+    chunks — critical because the agentic loop's concurrent-futures
+    cancellation can't actually kill a blocking ``read()``, only
+    unblock the awaiting task.
     """
     from urllib.parse import urlparse
 
@@ -515,6 +532,20 @@ def _fetch_page_text(
     if not ok:
         return reason
 
+    # Wall-clock deadline for the entire operation. Individual socket
+    # reads get a shorter per-op timeout so a hanging server never
+    # blocks for longer than ``_PER_OP_TIMEOUT`` even if the deadline
+    # itself is quite far away.
+    _PER_OP_TIMEOUT = min(10, timeout) if timeout > 0 else 10
+    deadline = time.monotonic() + max(1, timeout)
+
+    def _remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    resp = None
     try:
         from urllib.error import HTTPError as _HTTPError
         from urllib.parse import urljoin, urlunparse
@@ -525,6 +556,11 @@ def _fetch_page_text(
         ua = random.choice(_USER_AGENTS)
 
         for _hop in range(5):
+            if _cancelled():
+                return "Fetch cancelled."
+            if _remaining() <= 0:
+                return f"Fetch timed out after {timeout}s (deadline exceeded)."
+
             # Pin to the validated IP to prevent DNS rebinding.
             # Rewrite the URL to use the IP and set the Host header.
             cp = urlparse(current_url)
@@ -546,7 +582,11 @@ def _fetch_page_text(
                 },
             )
             try:
-                resp = opener.open(req, timeout = timeout)
+                # Cap per-op timeout at whichever is smaller: the
+                # configured per-op window, or whatever is left of
+                # the overall deadline.
+                op_timeout = min(_PER_OP_TIMEOUT, max(1.0, _remaining()))
+                resp = opener.open(req, timeout = op_timeout)
             except _HTTPError as e:
                 if e.code not in (301, 302, 303, 307, 308):
                     return (
@@ -568,8 +608,35 @@ def _fetch_page_text(
                     return reason2
                 current_host = rp.hostname
                 continue
-            # Success -- read capped body
-            raw_bytes = resp.read(max_bytes)
+            # Success — read the body in chunks so we can check the
+            # deadline + cancel_event between reads. A hung-drip
+            # server that trickles one byte every few seconds would
+            # otherwise hold us forever inside a single ``read()``
+            # that urllib's per-op timeout keeps renewing.
+            chunks: List[bytes] = []
+            bytes_read = 0
+            CHUNK = 64 * 1024
+            while bytes_read < max_bytes:
+                if _cancelled():
+                    return "Fetch cancelled."
+                if _remaining() <= 0:
+                    return f"Fetch timed out after {timeout}s (deadline exceeded)."
+                want = min(CHUNK, max_bytes - bytes_read)
+                try:
+                    chunk = resp.read(want)
+                except Exception:
+                    # Per-op timeout fired, or socket closed. Stop
+                    # the read loop; re-raise if we got nothing at
+                    # all so the outer handler surfaces a clear
+                    # message.
+                    if not chunks:
+                        raise
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                bytes_read += len(chunk)
+            raw_bytes = b"".join(chunks)
             break
         else:
             return "Failed to fetch URL: too many redirects."
@@ -580,6 +647,15 @@ def _fetch_page_text(
         return f"Failed to fetch URL: HTTP {e.code} {getattr(e, 'reason', '')}"
     except Exception as e:
         return f"Failed to fetch URL: {e}"
+    finally:
+        # Always close the response so the socket doesn't leak into
+        # a CLOSE_WAIT / ESTABLISHED-but-idle state when we bail
+        # early (cancellation, deadline, HTTPError).
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
     # Convert HTML to Markdown using the builtin converter (no external deps)
     from ._html_to_md import html_to_markdown
@@ -612,6 +688,7 @@ def _web_search(
     max_results: int = 5,
     timeout: int = _EXEC_TIMEOUT,
     url: str | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Search the web using DuckDuckGo and return formatted results.
 
@@ -624,8 +701,14 @@ def _web_search(
     # message as a scheme-format issue and burns another turn on a
     # pointless retry).
     if url and url.strip() and url.strip().lower() not in _URL_FALSY_SENTINELS:
+        # Cap at 60s hard; the caller may pass the overall tool
+        # timeout (30s in the agentic loop) which already bounds us.
         fetch_timeout = 60 if timeout is None else min(timeout, 60)
-        return _fetch_page_text(url.strip(), timeout = fetch_timeout)
+        return _fetch_page_text(
+            url.strip(),
+            timeout = fetch_timeout,
+            cancel_event = cancel_event,
+        )
 
     if not query or not query.strip():
         return "No query provided."
