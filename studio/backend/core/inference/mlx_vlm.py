@@ -44,6 +44,7 @@ inside ``load_model``. Instantiating ``MlxVlmBackend`` does not import
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import gc
 import json
 import os
@@ -664,6 +665,669 @@ class MlxVlmBackend:
                     tmpdir_ctx.cleanup()
                 except Exception:
                     pass
+
+    # ── Agentic tool-call loop ────────────────────────────────────
+    def generate_chat_completion_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        tool_choice: Optional[Any] = None,
+        image_b64: Optional[str] = None,
+        temperature: float = 0.6,
+        top_p: float = 0.95,
+        top_k: int = 20,
+        min_p: float = 0.01,
+        max_tokens: Optional[int] = None,
+        repetition_penalty: float = 1.0,
+        repetition_context_size: Optional[int] = None,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        logit_bias: Optional[Dict[int, float]] = None,
+        stop: Optional[List[str]] = None,
+        cancel_event: Optional[threading.Event] = None,
+        enable_thinking: Optional[bool] = None,
+        max_tool_iterations: int = 10,
+        auto_heal_tool_calls: bool = True,
+        tool_call_timeout: int = 300,
+        session_id: Optional[str] = None,
+    ) -> Generator[Union[Dict[str, Any], str], None, None]:
+        """VLM peer of :meth:`MlxLmBackend.generate_chat_completion_with_tools`.
+
+        Runs the same agentic tool-use loop the GGUF and MLX-LM
+        backends run, with one addition: ``image_b64`` is accepted on
+        the FIRST turn (tool-calling with an image attached). Later
+        iterations run text-only — mlx-vlm's ``stream_generate`` accepts
+        ``image=None`` and the tool-call history is passed via the chat
+        template.
+
+        Yielded events mirror the MLX-LM method exactly so the route
+        layer's ``_mlx_vlm_agentic_stream`` can reuse the same SSE-frame
+        shapes:
+
+        - ``{"type": "content", "text": cumulative}``
+        - ``{"type": "status", "text": "Calling tool X ..."}``
+        - ``{"type": "tool_start", "tool_name", "tool_call_id",
+          "arguments"}``
+        - ``{"type": "tool_end", "tool_name", "tool_call_id",
+          "result"}``
+        - ``{"type": "metadata", "usage": {...}, "timings": {...}}``
+
+        Semantics:
+
+        - ``tool_choice="none"`` short-circuits — one plain generation
+          turn runs without tools.
+        - The tool schema is injected via :meth:`_render_prompt`'s
+          synthetic-system-message path (the VLM ``apply_chat_template``
+          doesn't reliably accept a ``tools=`` kwarg across models).
+        - After each turn the cumulative text goes through
+          :func:`core.inference._tool_call_parser.parse_tool_calls_from_text`
+          — no calls → emit final content and metadata, done. Calls →
+          execute serially via :func:`core.inference.tools.execute_tool`
+          with the same per-call hard-timeout wrapper MLX-LM uses.
+        - Cancellation is checked at every iteration boundary and
+          every 0.5 s during a tool execution.
+        """
+        if not self.is_loaded:
+            raise RuntimeError("MLX-VLM model is not loaded")
+        if not self.supports_tools:
+            raise RuntimeError(
+                "Loaded MLX-VLM model does not advertise tool-calling "
+                "support (chat template does not mention tools / "
+                "tool_calls). Reload a tool-capable VLM checkpoint "
+                "(e.g. mlx-community Gemma-4 / Qwen3-VL)."
+            )
+
+        from core.inference._tool_call_parser import (
+            TOOL_XML_SIGNALS,
+            parse_tool_calls_from_text,
+            strip_tool_markup,
+        )
+        from core.inference.tools import execute_tool
+
+        tool_choice_norm = self._normalize_tool_choice(tool_choice)
+        conversation = [dict(m) for m in messages]
+
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        accumulated_predicted_ms = 0.0
+        accumulated_predicted_n = 0
+
+        if tool_choice_norm == "none":
+            # Plain single-turn; image still honoured.
+            yield from self._run_plain_vlm_tool_turn(
+                conversation = conversation,
+                tools = tools,
+                tool_choice = tool_choice_norm,
+                image_b64 = image_b64,
+                temperature = temperature,
+                top_p = top_p,
+                top_k = top_k,
+                min_p = min_p,
+                max_tokens = max_tokens,
+                repetition_penalty = repetition_penalty,
+                repetition_context_size = repetition_context_size,
+                presence_penalty = presence_penalty,
+                frequency_penalty = frequency_penalty,
+                logit_bias = logit_bias,
+                stop = stop,
+                cancel_event = cancel_event,
+                enable_thinking = enable_thinking,
+            )
+            return
+
+        for iteration in range(max_tool_iterations):
+            if cancel_event is not None and cancel_event.is_set():
+                return
+
+            # Only the FIRST iteration uses the user-provided image.
+            # Subsequent iterations are text-only (the image has already
+            # been consumed by the encoder, and passing it again would
+            # re-encode + bloat context).
+            iter_image = image_b64 if iteration == 0 else None
+
+            turn_text = ""
+            turn_usage: Dict[str, Any] = {}
+            turn_timings: Dict[str, Any] = {}
+            for event in self._stream_vlm_assistant_turn(
+                conversation = conversation,
+                tools = tools,
+                tool_choice = tool_choice_norm,
+                image_b64 = iter_image,
+                temperature = temperature,
+                top_p = top_p,
+                top_k = top_k,
+                min_p = min_p,
+                max_tokens = max_tokens,
+                repetition_penalty = repetition_penalty,
+                repetition_context_size = repetition_context_size,
+                presence_penalty = presence_penalty,
+                frequency_penalty = frequency_penalty,
+                logit_bias = logit_bias,
+                stop = stop,
+                cancel_event = cancel_event,
+                enable_thinking = enable_thinking,
+            ):
+                if isinstance(event, dict):
+                    if event.get("type") == "metadata":
+                        turn_usage = event.get("usage", {}) or {}
+                        turn_timings = event.get("timings", {}) or {}
+                    continue
+                turn_text = event
+                # Same two-stage clean as MlxLmBackend: strip closed
+                # tool-call blocks then hold back anything from the
+                # earliest unclosed signal onwards so partial markup
+                # doesn't leak to the SSE wire.
+                cleaned = (
+                    strip_tool_markup(turn_text)
+                    if auto_heal_tool_calls
+                    else turn_text
+                )
+                if auto_heal_tool_calls:
+                    earliest_signal = -1
+                    for sig in TOOL_XML_SIGNALS:
+                        idx = cleaned.find(sig)
+                        if idx >= 0 and (
+                            earliest_signal < 0 or idx < earliest_signal
+                        ):
+                            earliest_signal = idx
+                    if earliest_signal >= 0:
+                        cleaned = cleaned[:earliest_signal]
+                yield {"type": "content", "text": cleaned}
+
+            if cancel_event is not None and cancel_event.is_set():
+                return
+
+            total_prompt_tokens = turn_usage.get(
+                "prompt_tokens", total_prompt_tokens
+            )
+            total_completion_tokens += int(
+                turn_usage.get("completion_tokens", 0) or 0
+            )
+            pm = (
+                turn_timings.get("predicted_ms")
+                if isinstance(turn_timings, dict)
+                else None
+            )
+            pn = (
+                turn_timings.get("predicted_n")
+                if isinstance(turn_timings, dict)
+                else None
+            )
+            if isinstance(pm, (int, float)):
+                accumulated_predicted_ms += float(pm)
+            if isinstance(pn, (int, float)):
+                accumulated_predicted_n += int(pn)
+
+            tool_calls = (
+                parse_tool_calls_from_text(turn_text)
+                if auto_heal_tool_calls
+                else []
+            )
+
+            if not tool_calls:
+                final_text = (
+                    strip_tool_markup(turn_text, final = True)
+                    if auto_heal_tool_calls
+                    else turn_text
+                )
+                yield {"type": "content", "text": final_text}
+                yield {"type": "status", "text": ""}
+                yield self._build_vlm_metadata_event(
+                    prompt_tokens = total_prompt_tokens,
+                    completion_tokens = total_completion_tokens,
+                    predicted_ms = accumulated_predicted_ms,
+                    predicted_n = accumulated_predicted_n,
+                    base_timings = turn_timings,
+                )
+                return
+
+            # Record the assistant's turn with its tool_calls so
+            # apply_chat_template in the next iteration has history.
+            assistant_content = (
+                strip_tool_markup(turn_text, final = True)
+                if auto_heal_tool_calls
+                else turn_text
+            )
+            assistant_msg: Dict[str, Any] = {
+                "role": "assistant",
+                "content": assistant_content,
+                "tool_calls": tool_calls,
+            }
+            conversation.append(assistant_msg)
+
+            for tc in tool_calls:
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                func = tc.get("function", {})
+                tool_name = func.get("name", "")
+                raw_args = func.get("arguments", "")
+                if isinstance(raw_args, str):
+                    try:
+                        arguments = json.loads(raw_args) if raw_args else {}
+                    except json.JSONDecodeError:
+                        arguments = {"raw": raw_args}
+                else:
+                    arguments = raw_args
+
+                status = self._vlm_tool_status_text(tool_name, arguments)
+                yield {"type": "status", "text": status}
+                yield {
+                    "type": "tool_start",
+                    "tool_name": tool_name,
+                    "tool_call_id": tc.get("id", ""),
+                    "arguments": arguments,
+                }
+
+                # Hard-timeout wrapper — same shape as MlxLmBackend uses.
+                try:
+                    effective_timeout = (
+                        None if tool_call_timeout >= 9999
+                        else tool_call_timeout
+                    )
+                    _TOOL_TIMEOUT_CAPS = {
+                        "web_search": 30,
+                        "fetch_url": 30,
+                    }
+                    cap = _TOOL_TIMEOUT_CAPS.get(tool_name)
+                    if cap is not None and (
+                        effective_timeout is None
+                        or effective_timeout > cap
+                    ):
+                        effective_timeout = cap
+                    tool_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers = 1,
+                        thread_name_prefix = "mlx-vlm-tool-exec",
+                    )
+                    try:
+                        tool_future = tool_executor.submit(
+                            execute_tool,
+                            tool_name,
+                            arguments,
+                            cancel_event = cancel_event,
+                            timeout = effective_timeout,
+                            session_id = session_id,
+                        )
+                        deadline = (
+                            time.monotonic() + effective_timeout
+                            if effective_timeout is not None
+                            else None
+                        )
+                        while True:
+                            remaining = (
+                                deadline - time.monotonic()
+                                if deadline is not None
+                                else None
+                            )
+                            if remaining is not None and remaining <= 0:
+                                raise concurrent.futures.TimeoutError()
+                            wait_for = (
+                                min(0.5, remaining)
+                                if remaining is not None
+                                else 0.5
+                            )
+                            try:
+                                result = tool_future.result(timeout = wait_for)
+                                break
+                            except concurrent.futures.TimeoutError:
+                                if (
+                                    cancel_event is not None
+                                    and cancel_event.is_set()
+                                ):
+                                    return
+                                continue
+                    finally:
+                        tool_executor.shutdown(wait = False)
+                except concurrent.futures.TimeoutError:
+                    logger.warning(
+                        "VLM tool '%s' exceeded %ss timeout; abandoning "
+                        "background thread.",
+                        tool_name,
+                        effective_timeout,
+                    )
+                    result = (
+                        f"Error executing {tool_name}: timed out after "
+                        f"{effective_timeout}s."
+                    )
+                except Exception as exc:
+                    result = f"Error executing {tool_name}: {exc}"
+
+                yield {
+                    "type": "tool_end",
+                    "tool_name": tool_name,
+                    "tool_call_id": tc.get("id", ""),
+                    "result": result,
+                }
+
+                tool_msg: Dict[str, Any] = {
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": (
+                        result if isinstance(result, str) else str(result)
+                    ),
+                }
+                tc_id = tc.get("id")
+                if tc_id:
+                    tool_msg["tool_call_id"] = tc_id
+                conversation.append(tool_msg)
+
+            yield {"type": "status", "text": ""}
+
+        # ── Tool iteration cap reached ────────────────────────────
+        passthrough_mode = max_tool_iterations == 0
+        if max_tool_iterations > 0:
+            conversation.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "You have used all available tool calls. Based on "
+                        "everything you found so far, provide your final "
+                        "answer now. Do not call any more tools."
+                    ),
+                }
+            )
+        yield {"type": "status", "text": ""}
+        final_text_cum = ""
+        final_usage: Dict[str, Any] = {}
+        final_timings: Dict[str, Any] = {}
+        for event in self._stream_vlm_assistant_turn(
+            conversation = conversation,
+            tools = tools if passthrough_mode else None,
+            tool_choice = tool_choice_norm if passthrough_mode else "none",
+            # Cap-reached final turn is always text-only — the image was
+            # consumed on iteration 0.
+            image_b64 = None,
+            temperature = temperature,
+            top_p = top_p,
+            top_k = top_k,
+            min_p = min_p,
+            max_tokens = max_tokens,
+            repetition_penalty = repetition_penalty,
+            repetition_context_size = repetition_context_size,
+            presence_penalty = presence_penalty,
+            frequency_penalty = frequency_penalty,
+            logit_bias = logit_bias,
+            stop = stop,
+            cancel_event = cancel_event,
+            enable_thinking = enable_thinking,
+        ):
+            if isinstance(event, dict):
+                if event.get("type") == "metadata":
+                    final_usage = event.get("usage", {}) or {}
+                    final_timings = event.get("timings", {}) or {}
+                continue
+            final_text_cum = event
+            yield {"type": "content", "text": final_text_cum}
+
+        total_prompt_tokens = final_usage.get(
+            "prompt_tokens", total_prompt_tokens
+        )
+        total_completion_tokens += int(
+            final_usage.get("completion_tokens", 0) or 0
+        )
+        yield self._build_vlm_metadata_event(
+            prompt_tokens = total_prompt_tokens,
+            completion_tokens = total_completion_tokens,
+            predicted_ms = accumulated_predicted_ms,
+            predicted_n = accumulated_predicted_n,
+            base_timings = final_timings,
+        )
+
+    # ── Helpers for the VLM tool loop ─────────────────────────────
+
+    @staticmethod
+    def _normalize_tool_choice(tool_choice: Any) -> Optional[str]:
+        """Collapse OpenAI ``tool_choice`` to ``"auto"`` / ``"required"`` /
+        ``"none"`` / None. Mirrors :meth:`MlxLmBackend._normalize_tool_choice`.
+        """
+        if tool_choice is None:
+            return "auto"
+        if isinstance(tool_choice, str):
+            low = tool_choice.strip().lower()
+            if low in ("auto", "required", "none"):
+                return low
+            return "auto"
+        if isinstance(tool_choice, dict):
+            if tool_choice.get("type") == "function":
+                return "required"
+            return "auto"
+        return "auto"
+
+    def _stream_vlm_assistant_turn(
+        self,
+        *,
+        conversation: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: Optional[str],
+        image_b64: Optional[str],
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        min_p: float,
+        max_tokens: Optional[int],
+        repetition_penalty: float,
+        repetition_context_size: Optional[int],
+        presence_penalty: float,
+        frequency_penalty: float,
+        logit_bias: Optional[Dict[int, float]],
+        stop: Optional[List[str]],
+        cancel_event: Optional[threading.Event],
+        enable_thinking: Optional[bool],
+    ) -> Generator[Union[str, Dict[str, Any]], None, None]:
+        """Stream one assistant turn with the current conversation.
+
+        Mirrors :meth:`generate_chat_completion` but passes ``tools``
+        into the prompt builder and accepts a per-turn image. The body
+        is a near-clone — the two generators can't share code because
+        the prompt must be rebuilt per turn (the conversation grows
+        between iterations).
+        """
+        try:
+            from mlx_vlm import stream_generate  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(f"mlx_vlm is not installed: {e}") from e
+
+        render_tools = tools if (tools and tool_choice != "none") else None
+        num_images = 1 if image_b64 else 0
+        prompt = self._render_prompt(
+            conversation,
+            num_images = num_images,
+            tools = render_tools,
+            enable_thinking = enable_thinking,
+        )
+
+        tmpdir_ctx: Optional[tempfile.TemporaryDirectory] = None
+        image_path: Optional[str] = None
+        try:
+            if image_b64:
+                tmpdir_ctx = tempfile.TemporaryDirectory(prefix = "mlxvlm-")
+                try:
+                    image_path = self._decode_image_b64_to_path(
+                        image_b64, tmpdir_ctx.name
+                    )
+                except Exception as e:
+                    raise ValueError(f"Failed to decode image_b64: {e}") from e
+
+            sg_kwargs: Dict[str, Any] = {"prompt": prompt}
+            if image_path is not None:
+                sg_kwargs["image"] = image_path
+            if max_tokens is not None and max_tokens > 0:
+                sg_kwargs["max_tokens"] = int(max_tokens)
+            if temperature and temperature > 0:
+                sg_kwargs["temperature"] = float(temperature)
+            else:
+                sg_kwargs["temperature"] = 0.0
+            if top_p and top_p > 0:
+                sg_kwargs["top_p"] = float(top_p)
+            if top_k and top_k > 0:
+                sg_kwargs["top_k"] = int(top_k)
+            if min_p and min_p > 0:
+                sg_kwargs["min_p"] = float(min_p)
+            if (
+                repetition_penalty is not None
+                and float(repetition_penalty) > 1.0
+            ):
+                sg_kwargs["repetition_penalty"] = float(repetition_penalty)
+
+            stop_strings: List[str] = []
+            if stop:
+                if isinstance(stop, str):
+                    stop_strings = [stop]
+                else:
+                    stop_strings = [
+                        s for s in stop if isinstance(s, str) and s
+                    ]
+            max_stop_len = max((len(s) for s in stop_strings), default = 0)
+
+            cumulative = ""
+            last_resp: Any = None
+            finish_reason = "stop"
+
+            try:
+                for resp in stream_generate(
+                    self._model, self._processor, **sg_kwargs
+                ):
+                    last_resp = resp
+                    if cancel_event is not None and cancel_event.is_set():
+                        finish_reason = "cancelled"
+                        break
+                    text = getattr(resp, "text", None)
+                    if text is None and isinstance(resp, str):
+                        text = resp
+                    if not text:
+                        continue
+                    cumulative += text
+                    if stop_strings:
+                        scan_start = max(
+                            0,
+                            len(cumulative) - (max_stop_len + len(text)),
+                        )
+                        hay = cumulative[scan_start:]
+                        earliest_rel: Optional[int] = None
+                        for s in stop_strings:
+                            idx = hay.find(s)
+                            if idx != -1 and (
+                                earliest_rel is None
+                                or idx < earliest_rel
+                            ):
+                                earliest_rel = idx
+                        if earliest_rel is not None:
+                            cut = scan_start + earliest_rel
+                            cumulative = cumulative[:cut]
+                            yield cumulative
+                            break
+                    yield cumulative
+            except Exception as e:
+                logger.error(f"mlx_vlm stream_generate (tool turn) raised: {e}")
+                raise
+
+            usage = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
+            timings: Dict[str, Any] = {
+                "prompt_per_second": None,
+                "predicted_per_second": None,
+            }
+            if last_resp is not None:
+                pt = int(getattr(last_resp, "prompt_tokens", 0) or 0)
+                gt = int(getattr(last_resp, "generation_tokens", 0) or 0)
+                usage = {
+                    "prompt_tokens": pt,
+                    "completion_tokens": gt,
+                    "total_tokens": pt + gt,
+                }
+                timings = {
+                    "prompt_per_second": getattr(
+                        last_resp, "prompt_tps", None
+                    ),
+                    "predicted_per_second": getattr(
+                        last_resp, "generation_tps", None
+                    ),
+                }
+            yield {
+                "type": "metadata",
+                "usage": usage,
+                "timings": timings,
+                "finish_reason": finish_reason,
+            }
+        finally:
+            if tmpdir_ctx is not None:
+                try:
+                    tmpdir_ctx.cleanup()
+                except Exception:
+                    pass
+
+    def _run_plain_vlm_tool_turn(
+        self, **kwargs: Any
+    ) -> Generator[Union[Dict[str, Any], str], None, None]:
+        """``tool_choice="none"`` path: run one turn, relay events."""
+        conversation = kwargs.pop("conversation")
+        for event in self._stream_vlm_assistant_turn(
+            conversation = conversation, **kwargs
+        ):
+            if isinstance(event, dict):
+                if event.get("type") == "metadata":
+                    yield {
+                        "type": "metadata",
+                        "usage": event.get("usage", {}),
+                        "timings": event.get("timings", {}),
+                    }
+                continue
+            yield {"type": "content", "text": event}
+        yield {"type": "status", "text": ""}
+
+    @staticmethod
+    def _vlm_tool_status_text(
+        tool_name: str, arguments: Dict[str, Any]
+    ) -> str:
+        """Build UI status text for a tool invocation.
+
+        Mirrors :meth:`MlxLmBackend._tool_status_text` so the frontend
+        badges look identical regardless of backend.
+        """
+        if tool_name == "web_search":
+            url = (arguments.get("url") or "").strip()
+            if url:
+                return f"Reading: {url[:80]}"
+            return f"Searching: {arguments.get('query', '')[:80]}"
+        if tool_name == "python":
+            preview = (arguments.get("code") or "").strip().split("\n")[0][:60]
+            return (
+                f"Running Python: {preview}" if preview
+                else "Running Python..."
+            )
+        if tool_name == "terminal":
+            cmd = (arguments.get("command") or "")[:60]
+            return f"Running: {cmd}" if cmd else "Running command..."
+        return f"Calling: {tool_name}"
+
+    @staticmethod
+    def _build_vlm_metadata_event(
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        predicted_ms: float,
+        predicted_n: int,
+        base_timings: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Final metadata event — same shape as MLX-LM so the SSE driver
+        can be shared.
+        """
+        timings = dict(base_timings) if isinstance(base_timings, dict) else {}
+        if predicted_ms > 0.0:
+            timings["predicted_ms"] = predicted_ms
+        if predicted_n > 0:
+            timings["predicted_n"] = predicted_n
+        return {
+            "type": "metadata",
+            "usage": {
+                "prompt_tokens": int(prompt_tokens),
+                "completion_tokens": int(completion_tokens),
+                "total_tokens": int(prompt_tokens + completion_tokens),
+            },
+            "timings": timings,
+        }
 
     # ── Progress surface (matches MlxLmBackend.load_progress) ─────
     def load_progress(self) -> Dict[str, Any]:
