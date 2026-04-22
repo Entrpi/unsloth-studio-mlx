@@ -148,6 +148,80 @@ _TOOL_ACTION_NUDGE = (
     " Do NOT output code blocks -- use the python tool instead."
 )
 
+
+def _build_tool_use_nudge(
+    tool_names: "set[str]",
+    model_name: "Optional[str]" = None,
+) -> str:
+    """Build a model-sized system-prompt addendum telling the model to
+    use the available tools.
+
+    Returns the nudge text *without* any wrapping. Caller merges it
+    into whatever ``system_prompt`` they have (empty string → use as-is).
+
+    Small models (<9B) get a trimmed variant because the full nudge
+    encourages multi-step search plans they struggle to follow
+    through on. ``model_name`` is the load-time identifier used to
+    extract parameter count via ``_extract_model_size_b``.
+
+    Why this exists: Bonsai / Qwen3-family models lean heavily on
+    tool-call training so they'll invoke tools even without this
+    addendum. Other families (Gemma 4 E4B, Ministral 3B, Llama 3.2
+    3B) default to "I can't do that" unless explicitly told to call
+    the tools — and the MLX ``enable_tools`` branch previously didn't
+    apply the nudge that the GGUF path already used.
+    """
+    _has_web = "web_search" in tool_names
+    _has_code = "python" in tool_names or "terminal" in tool_names
+
+    _date_line = f"The current date is {_date.today().isoformat()}."
+
+    _model_size_b = (
+        _extract_model_size_b(model_name) if model_name else None
+    )
+    _is_small_model = _model_size_b is not None and _model_size_b < 9
+
+    if _is_small_model:
+        _web_tips = "Do not repeat the same search query."
+    else:
+        _web_tips = (
+            "When you search and find a relevant URL in the results, "
+            "fetch its full content by calling web_search with the url parameter. "
+            "Do not repeat the same search query. If a search returns "
+            "no useful results, try rephrasing or fetching a result URL directly."
+        )
+    _code_tips = (
+        "Use code execution for math, calculations, data processing, "
+        "or to parse and analyze information from tool results."
+    )
+
+    if _has_web and _has_code:
+        _nudge = (
+            _date_line + " "
+            "You have access to tools. When appropriate, prefer using "
+            "tools rather than answering from memory. "
+            + _web_tips
+            + " "
+            + _code_tips
+        )
+    elif _has_code:
+        _nudge = (
+            _date_line + " "
+            "You have access to tools. When appropriate, prefer using "
+            "code execution rather than answering from memory. " + _code_tips
+        )
+    elif _has_web:
+        _nudge = (
+            _date_line + " "
+            "You have access to tools. When appropriate, prefer using "
+            "web search for up-to-date or uncertain factual "
+            "information rather than answering from memory. " + _web_tips
+        )
+    else:
+        return ""
+
+    return _nudge + _TOOL_ACTION_NUDGE
+
 # Regex for stripping leaked tool-call XML from assistant messages/stream
 _TOOL_XML_RE = _re.compile(
     r"<tool_call>.*?</tool_call>|<function=\w+>.*?</function>",
@@ -2305,57 +2379,9 @@ async def openai_chat_completions(
 
             # ── Tool-use system prompt nudge ──────────────────────
             _tool_names = {t["function"]["name"] for t in tools_to_use}
-            _has_web = "web_search" in _tool_names
-            _has_code = "python" in _tool_names or "terminal" in _tool_names
-
-            _date_line = f"The current date is {_date.today().isoformat()}."
-
-            # Small models (<9B) struggle with multi-step search plans,
-            # so simplify the web tips to avoid plan-then-stall behavior.
-            _model_size_b = _extract_model_size_b(model_name)
-            _is_small_model = _model_size_b is not None and _model_size_b < 9
-
-            if _is_small_model:
-                _web_tips = "Do not repeat the same search query."
-            else:
-                _web_tips = (
-                    "When you search and find a relevant URL in the results, "
-                    "fetch its full content by calling web_search with the url parameter. "
-                    "Do not repeat the same search query. If a search returns "
-                    "no useful results, try rephrasing or fetching a result URL directly."
-                )
-            _code_tips = (
-                "Use code execution for math, calculations, data processing, "
-                "or to parse and analyze information from tool results."
-            )
-
-            if _has_web and _has_code:
-                _nudge = (
-                    _date_line + " "
-                    "You have access to tools. When appropriate, prefer using "
-                    "tools rather than answering from memory. "
-                    + _web_tips
-                    + " "
-                    + _code_tips
-                )
-            elif _has_code:
-                _nudge = (
-                    _date_line + " "
-                    "You have access to tools. When appropriate, prefer using "
-                    "code execution rather than answering from memory. " + _code_tips
-                )
-            elif _has_web:
-                _nudge = (
-                    _date_line + " "
-                    "You have access to tools. When appropriate, prefer using "
-                    "web search for up-to-date or uncertain factual "
-                    "information rather than answering from memory. " + _web_tips
-                )
-            else:
-                _nudge = ""
+            _nudge = _build_tool_use_nudge(_tool_names, model_name)
 
             if _nudge:
-                _nudge += _TOOL_ACTION_NUDGE
                 # Append nudge to system prompt (preserve user's prompt)
                 if system_prompt:
                     system_prompt = system_prompt.rstrip() + "\n\n" + _nudge
@@ -2960,6 +2986,38 @@ async def openai_chat_completions(
                 ]
             else:
                 mlx_tools = ALL_TOOLS
+
+            # ── Tool-use nudge — mirror GGUF path ───────────────────
+            # Without this, smaller tool-capable models (e.g. Gemma-4
+            # E4B, Ministral-3 3B, Llama-3.2 3B) tend to reply "I can't
+            # search the web" even when the tool schema is in the
+            # prompt. Bonsai / Qwen3-family are tool-call-trained and
+            # don't need it; the nudge is additive and harmless for
+            # models that already call tools reliably.
+            _mlx_tool_names = {t["function"]["name"] for t in mlx_tools}
+            _mlx_nudge = _build_tool_use_nudge(
+                _mlx_tool_names, mlx_backend.model_identifier
+            )
+            if _mlx_nudge:
+                # Prepend/append to the existing system message in
+                # mlx_messages (which was built above with
+                # preserve_tool_history=True when tools are in play).
+                _existing_system = None
+                for _msg in mlx_messages:
+                    if _msg.get("role") == "system":
+                        _existing_system = _msg
+                        break
+                if _existing_system is not None:
+                    _existing = _existing_system.get("content") or ""
+                    _existing_system["content"] = (
+                        _existing.rstrip() + "\n\n" + _mlx_nudge
+                        if _existing
+                        else _mlx_nudge
+                    )
+                else:
+                    mlx_messages.insert(
+                        0, {"role": "system", "content": _mlx_nudge}
+                    )
 
             def mlx_generate_with_tools():
                 return mlx_backend.generate_chat_completion_with_tools(
@@ -4284,54 +4342,9 @@ async def anthropic_messages(
 
         # Build tool-use system prompt nudge (same logic as /chat/completions)
         _tool_names = {t["function"]["name"] for t in openai_tools}
-        _has_web = "web_search" in _tool_names
-        _has_code = "python" in _tool_names or "terminal" in _tool_names
-
-        _date_line = f"The current date is {_date.today().isoformat()}."
-        _model_size_b = _extract_model_size_b(model_name)
-        _is_small_model = _model_size_b is not None and _model_size_b < 9
-
-        if _is_small_model:
-            _web_tips = "Do not repeat the same search query."
-        else:
-            _web_tips = (
-                "When you search and find a relevant URL in the results, "
-                "fetch its full content by calling web_search with the url parameter. "
-                "Do not repeat the same search query. If a search returns "
-                "no useful results, try rephrasing or fetching a result URL directly."
-            )
-        _code_tips = (
-            "Use code execution for math, calculations, data processing, "
-            "or to parse and analyze information from tool results."
-        )
-
-        if _has_web and _has_code:
-            _nudge = (
-                _date_line + " "
-                "You have access to tools. When appropriate, prefer using "
-                "tools rather than answering from memory. "
-                + _web_tips
-                + " "
-                + _code_tips
-            )
-        elif _has_code:
-            _nudge = (
-                _date_line + " "
-                "You have access to tools. When appropriate, prefer using "
-                "code execution rather than answering from memory. " + _code_tips
-            )
-        elif _has_web:
-            _nudge = (
-                _date_line + " "
-                "You have access to tools. When appropriate, prefer using "
-                "web search for up-to-date or uncertain factual "
-                "information rather than answering from memory. " + _web_tips
-            )
-        else:
-            _nudge = ""
+        _nudge = _build_tool_use_nudge(_tool_names, model_name)
 
         if _nudge:
-            _nudge += _TOOL_ACTION_NUDGE
             # Inject into system prompt
             if openai_messages and openai_messages[0].get("role") == "system":
                 openai_messages[0]["content"] = (
