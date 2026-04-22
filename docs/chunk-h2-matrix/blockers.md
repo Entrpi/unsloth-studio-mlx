@@ -122,6 +122,67 @@ asserts `tool_name == "get_weather"` and `arguments` contains
 `"Paris"` as the primary contract. Gemma-4 users can now drive
 real tool-call workflows on the MLX backend.
 
+## B5. MLX-VLM advertised `supports_tools=True` but had no agentic loop
+
+**Resolved in this chunk (see commits following the parity audit).**
+
+**Family.** Any MLX-VLM checkpoint whose chat template mentions
+`tool_calls` / `tools` — surfaced first by
+`mlx-community/gemma-4-e4b-it-4bit` (a Gemma-4 VLM, routes as VLM via
+the `is_mlx_vlm` predicate).
+
+**Symptom.** Loading Gemma 4 E4B through the VLM backend and enabling
+the tool-calling toggle in the UI produced plain chat responses — no
+tool invocations, no `tool_start` / `tool_end` events. The route
+layer's `if using_vlm:` branch only called
+`generate_chat_completion`, and `MlxVlmBackend` had no
+`generate_chat_completion_with_tools` method at all, despite
+`_detect_tools_from_template(self._chat_template)` returning True.
+
+**Root cause.** Phase 9 (Chunk D) explicitly deferred VLM
+tool-calling; the backend grew a `supports_tools` property (line 188)
+but not the agentic-loop method. The route layer's VLM branch
+(around `routes/inference.py:2734`) has no `if payload.enable_tools:`
+sub-branch — in contrast with the MLX-LM branch at line 2978.
+
+**Fix landed.**
+
+- Ported `generate_chat_completion_with_tools` to `MlxVlmBackend`,
+  mirroring the MLX-LM implementation. Uses `mlx_vlm.stream_generate`
+  instead of `mlx_lm.stream_generate`, and accepts an optional
+  `image_b64` so tool-calling with an image input is supported (e.g.
+  "analyse this chart and call `python` to compute stats").
+- Reuses the shared parser (`TOOL_XML_SIGNALS`,
+  `parse_tool_calls_from_text`, `strip_tool_markup`) so Gemma-4's
+  `<|tool_call>` dialect, Qwen/Bonsai's `<tool_call>` JSON dialect,
+  and Claude/Mistral's `<function=...>` XML dialect all parse
+  correctly.
+- Reuses the content hold-back logic (2026-04-22 MLX-LM fix) so
+  partial `<tool_call>` markup doesn't leak to the SSE wire.
+- Reuses the `concurrent.futures` tool-execution wrapper with the
+  30 s per-invocation cap on `web_search` / `fetch_url` and a
+  0.5 s cancel-event poll.
+- Prompt-injects the tool schema as a synthetic system message
+  (`_render_prompt(tools=...)` already did this) rather than
+  threading `tools=` through `apply_chat_template` — the VLM
+  template path doesn't reliably accept the kwarg across models,
+  and the JSON tool_calls output from the model is still parsed by
+  the shared parser regardless.
+- Route `if using_vlm:` branch gained a parallel `if payload.enable_tools:`
+  sub-branch that dispatches to a new `_mlx_vlm_agentic_stream`
+  SSE driver (mirror of `_mlx_agentic_stream` with image passthrough).
+- `_build_tool_use_nudge` is applied to the VLM system prompt the
+  same way MLX-LM does it, so small tool-capable VLMs (Gemma 4 E4B)
+  reliably call tools rather than replying "I can't do that".
+
+**Downstream impact.** Gemma 4 E4B VLM users can now drive tool
+workflows. The existing `test_mlx_gemma_tool_calling.py` contract
+(`tool_name == "get_weather"` and `"Paris"` in arguments) is mirrored
+for the VLM backend in
+`tests/test_mlx_vlm_gemma_tool_calling.py`. Non-goals for this chunk:
+client-side tools passthrough on VLM and Anthropic `/v1/messages` VLM
+tool-calling (both flagged P1 in `parity-audit.md`).
+
 ## B4. `@pytest.mark.slow` not yet a convention in this suite
 
 **Observation.** `pyproject.toml` doesn't register a `slow` mark, and
