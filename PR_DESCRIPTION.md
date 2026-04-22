@@ -1384,3 +1384,198 @@ against a clear "use the function" prompt, so the assertion is stable.
 - Full MLX suite: 302 passed, 4 skipped (MLX_SLOW_TESTS-gated), 0
   xfailed. +11 tests vs Chunk H-2 Gemma-4 tip.
 - `docs/chunk-h2-matrix/blockers.md` marks B3 as resolved.
+
+---
+
+# Chunk H-2 — Streaming architecture + telemetry
+
+The final block of work on this branch. Surfaced from a concrete bug:
+GLM-4.6V-Flash's second agentic iteration was generating 4000+ chars
+of final answer text cleanly server-side but the client UI stayed
+frozen at iter=1's last prose. Root-cause hunting via Chrome preview
+(React DevTools + SSE-tee hook + DOM snapshots) found an error-boundary
+throw — `Duplicate key toolCallId-call_0 in tapResources` — because
+the tool-call parser assigned `call_0` per-invocation and each
+agentic iteration re-invoked it fresh. That was the real bug; the
+SSE-level fixes we'd added earlier (keepalive / inactivity watchdog)
+were correct but covered different failure modes. The UI regression
+that triggered the investigation turned out to be a state-tree
+corruption caused by duplicate React keys, not a transport issue.
+
+Net: three phases of streaming-architecture improvements + full live
+telemetry UX (token counter + GPU sparkline) landed on top.
+
+## Phase 1 — SSE keepalive + inactivity watchdog + duplicate-ID fix
+
+Four commits (`952e2458`, `5876b833`, `2e86a974`, `a10996eb`):
+
+- **Keepalive** (`_mlx_agentic_stream`, `_openai_passthrough_stream`):
+  races `next(gen)` against an `asyncio.wait_for(asyncio.shield(fut),
+  timeout)` every 5s (configurable via
+  `STUDIO_SSE_KEEPALIVE_INTERVAL`). On timeout yields an SSE comment
+  line (`:ka\n\n`) — standards-compliant parsers ignore, our frontend's
+  `parseSseEvent` strips them. Shielded so the timeout doesn't cancel
+  in-flight work. **Thread-safety hotfix (`5876b833`)** pins a single
+  in-flight `next(gen)` task across keepalive ticks; Python generators
+  are NOT thread-safe, and the initial implementation created a new
+  `asyncio.to_thread(next, gen, …)` task on every tick, which caused
+  occasional "generator already executing" deadlocks.
+
+- **Inactivity watchdog** (frontend, `chat-api.ts`): wraps the
+  SSE reader in a 15s inactivity timeout. On trip, cancels the reader
+  and surfaces a "connection stalled" error. 3× the server's 5s
+  cadence so a missed tick doesn't false-positive.
+
+- **`_global_tool_counter`** (both MLX-LM and MLX-VLM agentic loops):
+  rewrites `call_{N}` IDs across iterations so assistant-ui's
+  `tapResources` state tree doesn't crash on `Duplicate key`. This is
+  THE fix for the original "UI stuck after iter=1" reports in this
+  chunk — keepalives and watchdog were correct but addressed different
+  failure modes.
+
+- **`_fetch_page_text` hardening** (`a10996eb`): wall-clock deadline +
+  `cancel_event` threaded through; chunked body read (64 KB) with
+  per-chunk deadline + cancel checks; explicit `resp.close()` in
+  `finally` so sockets don't leak into CLOSE_WAIT on cancel. Addresses
+  a real hang on slow-drip servers where urllib's per-op timeout keeps
+  renewing indefinitely.
+
+- **Error-path `[DONE]`**: the agentic stream's `except Exception`
+  branch now emits a `finish_reason=stop` chunk plus `data: [DONE]\n\n`
+  so the frontend EventSource exits loading state cleanly instead of
+  hanging forever on a silent server abort.
+
+## Phase 2 — Structured progress events
+
+One commit (`54054933`). Adds
+`{"type":"progress","phase":"prompt_eval"|"generating","iter":N}` SSE
+events at iteration/phase boundaries. Frontend renders as
+"Re-reading conversation…" / "Generating…" chips above the composer.
+
+Fills the UX gap where long prompt-eval windows (after tool execution,
+before the next turn's first token) showed zero signal to the user.
+Pure addition — external OpenAI clients ignore unknown event types.
+Gated by `STUDIO_EMIT_PROGRESS_EVENTS` (default on).
+
+## Phase 3 — Telemetry WebSocket + token chip + GPU sparkline
+
+Two commits landing the architecture (`edac4fb9`) + the IOReport
+backend (`a925ba92`) + cross-platform coverage (`d8367731`) + a
+disconnected-state UX polish (`45477f94`).
+
+Design decisions (documented in the code + commit bodies):
+
+- **Separate WebSocket channel** (`/ws/telemetry`), not an SSE
+  extension. Telemetry outlives chat turns, fans out to multiple
+  tabs, uses subscription filtering.
+- **Global GPU telemetry** (not per-request). Sparkline shows a
+  device-wide view; both tabs see the same curve.
+- **Pre-filter token counting**: counts raw tokens from
+  `stream_generate` output BEFORE `strip_tool_markup` / hold-back
+  mutation — so the counter ticks during held-back reasoning where
+  visible text hasn't changed. Broadcast at ~4 Hz during generation.
+- **UI**: token-counter chip above the composer
+  (`"1234 tok · 28.4 t/s · iter 0: 287 tok"`); GPU sparkline next to
+  the submit/stop button (72×18 px inline SVG, no recharts dep);
+  severity color-coded at >50% warn / >85% danger thresholds;
+  compact WifiOff badge when the WS drops or goes silent for >10s.
+
+### Cross-platform GPU sampling
+
+`_candidate_sources()` dispatches per platform:
+
+| Platform | Fallback chain |
+|---|---|
+| macOS Apple Silicon | `ioreport → iokit → mlx_mem → powermetrics` |
+| macOS Intel | none (chip hides) |
+| Linux native | `pynvml → amdgpu_sysfs → intel_sysfs → nvidia_smi_cli` |
+| WSL | `pynvml → nvidia_smi_cli` |
+| Windows | `pynvml → pdh → nvidia_smi_cli` |
+
+`ioreport` is a ctypes binding against `/usr/lib/libIOReport.dylib`
+— no sudo, no entitlements, same mechanism `mactop` / `macmon` use.
+Picks the `GPU Stats / GPU Performance States / GPUPH` channel and
+computes active-residency % from non-idle P-state residencies —
+matches `powermetrics`'s number to the tenth of a percent.
+
+### Requirements additions
+
+New marker-gated dependencies in `studio/backend/requirements/studio.txt`:
+
+```
+nvidia-ml-py>=12.0 ; sys_platform != "darwin"
+pywin32>=306 ; sys_platform == "win32"
+```
+
+`nvidia-ml-py` provides the `pynvml` module (cross-platform NVIDIA
+telemetry). `pywin32` provides `win32pdh` (Windows Performance Data
+Helper — what Task Manager uses for its GPU column). Both are
+optional at runtime: absent packages degrade gracefully through the
+fallback chain.
+
+## Feature flags
+
+All Chunk H-2 streaming / telemetry additions are gated behind
+env-var knobs documented in `docs/env-vars.md`. Summary table:
+
+| Flag | Default | Rollback |
+|---|---|---|
+| `STUDIO_SSE_KEEPALIVE_INTERVAL` | `5.0` (seconds) | `0` to disable |
+| `STUDIO_EMIT_PROGRESS_EVENTS` | on | `0` / `false` |
+| `STUDIO_ENABLE_TELEMETRY_WS` | on | `0` / `false` |
+| `STUDIO_TELEMETRY_GPU_SOURCE` | `auto` | `unavailable` |
+| `STUDIO_TELEMETRY_ALLOW_POWERMETRICS` | off | — |
+| `VITE_ENABLE_TELEMETRY_WS` | on | `0` at build time |
+
+Every new surface can be rolled back at runtime without a rebuild.
+The rollback playbook is in `docs/env-vars.md`.
+
+## Deferred / follow-up
+
+Known items we explicitly did NOT address in this chunk, documented
+for the next cycle:
+
+- **SGLang parser migration** — replace our 5-dialect hand-rolled
+  parser with SGLang's `BaseFormatDetector` framework to pick up
+  coverage for Harmony (gpt-oss), DeepSeek-R1, Llama 3.1/3.2's
+  `<|python_tag|>`, Mistral Tekken, Command-R, and ~15 other
+  families we don't currently parse. Full scoping doc in
+  `docs/chunk-h2-matrix/sglang-parser-migration.md` (commit
+  `89662be7`). Staged MLX-only migration in four phases; rejected
+  whole-system unification because llama-server with `--jinja`
+  drops raw content when it emits structured `tool_calls`,
+  leaving nothing for SGLang to parse on the GGUF path.
+
+- **Multi-GPU telemetry** — sampler returns a single dict today;
+  refactor point marked in `_run`. Next chunk: `list[dict]` return
+  + per-device WS events + multi-sparkline UI.
+
+- **NVIDIA temp / fan / power** — pynvml exposes these via
+  `nvmlDeviceGetTemperature`/`GetFanSpeed`/`GetPowerUsage`; natural
+  next fields after `freq_mhz`.
+
+- **PDH memory total on Windows** — needs either `dxgi` ctypes
+  (`IDXGIAdapter3::GetVideoMemoryInfo`) or a cached `wmic` query at
+  startup. Current Windows path reports `mem_total_gb=None`.
+
+- **IOKit fallback scaffold** — returns False on every platform
+  today; only matters if IOReport disappears in a future macOS.
+  Cheap to implement via pyobjc + `IOAccelerator/PerformanceStatistics`
+  if/when needed.
+
+## Test posture
+
+Full backend suite: 918 tests pass on this branch vs 512 on main —
+~400 tests added across the parser, streaming, telemetry, and
+agentic-loop work. 19 environmental failures on both branch and
+main (flash-attn needs Linux; GPU selection tests need CUDA;
+vision_cache / cache_case_resolution are pre-existing). Zero new
+test failures attributable to this branch.
+
+Frontend type-checks clean. Frontend build clean.
+
+Cross-platform GPU telemetry validated via 33 new unit tests that
+mock each backend's underlying primitive (pynvml module, sysfs
+reads, PDH counters, nvidia-smi subprocess). Integration test is
+the Chrome preview on Apple Silicon, which still exercises the
+`ioreport` path end-to-end after every code change.
