@@ -5165,28 +5165,42 @@ async def _openai_passthrough_stream(
         try:
             lines_iter = resp.aiter_lines()
             iter_anext = lines_iter.__anext__
+            # Same single-outstanding-task invariant as the MLX path:
+            # ``aiter_lines`` is single-consumer, and even if it
+            # tolerated concurrent __anext__ calls, we'd be dispatching
+            # partial-line state across tasks. Keep one outstanding
+            # task across keepalive ticks.
+            _pending_line: Optional[asyncio.Task] = None
 
             async def _next_line_or_keepalive():
-                """Race the next upstream line against the keepalive
-                deadline. Returns ``(line, is_keepalive, is_end)``."""
-                fut = asyncio.create_task(iter_anext())
+                """Race the in-flight next-line task against the
+                keepalive deadline. Returns
+                ``(line, is_keepalive, is_end)``."""
+                nonlocal _pending_line
+                if _pending_line is None or _pending_line.done():
+                    _pending_line = asyncio.create_task(iter_anext())
                 try:
                     if keepalive_interval > 0:
                         try:
                             line = await asyncio.wait_for(
-                                asyncio.shield(fut),
+                                asyncio.shield(_pending_line),
                                 timeout = keepalive_interval,
                             )
+                            _pending_line = None
                             return line, False, False
                         except asyncio.TimeoutError:
                             return None, True, False
                     else:
-                        line = await fut
+                        line = await _pending_line
+                        _pending_line = None
                         return line, False, False
                 except StopAsyncIteration:
+                    _pending_line = None
                     return None, False, True
                 except BaseException:
-                    fut.cancel()
+                    if _pending_line is not None:
+                        _pending_line.cancel()
+                        _pending_line = None
                     raise
 
             while True:
@@ -5477,36 +5491,60 @@ async def _mlx_agentic_stream(
             )
         _last_yield_ts[0] = now
 
+    # The in-flight ``next(gen)`` task — persistent across keepalive
+    # ticks. CRITICAL: Python generators are NOT thread-safe; calling
+    # ``next(gen)`` concurrently from two threads can corrupt state or
+    # raise "generator already executing". So we must keep a single
+    # outstanding next() task alive across keepalive timeouts and only
+    # create a new one after the previous one resolves.
+    _pending_next: Optional[asyncio.Task] = None
+
     async def _next_or_keepalive():
-        """Race next(gen) against the keepalive deadline.
+        """Race the in-flight next(gen) task against the keepalive
+        deadline.
 
         Returns ``(event, is_keepalive)``. When ``is_keepalive`` is
-        True the caller should yield a keepalive comment and loop back
-        — the generator task was *not* cancelled (we shield it), so
-        it's still running and the next call will pick up where it
-        left off.
+        True the caller should yield a keepalive comment and loop
+        back — the pending task is left running and the NEXT call
+        will observe its completion. We never start a second
+        concurrent ``next(gen)``.
         """
-        fut = asyncio.create_task(asyncio.to_thread(next, gen, _sentinel))
+        nonlocal _pending_next
+        if _pending_next is None or _pending_next.done():
+            # Previous task resolved (or this is the first call);
+            # kick off a new one for the next event.
+            _pending_next = asyncio.create_task(
+                asyncio.to_thread(next, gen, _sentinel)
+            )
         try:
             if keepalive_interval > 0:
                 try:
+                    # ``shield`` so the wait_for timeout doesn't
+                    # cancel the running task — we want it to keep
+                    # running; we just want a periodic yield slot.
                     result = await asyncio.wait_for(
-                        asyncio.shield(fut),
+                        asyncio.shield(_pending_next),
                         timeout = keepalive_interval,
                     )
+                    # Task resolved — clear so the next call creates
+                    # a fresh one.
+                    _pending_next = None
                     return result, False
                 except asyncio.TimeoutError:
+                    # Task still running — signal keepalive; leave
+                    # the task in place for the next iteration.
                     return None, True
             else:
-                return await fut, False
+                result = await _pending_next
+                _pending_next = None
+                return result, False
         except BaseException:
-            # On any other failure (cancellation etc.), cancel the
-            # spawned task so it doesn't outlive us. ``shield`` would
-            # otherwise leak it if the outer request is cancelled
-            # while the thread is still running. Best-effort — the
-            # thread itself can't be killed, but the Future wrapper
-            # gets cleaned up when next() eventually returns.
-            fut.cancel()
+            # Propagating exception: cancel the in-flight task so it
+            # doesn't outlive us. Best-effort — the thread itself
+            # can't be killed from Python, but we stop awaiting it.
+            if _pending_next is not None:
+                _pending_next.cancel()
+                _pending_next = None
             raise
 
     try:
