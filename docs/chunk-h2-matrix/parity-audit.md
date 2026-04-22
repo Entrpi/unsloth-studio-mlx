@@ -80,22 +80,30 @@ These dimensions are already at full parity or the gap is genuinely
 - **LoRA on audio models** — N/A; no one ships audio LoRA adapters
   for LFM2.5-Audio today.
 
-## Implementing now
+## Closed this chunk
 
-**VLM tool-calling (Option A)** — close the `supports_tools=True` +
-no-generator gap by porting `generate_chat_completion_with_tools` from
-MlxLm to MlxVlm, with image-input passthrough, and wiring the
-`enable_tools=True` branch of the `using_vlm:` route into a new
-`_mlx_vlm_agentic_stream` peer of `_mlx_agentic_stream`.
+**VLM tool-calling (Option A) — RESOLVED.**
+See `blockers.md::B5` for the full closure trail.
 
-Rationale: Gemma 4 E4B loads as a VLM and advertises
-`supports_tools=True`, but the VLM route branch runs plain chat — the
-`enable_tools` toggle silently did nothing. This broke the B3 closure
-promise for VLM checkpoints and hit the user in real usage on
-2026-04-22.
-
-Scope details in `blockers.md::B5`. Tests land alongside the
-implementation.
+Landed in commits:
+- `MlxVlmBackend.generate_chat_completion_with_tools` agentic loop
+  with image-b64 passthrough, shared-parser reuse, hold-back, and
+  timeout wrapper.
+- Route `using_vlm:` branch gains a `payload.enable_tools` sub-branch
+  that dispatches to `_mlx_vlm_agentic_stream`.
+- `_render_prompt` now tries passing `tools=` through
+  `apply_chat_template` first so Gemma-4's native
+  `<|tool>declaration:NAME{...}<tool|>` dialect is emitted — falls
+  back to the old system-prompt injection for templates that reject
+  the kwarg.
+- 12 unit tests in `test_mlx_vlm_tool_loop_unit.py` covering
+  guards, tool-choice, happy path, Gemma dialect, image-b64 first-
+  iteration-only contract, content hold-back, timeout wrapper,
+  cancel-event exit, max-iterations cap, metadata sum.
+- 1 real-model integration test in
+  `test_mlx_vlm_gemma_tool_calling.py` — empirically verified:
+  Gemma-4 E4B VLM emits `tool_name='get_weather'`,
+  `arguments={'city': 'Paris'}` through the VLM backend.
 
 ## Flagged for follow-up
 
