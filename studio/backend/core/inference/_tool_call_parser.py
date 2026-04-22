@@ -65,7 +65,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 # ── Pre-compiled patterns for tool-call XML parsing ──────────────────
@@ -313,6 +313,26 @@ def parse_tool_calls_from_text(
             call["id"] = f"call_{len(tool_calls)}"
             tool_calls.append(call)
 
+    # ── Dialect 4: loose top-level JSON envelope ──────────────────
+    # Some models (notably Gemma-4 E4B under certain prompts, also a few
+    # Llama / Mistral fine-tunes) emit a bare JSON object *without* any
+    # wrapper tag when they decide to call a tool. Key name conventions
+    # vary — observed in the wild:
+    #   {"tool_name": "X", "params": {...}}
+    #   {"name": "X", "arguments": {...}}
+    #   {"tool": "X", "input": {...}}
+    #   {"function": "X", "parameters": {...}}
+    # Try these as a last resort: only when every other dialect found
+    # nothing AND the content is a single top-level JSON object (or
+    # ends with one) that has one of the name/args key pairs. This is
+    # strictly narrower than "any JSON content is a tool call" — a
+    # legitimate JSON response without tool-call keys stays inert.
+    if not tool_calls and try_json:
+        loose_calls = _parse_loose_json_envelope(content)
+        for call in loose_calls:
+            call["id"] = f"call_{len(tool_calls)}"
+            tool_calls.append(call)
+
     return tool_calls
 
 
@@ -492,6 +512,166 @@ def _parse_gemma_dialect(content: str) -> List[Dict[str, Any]]:
             }
         )
     return tool_calls
+
+
+_LOOSE_NAME_KEYS = ("name", "tool_name", "tool", "function")
+_LOOSE_ARGS_KEYS = ("arguments", "params", "input", "parameters")
+
+
+def _parse_loose_json_envelope(content: str) -> List[Dict[str, Any]]:
+    """Parse a bare JSON envelope as a tool call.
+
+    Accepts top-level objects shaped like any of:
+        {"tool_name": "X", "params": {...}}
+        {"name": "X", "arguments": {...}}
+        {"tool": "X", "input": {...}}
+        {"function": "X", "parameters": {...}}
+
+    Also handles an outer ``{"tool_calls": [...]}`` wrapper where each
+    list entry is one of the above shapes.
+
+    Scans the content's tail for the last balanced ``{...}`` object
+    (the model may precede it with prose). Returns [] if nothing
+    parses, if required keys are missing, or if the matched object
+    looks like regular JSON content (e.g. only one of the keys is
+    present and it's a plain string).
+    """
+    if not content or "{" not in content:
+        return []
+
+    # Find the OUTERMOST balanced object. Scan from the first '{'; if
+    # it fails, try subsequent '{' positions (model may have prose
+    # that looks like "Here is the call: {...}").
+    for start in _iter_brace_starts(content):
+        body, end = _take_balanced_object(content, start)
+        if body is None:
+            continue
+        try:
+            parsed = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        # Outer "tool_calls" wrapper: recurse into each entry.
+        tc_list = parsed.get("tool_calls")
+        if isinstance(tc_list, list) and tc_list:
+            out: List[Dict[str, Any]] = []
+            for entry in tc_list:
+                if isinstance(entry, dict):
+                    call = _coerce_loose_to_tool_call(entry)
+                    if call is not None:
+                        call["id"] = f"call_{len(out)}"
+                        out.append(call)
+            if out:
+                return out
+        # Top-level tool-call shape.
+        call = _coerce_loose_to_tool_call(parsed)
+        if call is not None:
+            return [call]
+    return []
+
+
+def _coerce_loose_to_tool_call(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalise one loose-JSON object into the OpenAI-compat shape.
+
+    Requires BOTH a name-like key AND an args-like key (narrowly
+    typed) to fire. ``{"name": "Alice"}`` is not a tool call even
+    though it has a ``name``; ``{"tool_name": "web_search", "params":
+    {...}}`` is.
+    """
+    name = None
+    args_found = False
+    args: Any = None
+    for k in _LOOSE_NAME_KEYS:
+        v = obj.get(k)
+        if isinstance(v, str) and v:
+            name = v
+            break
+        # Handle nested ``"function": {"name": ..., "arguments": ...}``.
+        if k == "function" and isinstance(v, dict):
+            inner_name = v.get("name")
+            if isinstance(inner_name, str) and inner_name:
+                name = inner_name
+                if "arguments" in v:
+                    args = v["arguments"]
+                    args_found = True
+                break
+    if not name:
+        return None
+    if not args_found:
+        for k in _LOOSE_ARGS_KEYS:
+            if k in obj:
+                args = obj[k]
+                args_found = True
+                break
+    if not args_found:
+        # Required key pair missing — treat as incidental JSON, not a
+        # tool call. Prevents false positives on e.g. ``{"name": "X"}``.
+        return None
+    # Args should be a dict or string; anything else isn't a real call.
+    if not isinstance(args, (dict, str, list)):
+        return None
+    if isinstance(args, dict):
+        args_str = json.dumps(args)
+    elif isinstance(args, str):
+        args_str = args
+    else:
+        args_str = json.dumps(args)
+    return {
+        "id": "call_0",
+        "type": "function",
+        "function": {"name": name, "arguments": args_str},
+    }
+
+
+def _iter_brace_starts(content: str):
+    """Yield indices of every unescaped '{' in ``content``."""
+    in_string = False
+    i = 0
+    while i < len(content):
+        ch = content[i]
+        if in_string:
+            if ch == "\\" and i + 1 < len(content):
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            yield i
+        i += 1
+
+
+def _take_balanced_object(content: str, start: int) -> Tuple[Optional[str], int]:
+    """Extract content[start:end+1] where end closes the object at
+    content[start] == '{'. Returns (substring, end) on success, or
+    (None, start) on mismatch. Respects JSON string escaping so braces
+    inside strings don't unbalance the counter.
+    """
+    if start >= len(content) or content[start] != "{":
+        return None, start
+    depth = 0
+    in_string = False
+    i = start
+    while i < len(content):
+        ch = content[i]
+        if in_string:
+            if ch == "\\" and i + 1 < len(content):
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return content[start : i + 1], i
+        i += 1
+    return None, start
 
 
 __all__ = [

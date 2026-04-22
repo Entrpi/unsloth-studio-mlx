@@ -399,6 +399,116 @@ class TestGemmaDialect:
 
 
 # ---------------------------------------------------------------------
+# Dialect 4 — loose top-level JSON envelope (no wrapper tag)
+# ---------------------------------------------------------------------
+
+
+class TestLooseJsonEnvelope:
+    """Some models (notably Gemma-4 E4B under some prompts) drop the
+    wrapper tag and emit a bare top-level JSON object with tool-call-
+    shaped keys. Dialect 4 recognises these as a fall-through after
+    the three wrapper-based dialects produce nothing. Key aliases:
+    name / tool_name / tool / function for the name field; arguments /
+    params / input / parameters for the args field.
+    """
+
+    def test_tool_name_params_shape(self):
+        text = '{ "tool_name": "web_search", "params": { "query": "Ternary Bonsai" } }'
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "web_search"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"query": "Ternary Bonsai"}
+
+    def test_name_arguments_shape_without_wrapper(self):
+        text = '{"name": "get_weather", "arguments": {"city": "Paris"}}'
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
+
+    def test_tool_input_shape(self):
+        text = '{"tool": "python", "input": {"code": "print(1)"}}'
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "python"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"code": "print(1)"}
+
+    def test_tool_calls_wrapper_list(self):
+        text = (
+            '{"tool_calls": ['
+            '{"name": "a", "arguments": {"x": 1}},'
+            '{"name": "b", "arguments": {"y": 2}}'
+            ']}'
+        )
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 2
+        assert [c["function"]["name"] for c in calls] == ["a", "b"]
+        assert [c["id"] for c in calls] == ["call_0", "call_1"]
+
+    def test_function_nested_shape(self):
+        text = '{"function": {"name": "get_weather", "arguments": {"city": "Oslo"}}}'
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "get_weather"
+
+    def test_prose_prefix_before_json(self):
+        text = (
+            "I will call the tool now.\n"
+            '{"tool_name": "web_search", "params": {"query": "x"}}'
+        )
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "web_search"
+
+    def test_string_args_pass_through(self):
+        # OpenAI wire: arguments is a JSON string even when the model
+        # emitted it as a string. Don't re-quote.
+        text = '{"name": "x", "arguments": "raw-string-args"}'
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["arguments"] == "raw-string-args"
+
+    # ── False-positive defences ────────────────────────────────
+
+    def test_incidental_name_only_is_not_a_tool_call(self):
+        # Answer to "what's your name?" shouldn't trigger.
+        text = '{"name": "Alice"}'
+        assert parse_tool_calls_from_text(text) == []
+
+    def test_incidental_json_content_not_tool_call(self):
+        text = '{"temperature": 22, "humidity": 40}'
+        assert parse_tool_calls_from_text(text) == []
+
+    def test_non_string_name_is_skipped(self):
+        text = '{"name": 42, "params": {}}'
+        assert parse_tool_calls_from_text(text) == []
+
+    def test_wrapped_qwen_dialect_takes_precedence(self):
+        # When the <tool_call> wrapper is present, dialect 1 fires and
+        # dialect 4 doesn't re-parse the inner JSON.
+        text = '<tool_call>{"name": "X", "arguments": {"a": 1}}</tool_call>'
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "X"
+        # Only one call emitted — dialect 4 didn't double-add.
+
+    def test_empty_arguments_shape(self):
+        text = '{"tool_name": "ping", "params": {}}'
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert json.loads(calls[0]["function"]["arguments"]) == {}
+
+    def test_forced_qwen_dialect_skips_loose(self):
+        # When caller forces a specific dialect, dialect 4 should not
+        # hijack. 'qwen' implies try_json=True, but loose-JSON only
+        # fires when wrappered forms found nothing.
+        text = '{"tool_name": "X", "params": {}}'
+        assert parse_tool_calls_from_text(text, model_family="qwen") != []
+        # XML-forced should NOT match the loose JSON (try_json=False).
+        assert parse_tool_calls_from_text(text, model_family="xml") == []
+
+
+# ---------------------------------------------------------------------
 # Behaviour preservation — parity against the old inlined GGUF path
 # ---------------------------------------------------------------------
 
