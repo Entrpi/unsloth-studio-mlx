@@ -411,6 +411,63 @@ class MlxVlmBackend:
                 "enable_thinking": bool(enable_thinking)
             }
 
+        # ── Bypass mlx_vlm.apply_chat_template when the conversation
+        # has tool history ──
+        #
+        # mlx_vlm.prompt_utils.apply_chat_template rebuilds every
+        # message with only ``{role, content}`` via ``_get_role_content``
+        # + ``get_message_json`` — it silently discards ``tool_calls``
+        # on assistant turns and drops ``role="tool"`` messages
+        # entirely. That breaks agentic loops on turn 1+: the model
+        # gets a prompt with its own prior "<prose>" turn but NO
+        # ``<|tool_call>`` markup and NO ``<|tool_response>`` result
+        # from the tool it just ran, so it thinks it hasn't searched
+        # yet and generates apology prose ("I have not been able to
+        # perform a search").
+        #
+        # When any message in the conversation carries tool-calling
+        # shape (assistant.tool_calls OR role="tool"), go through the
+        # processor's native HF ``apply_chat_template`` directly —
+        # which passes the full message dict (all keys) into the
+        # underlying Jinja template. Verified against Gemma-4-E4B:
+        # produces the expected ``<|tool_call>call:...<tool_call|>
+        # <|tool_response>response:...<tool_response|>`` sequence.
+        has_tool_history = any(
+            (isinstance(m, dict) and (m.get("tool_calls") or m.get("role") == "tool"))
+            for m in (messages if isinstance(messages, list) else [])
+        )
+        if has_tool_history:
+            try:
+                processor_tmpl = getattr(
+                    self._processor, "apply_chat_template", None
+                )
+                if processor_tmpl is None:
+                    # Processor may expose tokenizer instead.
+                    tok = getattr(self._processor, "tokenizer", None)
+                    if tok is not None:
+                        processor_tmpl = getattr(tok, "apply_chat_template", None)
+                if processor_tmpl is not None:
+                    hf_kwargs: Dict[str, Any] = {
+                        "add_generation_prompt": True,
+                        "tokenize": False,
+                    }
+                    if tools:
+                        hf_kwargs["tools"] = tools
+                    if (
+                        self._supports_reasoning
+                        and enable_thinking is not None
+                    ):
+                        hf_kwargs["chat_template_kwargs"] = {
+                            "enable_thinking": bool(enable_thinking)
+                        }
+                    return processor_tmpl(messages, **hf_kwargs)
+            except Exception as e:
+                logger.warning(
+                    "VLM HF apply_chat_template (tool-history path) "
+                    "failed (%s); falling back to mlx_vlm helper",
+                    type(e).__name__,
+                )
+
         # First attempt: pass ``tools=`` through so the model's native
         # template renders the schema in its own dialect (Gemma-4's
         # <|tool>declaration..., Qwen3's <tools>...</tools>, etc.).
@@ -1245,6 +1302,29 @@ class MlxVlmBackend:
             tools = render_tools,
             enable_thinking = enable_thinking,
         )
+        # Diagnostic: dump the rendered prompt tail (last 1500 chars) so
+        # we can verify tool results are present + correctly formatted
+        # when generation on an agentic-loop follow-up turn produces an
+        # empty turn_text (observed with Gemma-4 E4B).
+        try:
+            _conv_shape = [
+                {
+                    "role": m.get("role"),
+                    "has_content": bool(m.get("content")),
+                    "has_tool_calls": bool(m.get("tool_calls")),
+                    "name": m.get("name"),
+                }
+                for m in conversation
+            ]
+            logger.info(
+                "VLM _stream_turn: conv=%d msgs shape=%r prompt_len=%d prompt_tail=%r",
+                len(conversation),
+                _conv_shape,
+                len(prompt) if isinstance(prompt, str) else -1,
+                prompt[-1500:] if isinstance(prompt, str) else prompt,
+            )
+        except Exception:
+            pass
 
         tmpdir_ctx: Optional[tempfile.TemporaryDirectory] = None
         image_path: Optional[str] = None
