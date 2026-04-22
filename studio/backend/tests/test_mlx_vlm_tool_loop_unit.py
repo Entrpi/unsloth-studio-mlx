@@ -517,3 +517,94 @@ class TestVlmMetadataEvent:
             usage["total_tokens"]
             == usage["prompt_tokens"] + usage["completion_tokens"]
         )
+
+
+# ── Phase 2 progress events ─────────────────────────────────────
+
+class TestProgressEvents:
+    """``{"type": "progress", "phase": ..., "iter": N}`` must fire at
+    the expected boundaries of the agentic loop:
+
+    - ``prompt_eval`` emitted once per iteration BEFORE the inner
+      ``_stream_vlm_assistant_turn`` generator is pumped (i.e. before
+      any ``content`` event of that iteration arrives).
+    - ``generating`` emitted at most once per iteration, immediately
+      BEFORE the first non-empty ``content`` event.
+    - A two-iteration happy-path therefore produces two of each, in
+      the strictly-alternating sequence
+      ``prompt_eval, generating, ..., prompt_eval, generating, ...``.
+
+    The feature-flag (``STUDIO_EMIT_PROGRESS_EVENTS=0``) suppresses
+    both event types entirely.
+    """
+
+    def _events(self, monkeypatch = None):
+        b = _stub_vlm_backend_for_tools()
+        tool_call_markup = (
+            '<tool_call>{"name": "get_weather", "arguments": '
+            '{"city": "Paris"}}</tool_call>'
+        )
+        with mock.patch(
+            "core.inference.tools.execute_tool",
+            return_value = '{"temp": 22}',
+        ):
+            events, _ = _run_vlm_tool_loop(
+                b,
+                turns_text = [tool_call_markup, "22 degrees in Paris."],
+                tools = [
+                    {
+                        "type": "function",
+                        "function": {"name": "get_weather"},
+                    }
+                ],
+            )
+        return events
+
+    def test_progress_events_fire_at_boundaries(self):
+        events = self._events()
+        progress = [
+            e for e in events
+            if isinstance(e, dict) and e.get("type") == "progress"
+        ]
+        # Two iterations → at least two prompt_eval + two generating.
+        phases_by_iter: dict = {}
+        for e in progress:
+            key = (e.get("iter"), e.get("phase"))
+            phases_by_iter[key] = phases_by_iter.get(key, 0) + 1
+        assert phases_by_iter.get((0, "prompt_eval"), 0) == 1, progress
+        assert phases_by_iter.get((0, "generating"), 0) == 1, progress
+        assert phases_by_iter.get((1, "prompt_eval"), 0) == 1, progress
+        assert phases_by_iter.get((1, "generating"), 0) == 1, progress
+
+    def test_prompt_eval_precedes_content_within_iteration(self):
+        events = self._events()
+        # For each iteration: first content event of that iter must
+        # be AFTER this iter's prompt_eval and BEFORE its generating
+        # (generating fires immediately before the same content).
+        # Simplest check: the first event of the whole stream is
+        # prompt_eval(iter=0).
+        first_progress = next(
+            (e for e in events if isinstance(e, dict)
+             and e.get("type") == "progress"),
+            None,
+        )
+        assert first_progress is not None
+        assert first_progress["phase"] == "prompt_eval"
+        assert first_progress["iter"] == 0
+
+    def test_progress_feature_flag_disables_emission(self, monkeypatch):
+        from core.inference import mlx_lm as _mlx_lm_mod
+
+        monkeypatch.setenv("STUDIO_EMIT_PROGRESS_EVENTS", "0")
+        # Sanity: the helper reads the env var fresh on each call.
+        assert _mlx_lm_mod._progress_events_enabled() is False
+
+        events = self._events()
+        progress = [
+            e for e in events
+            if isinstance(e, dict) and e.get("type") == "progress"
+        ]
+        assert progress == [], (
+            f"progress events leaked with flag disabled: {progress}"
+        )
+

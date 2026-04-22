@@ -488,8 +488,19 @@ const CodeToolsToggle: FC = () => {
   );
 };
 
+// Phase 2 — user-facing copy for the two progress phases emitted by
+// the backend agentic loop. Intentionally short ("…" suffix) — these
+// render inline in a small chip so the text budget is tight. Keep
+// synced with ``STUDIO_EMIT_PROGRESS_EVENTS`` / the phase enum in
+// ``core.inference.mlx_lm`` + ``core.inference.mlx_vlm``.
+const PROGRESS_PHASE_COPY: Record<string, string> = {
+  prompt_eval: "Re-reading conversation…",
+  generating: "Generating…",
+};
+
 const ToolStatusDisplay: FC = () => {
   const toolStatus = useChatRuntimeStore((s) => s.toolStatus);
+  const progressState = useChatRuntimeStore((s) => s.progressState);
   const isThreadRunning = useAuiState(({ thread }) => thread.isRunning);
   const [elapsed, setElapsed] = useState(0);
   const [visible, setVisible] = useState(false);
@@ -523,18 +534,43 @@ const ToolStatusDisplay: FC = () => {
     };
   }, [toolStatus, isThreadRunning]);
 
-  if (!toolStatus || !visible) return null;
-  const isRunning = toolStatus.startsWith("Running");
-  const StatusIcon = isRunning ? TerminalIcon : GlobeIcon;
-  return (
-    <div className="mb-2 flex w-full flex-row items-center gap-2 px-1.5 pt-0.5 pb-1">
-      <div className="flex animate-pulse items-center gap-2 rounded-full border border-primary/20 bg-primary/5 px-3 py-1.5 text-xs text-primary">
-        <StatusIcon className="size-3.5" />
-        <span>{toolStatus}</span>
-        <span className="tabular-nums opacity-60">{elapsed}s</span>
+  if (toolStatus && visible) {
+    const isRunning = toolStatus.startsWith("Running");
+    const StatusIcon = isRunning ? TerminalIcon : GlobeIcon;
+    return (
+      <div className="mb-2 flex w-full flex-row items-center gap-2 px-1.5 pt-0.5 pb-1">
+        <div className="flex animate-pulse items-center gap-2 rounded-full border border-primary/20 bg-primary/5 px-3 py-1.5 text-xs text-primary">
+          <StatusIcon className="size-3.5" />
+          <span>{toolStatus}</span>
+          <span className="tabular-nums opacity-60">{elapsed}s</span>
+        </div>
       </div>
-    </div>
-  );
+    );
+  }
+
+  // Phase 2 — companion progress chip. Renders only when tool status
+  // is absent AND the thread is actively running, so a stale
+  // progressState from a prior (completed) turn can't leak a ghost
+  // chip. Visually subtler than the tool chip — muted foreground, no
+  // elapsed counter — because progress is a high-frequency phase
+  // indicator, not a long-duration operation badge.
+  if (
+    !toolStatus &&
+    isThreadRunning &&
+    progressState?.phase &&
+    PROGRESS_PHASE_COPY[progressState.phase]
+  ) {
+    return (
+      <div className="mb-2 flex w-full flex-row items-center gap-2 px-1.5 pt-0.5 pb-1">
+        <div className="flex animate-pulse items-center gap-2 rounded-full border border-muted-foreground/20 bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground">
+          <LoaderIcon className="size-3.5 animate-spin" />
+          <span>{PROGRESS_PHASE_COPY[progressState.phase]}</span>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
 };
 
 const ComposerAction: FC = () => {

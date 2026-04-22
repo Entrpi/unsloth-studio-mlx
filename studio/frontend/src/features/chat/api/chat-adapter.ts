@@ -749,6 +749,23 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
             continue;
           }
 
+          // Phase 2 — structured progress events (phase + iter).
+          // Dispatched into the runtime store so the composer can
+          // render a "Re-reading conversation…" / "Generating…" chip
+          // during silent periods of the agentic loop. Tool status
+          // takes priority over progress in the UI layer.
+          const progressEvent = (chunk as unknown as {
+            _progress?: { phase?: string; iter?: number };
+          })._progress;
+          if (progressEvent !== undefined) {
+            runtime.setProgressState(
+              progressEvent.phase
+                ? { phase: progressEvent.phase, iter: progressEvent.iter ?? 0 }
+                : null,
+            );
+            continue;
+          }
+
           // Emit tool-call content parts for assistant-ui.
           // On tool_start: add a new tool-call part (renders in "running" state).
           // On tool_end: set result on the existing part (transitions to "complete").
@@ -934,6 +951,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       } finally {
         runtime.setGeneratingStatus(null);
         runtime.setToolStatus(null);
+        runtime.setProgressState(null);
         clearTimeout(warmupTimer);
         if (waitingFirstChunk) {
           if (!firstTokenSettled) {

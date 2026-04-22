@@ -35,6 +35,7 @@ from __future__ import annotations
 import concurrent.futures
 import gc
 import json
+import os
 import platform
 import re
 import threading
@@ -48,6 +49,27 @@ logger = get_logger(__name__)
 
 # Sentinel for a metadata event at the end of the generator stream.
 MetadataEvent = Dict[str, Any]
+
+
+# Phase 2 — structured progress events for the agentic loop. During
+# long silent periods (prompt re-eval after a tool call) the SSE wire
+# has no visible activity and the UI can't distinguish "server is
+# working" from "server is stuck". The loop emits small
+# ``{"type": "progress", "phase": ..., "iter": N}`` events at two
+# well-defined boundaries and the route layer forwards them verbatim
+# to a Studio-specific SSE payload. Purely additive — external OpenAI
+# clients never see these events (they're custom ``data:`` payloads
+# with ``type=="progress"``, which non-Studio clients ignore).
+#
+# Feature-flag via ``STUDIO_EMIT_PROGRESS_EVENTS`` (``0`` to disable;
+# anything else or unset = enabled). Mirrors the Phase 1 keepalive
+# knob (``STUDIO_SSE_KEEPALIVE_INTERVAL``) so we have a single env
+# escape hatch per streaming addition.
+def _progress_events_enabled() -> bool:
+    raw = os.environ.get("STUDIO_EMIT_PROGRESS_EVENTS")
+    if raw is None:
+        return True
+    return raw.strip() not in {"0", "false", "False", "no", "off"}
 
 
 # Phase 3 — hf_variant extraction. MLX repos commonly ship with a quant
@@ -1604,9 +1626,25 @@ class MlxLmBackend:
             )
             return
 
+        emit_progress = _progress_events_enabled()
+
         for iteration in range(max_tool_iterations):
             if cancel_event is not None and cancel_event.is_set():
                 return
+
+            # Phase 2 — signal the prompt-eval boundary. Between the
+            # last tool_end and the first content delta of this turn
+            # the wire is silent for 4-10s while apply_chat_template
+            # rebuilds the prompt and prefill tokenizes the re-grown
+            # context. The UI renders this as "Re-reading
+            # conversation…".
+            if emit_progress:
+                yield {
+                    "type": "progress",
+                    "phase": "prompt_eval",
+                    "iter": iteration,
+                }
+            first_token_seen = False
 
             # ── Generate one assistant turn, accumulating text ────
             turn_text = ""
@@ -1683,6 +1721,20 @@ class MlxLmBackend:
                             earliest_signal = idx
                     if earliest_signal >= 0:
                         cleaned = cleaned[:earliest_signal]
+                # Phase 2 — first content yield of this iteration:
+                # prompt-eval is definitionally finished once the
+                # backend has started producing tokens. Fires even
+                # when ``cleaned`` is empty (e.g. the whole turn is
+                # held-back tool-call markup) so the "Generating…"
+                # phase reflects real backend state rather than the
+                # UI's cleaned-output view.
+                if emit_progress and not first_token_seen:
+                    first_token_seen = True
+                    yield {
+                        "type": "progress",
+                        "phase": "generating",
+                        "iter": iteration,
+                    }
                 yield {"type": "content", "text": cleaned}
 
             if cancel_event is not None and cancel_event.is_set():

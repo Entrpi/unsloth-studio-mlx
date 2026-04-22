@@ -434,6 +434,15 @@ export async function* streamChatCompletions(
         separatorIndex = buffer.search(/\r?\n\r?\n/);
         continue;
       }
+      // Phase 2 — structured progress events: {phase, iter}. Surface
+      // to the adapter via _progress; the adapter dispatches into the
+      // runtime store so the UI can render a "Re-reading…" /
+      // "Generating…" status chip between tool events.
+      if ("type" in parsed && parsed.type === "progress") {
+        yield { _progress: parsed } as unknown as OpenAIChatChunk;
+        separatorIndex = buffer.search(/\r?\n\r?\n/);
+        continue;
+      }
       yield parsed as OpenAIChatChunk;
       separatorIndex = buffer.search(/\r?\n\r?\n/);
     }

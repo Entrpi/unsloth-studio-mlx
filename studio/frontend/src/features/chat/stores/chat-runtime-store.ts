@@ -191,6 +191,12 @@ type ChatRuntimeStore = {
   codeToolsEnabled: boolean;
   toolStatus: string | null;
   generatingStatus: string | null;
+  // Phase 2 — structured progress from the backend agentic loop.
+  // ``phase`` is "prompt_eval" (apply_chat_template + prefill) or
+  // "generating" (first token seen). ``iter`` is the 0-indexed
+  // iteration within the current agentic turn. ``null`` between
+  // turns and before the stream starts.
+  progressState: { phase: string; iter: number } | null;
   autoHealToolCalls: boolean;
   maxToolCallsPerMessage: number;
   toolCallTimeout: number;
@@ -240,6 +246,7 @@ type ChatRuntimeStore = {
   setCodeToolsEnabled: (enabled: boolean) => void;
   setToolStatus: (status: string | null) => void;
   setGeneratingStatus: (status: string | null) => void;
+  setProgressState: (state: { phase: string; iter: number } | null) => void;
   setAutoHealToolCalls: (enabled: boolean) => void;
   setMaxToolCallsPerMessage: (value: number) => void;
   setToolCallTimeout: (value: number) => void;
@@ -279,6 +286,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   codeToolsEnabled: false,
   toolStatus: null,
   generatingStatus: null,
+  progressState: null,
   autoHealToolCalls: loadBool(AUTO_HEAL_TOOL_CALLS_KEY, true),
   maxToolCallsPerMessage: loadInt(MAX_TOOL_CALLS_KEY, 25),
   toolCallTimeout: loadInt(TOOL_CALL_TIMEOUT_KEY, 5),
@@ -380,6 +388,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
       toolsEnabled: false,
       codeToolsEnabled: false,
       toolStatus: null,
+      progressState: null,
       kvCacheDtype: null,
       loadedKvCacheDtype: null,
       speculativeType: "ngram-mod",
@@ -395,6 +404,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   setCodeToolsEnabled: (codeToolsEnabled) => set({ codeToolsEnabled }),
   setToolStatus: (toolStatus) => set({ toolStatus }),
   setGeneratingStatus: (generatingStatus) => set({ generatingStatus }),
+  setProgressState: (progressState) => set({ progressState }),
   setAutoHealToolCalls: (autoHealToolCalls) =>
     set(() => {
       saveBool(AUTO_HEAL_TOOL_CALLS_KEY, autoHealToolCalls);

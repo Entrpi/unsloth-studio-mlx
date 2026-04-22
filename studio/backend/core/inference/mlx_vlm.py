@@ -65,6 +65,7 @@ MetadataEvent = Dict[str, Any]
 
 # Reuse the MLX-LM variant regex — same naming conventions apply.
 from core.inference.mlx_lm import _extract_mlx_variant  # noqa: E402
+from core.inference.mlx_lm import _progress_events_enabled  # noqa: E402
 
 
 class MlxVlmBackend:
@@ -946,6 +947,8 @@ class MlxVlmBackend:
             )
             return
 
+        emit_progress = _progress_events_enabled()
+
         for iteration in range(max_tool_iterations):
             if cancel_event is not None and cancel_event.is_set():
                 return
@@ -955,6 +958,19 @@ class MlxVlmBackend:
             # been consumed by the encoder, and passing it again would
             # re-encode + bloat context).
             iter_image = image_b64 if iteration == 0 else None
+
+            # Phase 2 — announce the prompt-eval boundary. On the
+            # first iteration this primarily covers image encoding +
+            # prefill; on subsequent iterations it covers the
+            # apply_chat_template rebuild plus prefill of the re-grown
+            # (tool-result-laden) context.
+            if emit_progress:
+                yield {
+                    "type": "progress",
+                    "phase": "prompt_eval",
+                    "iter": iteration,
+                }
+            first_token_seen = False
 
             turn_text = ""
             turn_usage: Dict[str, Any] = {}
@@ -1003,6 +1019,22 @@ class MlxVlmBackend:
                             earliest_signal = idx
                     if earliest_signal >= 0:
                         cleaned = cleaned[:earliest_signal]
+                # Phase 2 — first content yield of this iteration:
+                # the model is actively producing tokens, so flip
+                # from "Re-reading conversation…" to "Generating…".
+                # We fire on the first yield regardless of whether
+                # ``cleaned`` is empty (a held-back tool-call opener
+                # is still "the model is generating") so the UI phase
+                # chip reflects the real backend state even when the
+                # surviving prose stays empty for an entire
+                # tool-only turn.
+                if emit_progress and not first_token_seen:
+                    first_token_seen = True
+                    yield {
+                        "type": "progress",
+                        "phase": "generating",
+                        "iter": iteration,
+                    }
                 yield {"type": "content", "text": cleaned}
 
             if cancel_event is not None and cancel_event.is_set():

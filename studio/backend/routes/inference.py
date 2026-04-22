@@ -5584,6 +5584,15 @@ async def _mlx_agentic_stream(
                 yield f"data: {json.dumps(event)}\n\n"
                 continue
 
+            # Phase 2 — structured progress events. Forward verbatim;
+            # the frontend handles the ``{"type": "progress", ...}``
+            # payload directly. Non-Studio OpenAI clients ignore
+            # unknown-type data events.
+            if etype == "progress":
+                _mark_yield("progress")
+                yield f"data: {json.dumps(event)}\n\n"
+                continue
+
             if etype == "metadata":
                 _stream_usage = event.get("usage")
                 _stream_timings = event.get("timings")

@@ -2018,6 +2018,94 @@ class TestAgenticLoopMultiTurn:
         assert [e["result"] for e in ends] == ['{"t1": 1}', '{"t2": 2}']
 
 
+class TestProgressEvents:
+    """Phase 2 — structured progress events emitted by the MLX-LM
+    agentic loop. ``prompt_eval`` fires once per iteration before the
+    inner ``_stream_assistant_turn`` loop; ``generating`` fires at
+    most once per iteration, on the first content yield of that
+    iteration. Feature-flag via ``STUDIO_EMIT_PROGRESS_EVENTS``.
+    """
+
+    def test_progress_events_fire_per_iteration(self):
+        from unittest import mock
+
+        b = _stub_backend_for_tools()
+        with mock.patch(
+            "core.inference.tools.execute_tool", return_value="ok"
+        ):
+            events = _run_tool_loop(
+                b,
+                turns_text=[
+                    '<tool_call>{"name": "x", "arguments": {}}</tool_call>',
+                    "final answer",
+                ],
+                tools=[{"type": "function", "function": {"name": "x"}}],
+            )
+
+        progress = [e for e in events if e.get("type") == "progress"]
+        phases = {(e["iter"], e["phase"]) for e in progress}
+        assert (0, "prompt_eval") in phases
+        assert (0, "generating") in phases
+        assert (1, "prompt_eval") in phases
+        assert (1, "generating") in phases
+
+    def test_prompt_eval_fires_before_any_content(self):
+        """The first progress event of the stream MUST be
+        ``prompt_eval`` for iteration 0 — the whole point is to give
+        the UI a signal before the first token arrives.
+        """
+        from unittest import mock
+
+        b = _stub_backend_for_tools()
+        with mock.patch(
+            "core.inference.tools.execute_tool", return_value="ok"
+        ):
+            events = _run_tool_loop(
+                b,
+                turns_text=[
+                    '<tool_call>{"name": "x", "arguments": {}}</tool_call>',
+                    "final",
+                ],
+                tools=[{"type": "function", "function": {"name": "x"}}],
+            )
+
+        first_progress = next(
+            (e for e in events if e.get("type") == "progress"), None
+        )
+        first_content = next(
+            (e for e in events if e.get("type") == "content"), None
+        )
+        assert first_progress is not None
+        assert first_progress["phase"] == "prompt_eval"
+        assert first_progress["iter"] == 0
+        # Index-wise, prompt_eval must come before the first content.
+        assert events.index(first_progress) < events.index(first_content)
+
+    def test_feature_flag_disables_progress_events(self, monkeypatch):
+        from unittest import mock
+
+        from core.inference.mlx_lm import _progress_events_enabled
+
+        monkeypatch.setenv("STUDIO_EMIT_PROGRESS_EVENTS", "0")
+        assert _progress_events_enabled() is False
+
+        b = _stub_backend_for_tools()
+        with mock.patch(
+            "core.inference.tools.execute_tool", return_value="ok"
+        ):
+            events = _run_tool_loop(
+                b,
+                turns_text=[
+                    '<tool_call>{"name": "x", "arguments": {}}</tool_call>',
+                    "final",
+                ],
+                tools=[{"type": "function", "function": {"name": "x"}}],
+            )
+
+        progress = [e for e in events if e.get("type") == "progress"]
+        assert progress == [], progress
+
+
 class TestContentStreamHoldback:
     """Regression coverage for leaked tool-call markup in the streamed
     content events. The mid-turn ``strip_tool_markup`` only catches
