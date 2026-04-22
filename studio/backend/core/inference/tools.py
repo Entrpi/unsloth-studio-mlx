@@ -593,6 +593,20 @@ def _fetch_page_text(
     return text
 
 
+#: Case-insensitive sentinel values that models emit when the ``url``
+#: argument is semantically absent but the schema's shape forced them
+#: to fill in *something*. Observed in the wild:
+#:   - GLM-4 emits the Python literal ``None`` as a bare string;
+#:   - other models sometimes emit ``"null"`` / ``"undefined"`` /
+#:     the textual ``"N/A"`` / empty string.
+#: Treating these as "no URL" lets web_search fall through to query
+#: mode instead of trying to fetch a non-URL and failing at
+#: urlparse-scheme-check time.
+_URL_FALSY_SENTINELS = frozenset({
+    "none", "null", "undefined", "n/a", "na", "nil", "false",
+})
+
+
 def _web_search(
     query: str,
     max_results: int = 5,
@@ -603,8 +617,13 @@ def _web_search(
 
     If ``url`` is provided, fetches that page directly instead of searching.
     """
-    # Direct URL fetch mode
-    if url and url.strip():
+    # Direct URL fetch mode. Treat common sentinel values the model
+    # may emit as "no URL" so we don't try to fetch a non-URL and
+    # surface a misleading "Blocked: only http/https URLs are allowed
+    # (got '')" error back to the model (which then interprets the
+    # message as a scheme-format issue and burns another turn on a
+    # pointless retry).
+    if url and url.strip() and url.strip().lower() not in _URL_FALSY_SENTINELS:
         fetch_timeout = 60 if timeout is None else min(timeout, 60)
         return _fetch_page_text(url.strip(), timeout = fetch_timeout)
 
