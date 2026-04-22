@@ -39,3 +39,17 @@ mlx-audio>=0.4.2,<0.5 ; sys_platform == "darwin"
 # `backend=whisper` on /v1/audio/transcriptions. Lazy-imported in
 # MlxAudioBackend.transcribe_with_whisper so its absence is non-fatal.
 mlx-whisper>=0.4.3,<0.5 ; sys_platform == "darwin"
+# Chunk H2: cross-platform GPU telemetry. nvidia-ml-py provides the `pynvml`
+# module used by core/telemetry/gpu_sampler.py as the primary GPU source on
+# Linux / WSL / Windows boxes with an NVIDIA driver (NVIDIA is by far the
+# most common inference GPU across Studio's deployment matrix). Marker
+# excludes macOS where Apple-Silicon goes through IOReport instead — on
+# Intel Macs there's no GPU path anyway. Lazy-imported in the sampler so
+# its absence degrades cleanly to the next backend (AMD sysfs, nvidia-smi
+# CLI, ...).
+nvidia-ml-py>=12.0 ; sys_platform != "darwin"
+# Chunk H2: pywin32 provides the `win32pdh` Performance Data Helper used by
+# the Windows branch of the GPU sampler (covers AMD / Intel Arc / any-GPU
+# on Windows, alongside pynvml for NVIDIA cards). Pulled in only on
+# Windows — on Linux/macOS this would be a no-op install.
+pywin32>=306 ; sys_platform == "win32"
