@@ -383,16 +383,65 @@ class MlxVlmBackend:
         list of OpenAI-format messages. We always pass the full messages
         list so multi-turn conversations render correctly.
 
-        Tool-schema injection: ``apply_chat_template`` in ``mlx-vlm``
-        does NOT accept a ``tools=`` kwarg reliably across models, so
-        when tools are supplied we add a synthetic system message with
-        a compact JSON-schema block rather than routing the tools
-        kwarg through the template engine. This mirrors what the GGUF
-        backend's no-template-tools fallback does.
+        Tool-schema rendering: ``mlx_vlm.apply_chat_template`` forwards
+        unknown kwargs to ``get_chat_template`` which in turn forwards
+        them to ``processor.apply_chat_template(messages, tools=...,
+        **kwargs)``. For tool-capable models (Gemma-4, Qwen3-VL) this
+        emits the model's native tool-schema dialect — Gemma-4 for
+        example renders ``<|tool>declaration:NAME{...}<tool|>`` blocks
+        that the model is trained on, which materially improves the
+        model's cooperation vs a generic system-prompt injection.
+
+        When ``tools=`` causes a ``TypeError`` (template doesn't accept
+        the kwarg) we fall back to a synthetic system message that
+        describes the tools in natural language — the shared parser
+        still recognises whatever dialect the model then emits.
         """
         from mlx_vlm.prompt_utils import apply_chat_template  # type: ignore
 
-        # Tool-injection: prepend a system message with the schema.
+        kwargs: Dict[str, Any] = {
+            "num_images": int(num_images),
+            "num_audios": 0,
+            "add_generation_prompt": True,
+        }
+        # Forward enable_thinking only when the model advertises it. Not
+        # every VLM template will honor the kwarg, so wrap in try/except.
+        if self._supports_reasoning and enable_thinking is not None:
+            kwargs["chat_template_kwargs"] = {
+                "enable_thinking": bool(enable_thinking)
+            }
+
+        # First attempt: pass ``tools=`` through so the model's native
+        # template renders the schema in its own dialect (Gemma-4's
+        # <|tool>declaration..., Qwen3's <tools>...</tools>, etc.).
+        if tools:
+            try:
+                return apply_chat_template(
+                    self._processor,
+                    self._config,
+                    messages,
+                    tools = tools,
+                    **kwargs,
+                )
+            except TypeError as e:
+                logger.info(
+                    "VLM apply_chat_template rejected tools= kwarg "
+                    "(%s); falling back to system-prompt injection",
+                    e,
+                )
+            except Exception as e:
+                # Some templates raise ValueError / KeyError on tool
+                # schemas they can't handle; fall back cleanly.
+                logger.warning(
+                    "VLM apply_chat_template raised %s on tools=; "
+                    "falling back to system-prompt injection",
+                    type(e).__name__,
+                )
+
+        # Fallback: inject a synthetic system message describing the
+        # tools in plain text. The shared parser is dialect-agnostic,
+        # so whatever the model then emits (JSON-in-<tool_call>,
+        # XML-function, or Gemma <|tool_call>) still parses.
         effective_messages = messages
         if tools:
             schema_lines = ["You have access to the following tools:"]
@@ -406,9 +455,11 @@ class MlxVlmBackend:
                 "{\"tool_calls\":[{\"name\":...,\"arguments\":{...}}]}."
             )
             tool_system = "\n".join(schema_lines)
-            # Merge with an existing system message if present.
             effective_messages = list(messages)
-            if effective_messages and effective_messages[0].get("role") == "system":
+            if (
+                effective_messages
+                and effective_messages[0].get("role") == "system"
+            ):
                 old = effective_messages[0].get("content", "")
                 if isinstance(old, str) and old:
                     effective_messages[0] = {
@@ -424,18 +475,6 @@ class MlxVlmBackend:
                 effective_messages = [
                     {"role": "system", "content": tool_system}
                 ] + effective_messages
-
-        kwargs: Dict[str, Any] = {
-            "num_images": int(num_images),
-            "num_audios": 0,
-            "add_generation_prompt": True,
-        }
-        # Forward enable_thinking only when the model advertises it. Not
-        # every VLM template will honor the kwarg, so wrap in try/except.
-        if self._supports_reasoning and enable_thinking is not None:
-            kwargs["chat_template_kwargs"] = {
-                "enable_thinking": bool(enable_thinking)
-            }
 
         try:
             return apply_chat_template(
