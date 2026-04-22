@@ -635,6 +635,20 @@ function extractParamLabel(id: string): string | undefined {
   return match ? `${match[1]}B` : undefined;
 }
 
+/** Extract MLX quant label from a repo id (e.g. "…-MLX-4bit" → "4bit",
+ * "mlx-community/…-4bit" → "4bit"). Returns null when the id isn't
+ * structured as an MLX quant variant. */
+function extractMlxQuantLabel(id: string): string | null {
+  const lower = id.toLowerCase();
+  const m = lower.match(/-(\d+(?:\.\d+)?)(bit)\b/);
+  if (m) return `${m[1]}${m[2]}`;
+  // Fallback for bf16/fp16 uploads that occasionally land under the
+  // mlx-community org without a bit suffix — show the precision tag.
+  const m2 = lower.match(/-(bf16|fp16|fp32)\b/);
+  if (m2) return m2[1];
+  return null;
+}
+
 // Module-level caches so re-mounting the popover shows results instantly
 let _cachedGgufCache: CachedGgufRepo[] = [];
 let _cachedModelsCache: CachedModelRepo[] = [];
@@ -947,6 +961,21 @@ export function HubModelPicker({
 
   const chatOnly = usePlatformStore((s) => s.isChatOnly());
 
+  // Non-GGUF cached hub models (``.safetensors`` / ``.bin`` repos in HF
+  // cache). In chat-only mode we filter to just MLX-quant repos: Studio's
+  // chat runtime can load MLX-quantized weights via MlxLmBackend /
+  // MlxVlmBackend on Apple Silicon, but it can't load raw HuggingFace
+  // PyTorch weights without the Unsloth training runtime. Pre-chat-only
+  // builds of the Downloaded section were hidden entirely, which meant
+  // users who downloaded ``unsloth/Qwen3.6-…-UD-MLX-4bit`` via the new
+  // MLX variant picker couldn't see it afterwards. In training mode we
+  // keep showing everything so the existing Unsloth-runtime path is
+  // unchanged.
+  const visibleCachedModels = useMemo(() => {
+    if (!chatOnly) return cachedModels;
+    return cachedModels.filter((c) => isMlxRepo(c.repo_id));
+  }, [cachedModels, chatOnly]);
+
   const recommendedIds = useMemo(() => {
     const all = dedupe([...models.map((model) => model.id), value ?? ""])
       .filter((id) => !downloadedSet.has(id.toLowerCase()))
@@ -1207,7 +1236,7 @@ export function HubModelPicker({
             </div>
           ) : !showHfSection &&
             (cachedGguf.length > 0 ||
-              (!chatOnly && cachedModels.length > 0)) ? (
+              visibleCachedModels.length > 0) ? (
             <>
               <ListLabel
                 icon={<DownloadIcon className="size-3" />}
@@ -1242,36 +1271,45 @@ export function HubModelPicker({
                   )}
                 </div>
               ))}
-              {!downloadedCollapsed && !chatOnly &&
-                cachedModels.map((c) => (
-                  <div key={c.repo_id} className="flex items-center gap-0.5">
-                    <div className="min-w-0 flex-1">
-                      <ModelRow
-                        label={c.repo_id}
-                        meta={formatBytes(c.size_bytes)}
-                        selected={value === c.repo_id}
-                        onClick={() =>
-                          onSelect(c.repo_id, {
-                            source: "hub",
-                            isLora: false,
-                            isDownloaded: true,
-                          })
-                        }
-                        vramStatus={null}
-                      />
+              {!downloadedCollapsed &&
+                visibleCachedModels.map((c) => {
+                  const mlx = isMlxRepo(c.repo_id);
+                  const quant = mlx ? extractMlxQuantLabel(c.repo_id) : null;
+                  const meta = mlx
+                    ? quant
+                      ? `MLX · ${quant} · ${formatBytes(c.size_bytes)}`
+                      : `MLX · ${formatBytes(c.size_bytes)}`
+                    : formatBytes(c.size_bytes);
+                  return (
+                    <div key={c.repo_id} className="flex items-center gap-0.5">
+                      <div className="min-w-0 flex-1">
+                        <ModelRow
+                          label={c.repo_id}
+                          meta={meta}
+                          selected={value === c.repo_id}
+                          onClick={() =>
+                            onSelect(c.repo_id, {
+                              source: "hub",
+                              isLora: false,
+                              isDownloaded: true,
+                            })
+                          }
+                          vramStatus={null}
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDeleteTarget(c.repo_id);
+                        }}
+                        className="shrink-0 rounded-md p-1.5 text-muted-foreground/60 transition-colors hover:bg-destructive/10 hover:text-destructive"
+                      >
+                        <Trash2Icon className="size-3.5" />
+                      </button>
                     </div>
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setDeleteTarget(c.repo_id);
-                      }}
-                      className="shrink-0 rounded-md p-1.5 text-muted-foreground/60 transition-colors hover:bg-destructive/10 hover:text-destructive"
-                    >
-                      <Trash2Icon className="size-3.5" />
-                    </button>
-                  </div>
-                ))}
+                  );
+                })}
             </>
           ) : null}
 
