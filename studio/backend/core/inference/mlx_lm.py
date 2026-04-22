@@ -1552,6 +1552,29 @@ class MlxLmBackend:
         accumulated_predicted_ms = 0.0
         accumulated_predicted_n = 0
 
+        # Duplicate-call detection state — mirror of the VLM backend's
+        # guard. Small tool-capable models sometimes fail to use the
+        # tool result and re-emit the same call verbatim. When the
+        # first call of the current iteration matches the first call
+        # of the previous iteration, break out early to the cap-
+        # reached final-answer path rather than burning every
+        # iteration on the same search.
+        def _canonical_args(args):
+            if args is None:
+                return ""
+            raw = args
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw) if raw else {}
+                except (ValueError, TypeError):
+                    return raw.strip()
+            try:
+                return json.dumps(raw, sort_keys = True)
+            except (TypeError, ValueError):
+                return str(raw)
+
+        _prev_call_sig: Optional[Tuple[str, str]] = None
+
         # ``tool_choice="none"`` → skip the agentic loop entirely.
         if tool_choice_norm == "none":
             yield from self._run_plain_tool_turn(
@@ -1674,6 +1697,23 @@ class MlxLmBackend:
             tool_calls = (
                 parse_tool_calls_from_text(turn_text) if auto_heal_tool_calls else []
             )
+
+            # Duplicate-call detection — same guard as MlxVlmBackend.
+            if tool_calls:
+                _first = tool_calls[0].get("function", {}) or {}
+                _sig: Tuple[str, str] = (
+                    _first.get("name", ""),
+                    _canonical_args(_first.get("arguments")),
+                )
+                if _prev_call_sig is not None and _sig == _prev_call_sig:
+                    logger.info(
+                        "MLX agentic iter=%d: duplicate tool call %r — "
+                        "breaking loop to force final-answer turn",
+                        iteration,
+                        _sig[0],
+                    )
+                    break
+                _prev_call_sig = _sig
 
             if not tool_calls:
                 # Final answer turn — emit the cleaned text one last

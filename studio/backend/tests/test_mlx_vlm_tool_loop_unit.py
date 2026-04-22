@@ -460,9 +460,12 @@ class TestCancelEventExit:
 class TestVlmMaxIterations:
     def test_cap_triggers_final_nudge(self):
         b = _stub_vlm_backend_for_tools()
+        # Each turn uses different arguments so the duplicate-call
+        # guard (TestAgenticLoopDuplicateDetection in the MLX-LM
+        # test file covers that) doesn't short-circuit the cap.
         calls = [
-            '<tool_call>{"name": "loop", "arguments": {}}</tool_call>',
-            '<tool_call>{"name": "loop", "arguments": {}}</tool_call>',
+            '<tool_call>{"name": "loop", "arguments": {"step": 1}}</tool_call>',
+            '<tool_call>{"name": "loop", "arguments": {"step": 2}}</tool_call>',
             "Final fallback answer.",
         ]
         with mock.patch(

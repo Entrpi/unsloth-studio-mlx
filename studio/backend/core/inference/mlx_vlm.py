@@ -783,6 +783,16 @@ class MlxVlmBackend:
         )
         from core.inference.tools import execute_tool
 
+        logger.info(
+            "VLM generate_chat_completion_with_tools ENTRY: tools=%d, "
+            "messages=%d, image=%s, max_iter=%d, auto_heal=%s",
+            len(tools or []),
+            len(messages or []),
+            "yes" if image_b64 else "no",
+            max_tool_iterations,
+            auto_heal_tool_calls,
+        )
+
         tool_choice_norm = self._normalize_tool_choice(tool_choice)
         conversation = [dict(m) for m in messages]
 
@@ -790,6 +800,37 @@ class MlxVlmBackend:
         total_completion_tokens = 0
         accumulated_predicted_ms = 0.0
         accumulated_predicted_n = 0
+
+        # Duplicate-call detection state. Gemma-4 E4B (and other small
+        # VLMs) sometimes fail to incorporate tool results on the
+        # follow-up turn and instead re-emit the same call verbatim —
+        # sometimes via the native dialect, sometimes as a bare loose-
+        # JSON envelope. Without this guard the loop re-executes the
+        # same search up to ``max_tool_iterations`` times, wastes
+        # minutes, and still ends without a useful answer. We track
+        # the signature of the last iteration's first tool call and
+        # break out to the final-nudge turn on match. See
+        # ``docs/chunk-h2-matrix/blockers.md`` entry B6.
+        def _canonical_args(args):
+            """Return a whitespace/key-order-insensitive string form
+            for comparing two ``function.arguments`` values.
+            ``arguments`` is usually a JSON-encoded string on the OpenAI
+            wire, but loose-JSON dialect may pass through as-is.
+            """
+            if args is None:
+                return ""
+            raw = args
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw) if raw else {}
+                except (ValueError, TypeError):
+                    return raw.strip()
+            try:
+                return json.dumps(raw, sort_keys = True)
+            except (TypeError, ValueError):
+                return str(raw)
+
+        _prev_call_sig: Optional[Tuple[str, str]] = None
 
         if tool_choice_norm == "none":
             # Plain single-turn; image still honoured.
@@ -902,6 +943,37 @@ class MlxVlmBackend:
                 if auto_heal_tool_calls
                 else []
             )
+
+            logger.info(
+                "VLM agentic iter=%d: turn_text=%r parsed_calls=%d",
+                iteration,
+                (turn_text or "")[:500],
+                len(tool_calls),
+            )
+
+            # Duplicate-call detection. If the first tool call this
+            # iteration matches the first tool call of the previous
+            # iteration (same name + same canonical arguments), the
+            # model is stuck in a re-emit loop. Break out to the
+            # final-nudge turn so we spend the remaining budget on
+            # producing an answer from the results we already have.
+            if tool_calls:
+                _first = tool_calls[0].get("function", {}) or {}
+                _sig: Tuple[str, str] = (
+                    _first.get("name", ""),
+                    _canonical_args(_first.get("arguments")),
+                )
+                if _prev_call_sig is not None and _sig == _prev_call_sig:
+                    logger.info(
+                        "VLM agentic iter=%d: duplicate tool call %r — "
+                        "breaking loop to force final-answer turn",
+                        iteration,
+                        _sig[0],
+                    )
+                    # Falls through to the cap-reached final-nudge
+                    # path below.
+                    break
+                _prev_call_sig = _sig
 
             if not tool_calls:
                 final_text = (

@@ -2126,6 +2126,128 @@ class TestContentStreamHoldback:
                 )
 
 
+class TestAgenticLoopDuplicateDetection:
+    """Guard against small tool-capable models (observed with Gemma-4 E4B
+    via MLX-VLM, and transferred to MLX-LM for consistency) that fail to
+    use tool results and re-emit the same tool call every iteration.
+    Without the guard, the loop burns through ``max_tool_iterations``
+    re-running the same search. The guard breaks on the second
+    identical call and jumps to the final-answer path.
+    """
+
+    def test_two_identical_calls_breaks_to_final_turn(self):
+        from unittest import mock
+
+        b = _stub_backend_for_tools()
+
+        # Three turns, all with the same tool call. After the 2nd
+        # identical one, the loop should bail rather than execute a
+        # third.
+        same_call = (
+            '<tool_call>{"name": "web_search", "arguments": {"q": "X"}}</tool_call>'
+        )
+
+        executions = []
+
+        def _fake_exec(name, arguments, **kwargs):
+            executions.append((name, arguments))
+            return f"result-{len(executions)}"
+
+        with mock.patch(
+            "core.inference.tools.execute_tool", side_effect=_fake_exec
+        ):
+            events = _run_tool_loop(
+                b,
+                turns_text=[same_call, same_call, same_call, "final answer"],
+                tools=[{"type": "function", "function": {"name": "web_search"}}],
+                max_iter=5,
+            )
+
+        # Tool was executed ONCE (iter 0). Iter 1 detected the
+        # duplicate and broke out. Iter 2/3 never ran the tool.
+        assert len(executions) == 1, (
+            f"expected 1 execution, got {len(executions)}: {executions}"
+        )
+        # The final-answer path fired (conversation ended with a content
+        # event + metadata, no additional tool_start).
+        types = [e.get("type") for e in events if isinstance(e, dict)]
+        assert "tool_start" in types
+        assert types.count("tool_start") == 1  # only the first one
+        assert "metadata" in types
+
+    def test_different_args_are_not_duplicates(self):
+        from unittest import mock
+
+        b = _stub_backend_for_tools()
+
+        turn_a = (
+            '<tool_call>{"name": "web_search", "arguments": {"q": "A"}}</tool_call>'
+        )
+        turn_b = (
+            '<tool_call>{"name": "web_search", "arguments": {"q": "B"}}</tool_call>'
+        )
+
+        executions = []
+
+        def _fake_exec(name, arguments, **kwargs):
+            executions.append(arguments)
+            return "result"
+
+        with mock.patch(
+            "core.inference.tools.execute_tool", side_effect=_fake_exec
+        ):
+            events = _run_tool_loop(
+                b,
+                turns_text=[turn_a, turn_b, "final answer"],
+                tools=[{"type": "function", "function": {"name": "web_search"}}],
+                max_iter=5,
+            )
+
+        # Both calls ran — different queries, not duplicates.
+        assert len(executions) == 2
+        assert executions[0] == {"q": "A"}
+        assert executions[1] == {"q": "B"}
+
+    def test_key_order_does_not_break_duplicate_detection(self):
+        """Canonicalisation uses sorted keys so ``{"a":1,"b":2}`` and
+        ``{"b":2,"a":1}`` count as the same call.
+        """
+        from unittest import mock
+
+        b = _stub_backend_for_tools()
+
+        turn_1 = (
+            '<tool_call>{"name": "web_search", '
+            '"arguments": {"q": "x", "max": 5}}</tool_call>'
+        )
+        # Same args, different key order in the JSON.
+        turn_2 = (
+            '<tool_call>{"name": "web_search", '
+            '"arguments": {"max": 5, "q": "x"}}</tool_call>'
+        )
+
+        executions = []
+
+        def _fake_exec(name, arguments, **kwargs):
+            executions.append(arguments)
+            return "result"
+
+        with mock.patch(
+            "core.inference.tools.execute_tool", side_effect=_fake_exec
+        ):
+            events = _run_tool_loop(
+                b,
+                turns_text=[turn_1, turn_2, turn_1, "final answer"],
+                tools=[{"type": "function", "function": {"name": "web_search"}}],
+                max_iter=5,
+            )
+
+        assert len(executions) == 1, (
+            f"key-order variation should match duplicate; "
+            f"got {len(executions)} executions"
+        )
+
+
 class TestAgenticLoopToolTimeout:
     """Regression coverage for hung tool execution wedging the agentic
     loop. Previously a blocking ``web_search`` could hold the MLX
@@ -2278,9 +2400,13 @@ class TestAgenticLoopMaxIterations:
         # Every turn wants to call a tool; cap at 2 so after 2
         # iterations the loop injects the "no more tools" nudge and
         # runs one more turn with plain text.
+        #
+        # Each turn uses *different* arguments so the duplicate-call
+        # guard doesn't short-circuit the iteration cap path — that
+        # guard has its own TestAgenticLoopDuplicateDetection coverage.
         calls = [
-            '<tool_call>{"name": "loop", "arguments": {}}</tool_call>',
-            '<tool_call>{"name": "loop", "arguments": {}}</tool_call>',
+            '<tool_call>{"name": "loop", "arguments": {"step": 1}}</tool_call>',
+            '<tool_call>{"name": "loop", "arguments": {"step": 2}}</tool_call>',
             "Final fallback answer.",
         ]
         with mock.patch(
