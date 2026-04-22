@@ -2731,17 +2731,46 @@ async def openai_chat_completions(
 
     # ── MLX-VLM path: stream via mlx_vlm.stream_generate ──────
     # Phase 9 (Chunk D). Image-bearing multimodal chats route here.
+    # Chunk H-2 (2026-04-22): the ``enable_tools=true`` sub-branch now
+    # dispatches to :func:`_mlx_vlm_agentic_stream` for the same
+    # server-side tool loop the MLX-LM and GGUF paths use.
     if using_vlm:
         image_b64 = extracted_image_b64 or payload.image_base64
 
-        # Build message list with system prompt prepended. VLM models
-        # don't support Studio's built-in tool-agentic loop yet (Phase 9
-        # non-goal); tool_calls passthrough from clients is accepted
-        # but the content/parsing is done client-side.
-        vlm_messages: List[Dict[str, Any]] = []
-        if system_prompt:
-            vlm_messages.append({"role": "system", "content": system_prompt})
-        vlm_messages.extend(chat_messages)
+        # Guard: enable_tools requires the VLM to advertise tool
+        # support. This matches the MLX-LM branch at ~line 2921.
+        if payload.enable_tools and not vlm_backend.supports_tools:
+            raise HTTPException(
+                status_code = 400,
+                detail = (
+                    "Loaded MLX-VLM model does not advertise "
+                    "tool-calling support. Load a tool-capable VLM "
+                    "(e.g. mlx-community Gemma-4 / Qwen3-VL)."
+                ),
+            )
+
+        # When tools are in play we need the full tool-history in the
+        # message list (assistant ``tool_calls`` + ``role=tool``
+        # results). Otherwise keep the lean Phase-1 shape.
+        if payload.enable_tools:
+            _vlm_tool_system, _vlm_tool_msgs, _ = _extract_content_parts(
+                payload.messages,
+                preserve_tool_history = True,
+                chat_template = vlm_backend.chat_template,
+            )
+            vlm_messages: List[Dict[str, Any]] = []
+            if _vlm_tool_system:
+                vlm_messages.append(
+                    {"role": "system", "content": _vlm_tool_system}
+                )
+            vlm_messages.extend(_vlm_tool_msgs)
+        else:
+            vlm_messages = []
+            if system_prompt:
+                vlm_messages.append(
+                    {"role": "system", "content": system_prompt}
+                )
+            vlm_messages.extend(chat_messages)
 
         cancel_event = threading.Event()
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -2753,6 +2782,98 @@ async def openai_chat_completions(
                 _vlm_stop = [payload.stop]
             elif isinstance(payload.stop, list):
                 _vlm_stop = [s for s in payload.stop if isinstance(s, str) and s]
+
+        # ── MLX-VLM server-side tool agentic loop ─────────────────
+        if payload.enable_tools:
+            from core.inference.tools import ALL_TOOLS
+
+            if payload.enabled_tools is not None:
+                vlm_tools = [
+                    t
+                    for t in ALL_TOOLS
+                    if t["function"]["name"] in payload.enabled_tools
+                ]
+            else:
+                vlm_tools = ALL_TOOLS
+
+            # Tool-use nudge — mirror the MLX-LM path so small
+            # tool-capable VLMs (Gemma-4 E4B) reliably call tools
+            # rather than replying "I can't do that".
+            _vlm_tool_names = {t["function"]["name"] for t in vlm_tools}
+            _vlm_nudge = _build_tool_use_nudge(
+                _vlm_tool_names, vlm_backend.model_identifier
+            )
+            if _vlm_nudge:
+                _existing_system = None
+                for _msg in vlm_messages:
+                    if _msg.get("role") == "system":
+                        _existing_system = _msg
+                        break
+                if _existing_system is not None:
+                    _existing = _existing_system.get("content") or ""
+                    _existing_system["content"] = (
+                        _existing.rstrip() + "\n\n" + _vlm_nudge
+                        if _existing
+                        else _vlm_nudge
+                    )
+                else:
+                    vlm_messages.insert(
+                        0, {"role": "system", "content": _vlm_nudge}
+                    )
+
+            def vlm_generate_with_tools():
+                return vlm_backend.generate_chat_completion_with_tools(
+                    messages = vlm_messages,
+                    tools = vlm_tools,
+                    tool_choice = payload.tool_choice,
+                    image_b64 = image_b64,
+                    temperature = payload.temperature,
+                    top_p = payload.top_p,
+                    top_k = payload.top_k,
+                    min_p = payload.min_p,
+                    max_tokens = payload.max_tokens,
+                    repetition_penalty = payload.repetition_penalty,
+                    presence_penalty = payload.presence_penalty,
+                    stop = _vlm_stop,
+                    cancel_event = cancel_event,
+                    enable_thinking = payload.enable_thinking,
+                    max_tool_iterations = payload.max_tool_calls_per_message
+                    if payload.max_tool_calls_per_message is not None
+                    else 10,
+                    auto_heal_tool_calls = (
+                        payload.auto_heal_tool_calls
+                        if payload.auto_heal_tool_calls is not None
+                        else True
+                    ),
+                    tool_call_timeout = payload.tool_call_timeout
+                    if payload.tool_call_timeout is not None
+                    else 300,
+                    session_id = payload.session_id,
+                )
+
+            if payload.stream:
+                return StreamingResponse(
+                    _mlx_vlm_agentic_stream(
+                        request = request,
+                        cancel_event = cancel_event,
+                        run_gen = vlm_generate_with_tools,
+                        completion_id = completion_id,
+                        created = created,
+                        model_name = model_name,
+                    ),
+                    media_type = "text/event-stream",
+                    headers = {
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            return await _mlx_agentic_non_streaming(
+                run_gen = vlm_generate_with_tools,
+                completion_id = completion_id,
+                created = created,
+                model_name = model_name,
+            )
 
         def vlm_generate():
             return vlm_backend.generate_chat_completion(
@@ -5150,6 +5271,36 @@ async def _openai_passthrough_non_streaming(
 #     `delta.tool_calls`, streamed to the client, and terminated with
 #     `finish_reason: "tool_calls"` so the external client (opencode /
 #     Claude Code / Cursor) can execute the tools itself.
+
+
+async def _mlx_vlm_agentic_stream(
+    *,
+    request,
+    cancel_event,
+    run_gen,
+    completion_id: str,
+    created: int,
+    model_name: str,
+):
+    """VLM peer of :func:`_mlx_agentic_stream`.
+
+    :meth:`MlxVlmBackend.generate_chat_completion_with_tools` yields the
+    identical event shapes (``content`` / ``status`` / ``tool_start`` /
+    ``tool_end`` / ``metadata``), so the SSE plumbing is exactly the
+    same — this wrapper delegates. The separate identifier lets the
+    route layer and tests assert the VLM path is reachable distinctly
+    from the MLX-LM path, and gives us a natural hook for future
+    VLM-only events (e.g. per-turn image encoding progress).
+    """
+    async for frame in _mlx_agentic_stream(
+        request = request,
+        cancel_event = cancel_event,
+        run_gen = run_gen,
+        completion_id = completion_id,
+        created = created,
+        model_name = model_name,
+    ):
+        yield frame
 
 
 async def _mlx_agentic_stream(
