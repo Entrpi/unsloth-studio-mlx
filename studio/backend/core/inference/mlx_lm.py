@@ -1574,6 +1574,13 @@ class MlxLmBackend:
                 return str(raw)
 
         _prev_call_sig: Optional[Tuple[str, str]] = None
+        # Running counter of tool calls across ALL iterations of this
+        # agentic turn. The parser assigns per-call IDs like ``call_0``
+        # relative to a single invocation — which resets every iter.
+        # Rewriting with this counter keeps IDs unique across iters so
+        # the client's assistant-ui store doesn't crash with
+        # ``Duplicate key toolCallId-call_0 in tapResources``.
+        _global_tool_counter = 0
 
         # ``tool_choice="none"`` → skip the agentic loop entirely.
         if tool_choice_norm == "none":
@@ -1697,6 +1704,14 @@ class MlxLmBackend:
             tool_calls = (
                 parse_tool_calls_from_text(turn_text) if auto_heal_tool_calls else []
             )
+
+            # Rewrite tool-call IDs so they're globally unique across
+            # the whole agentic turn (parser returns ``call_0`` fresh
+            # each iteration; assistant-ui keys its state tree by id
+            # and crashes on duplicates across iterations).
+            for _tc in tool_calls:
+                _tc["id"] = f"call_{_global_tool_counter}"
+                _global_tool_counter += 1
 
             # Duplicate-call detection — same guard as MlxVlmBackend.
             if tool_calls:

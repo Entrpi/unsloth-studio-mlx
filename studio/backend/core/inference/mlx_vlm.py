@@ -911,6 +911,17 @@ class MlxVlmBackend:
                 return str(raw)
 
         _prev_call_sig: Optional[Tuple[str, str]] = None
+        # Running counter of tool calls across ALL iterations of this
+        # agentic turn. The parser assigns per-call IDs like ``call_0``,
+        # ``call_1`` relative to a single ``parse_tool_calls_from_text``
+        # invocation — which resets every iteration. Before my fix the
+        # client's assistant-ui store crashed with
+        # ``Duplicate key toolCallId-call_0 in tapResources`` when
+        # iter=1's first tool call arrived with the same id as iter=0's.
+        # Rewriting here ensures unique ids within a single server-side
+        # turn (the only scope the UI cares about — fresh turn = fresh
+        # assistant bubble).
+        _global_tool_counter = 0
 
         if tool_choice_norm == "none":
             # Plain single-turn; image still honoured.
@@ -1024,7 +1035,18 @@ class MlxVlmBackend:
                 else []
             )
 
-            logger.debug(
+            # Rewrite tool-call IDs so they're globally unique across
+            # the ENTIRE agentic turn, not just this iteration. The
+            # parser assigns ``call_0``, ``call_1`` per-invocation; if
+            # we kept those verbatim the client's assistant-ui store
+            # crashes on iter=1's tool with
+            # ``Duplicate key toolCallId-call_0 in tapResources`` and
+            # the whole chat state freezes.
+            for _tc in tool_calls:
+                _tc["id"] = f"call_{_global_tool_counter}"
+                _global_tool_counter += 1
+
+            logger.info(
                 "VLM agentic iter=%d: turn_text=%r parsed_calls=%d",
                 iteration,
                 (turn_text or "")[:500],
@@ -1061,12 +1083,20 @@ class MlxVlmBackend:
                     if auto_heal_tool_calls
                     else turn_text
                 )
-                logger.debug(
+                _ft = final_text or ""
+                logger.info(
                     "VLM agentic iter=%d: no tool_calls parsed — "
-                    "returning final_text (len=%d, prev_text_truncated=%r)",
+                    "returning final_text (len=%d, "
+                    "has_think_open=%s, has_think_close=%s, "
+                    "think_open_count=%d, think_close_count=%d, "
+                    "last_200=%r)",
                     iteration,
-                    len(final_text or ""),
-                    (final_text or "")[:120],
+                    len(_ft),
+                    "<think>" in _ft,
+                    "</think>" in _ft,
+                    _ft.count("<think>"),
+                    _ft.count("</think>"),
+                    _ft[-200:],
                 )
                 yield {"type": "content", "text": final_text}
                 yield {"type": "status", "text": ""}
