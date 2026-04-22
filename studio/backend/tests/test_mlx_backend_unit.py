@@ -2106,6 +2106,87 @@ class TestProgressEvents:
         assert progress == [], progress
 
 
+class TestTelemetryEmission:
+    """Phase 3 — smoke test that the broadcaster receives ``session``
+    and ``tokens`` events co-emitted with Phase 2 ``progress`` events
+    during a tool-loop run. Backend-side only; frontend hook is covered
+    via Chrome preview.
+    """
+
+    def test_session_and_tokens_events_fire(self, monkeypatch):
+        from unittest import mock
+
+        import asyncio
+
+        from core.telemetry.broadcaster import (
+            TelemetryBroadcaster, SubscriptionSpec,
+        )
+
+        # Use a local broadcaster so we don't leak events across tests.
+        local_broadcaster = TelemetryBroadcaster()
+
+        def _fake_tb():
+            return (local_broadcaster, None)
+
+        monkeypatch.setattr(
+            "core.inference.mlx_lm._telemetry_broadcaster",
+            _fake_tb,
+        )
+
+        b = _stub_backend_for_tools()
+
+        # Drive the loop in a thread so the broadcaster's
+        # call_soon_threadsafe can reach an asyncio loop in the test.
+        received = []
+
+        async def _subscribe_and_run():
+            sub = await local_broadcaster.subscribe(
+                SubscriptionSpec(event_types={"session", "tokens"})
+            )
+
+            def _drive():
+                with mock.patch(
+                    "core.inference.tools.execute_tool", return_value="ok"
+                ):
+                    return _run_tool_loop(
+                        b,
+                        turns_text=[
+                            '<tool_call>{"name": "x", "arguments": {}}</tool_call>',
+                            "final answer",
+                        ],
+                        tools=[{"type": "function", "function": {"name": "x"}}],
+                    )
+
+            # Run the sync generator in a thread.
+            loop = asyncio.get_running_loop()
+            fut = loop.run_in_executor(None, _drive)
+
+            async def _drain():
+                try:
+                    while True:
+                        e = await asyncio.wait_for(
+                            sub.__aiter__().__anext__(), timeout=0.5
+                        )
+                        received.append(e)
+                except asyncio.TimeoutError:
+                    pass
+                finally:
+                    sub.close()
+
+            await fut
+            await _drain()
+
+        asyncio.run(_subscribe_and_run())
+
+        types = [e["type"] for e in received]
+        assert "session" in types
+        # A ``done`` state MUST always fire at completion.
+        session_states = [
+            e["state"] for e in received if e["type"] == "session"
+        ]
+        assert "done" in session_states
+
+
 class TestContentStreamHoldback:
     """Regression coverage for leaked tool-call markup in the streamed
     content events. The mid-turn ``strip_tool_markup`` only catches

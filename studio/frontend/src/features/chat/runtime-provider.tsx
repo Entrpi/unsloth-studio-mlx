@@ -28,6 +28,7 @@ import { authFetch } from "@/features/auth";
 import { createOpenAIStreamAdapter } from "./api/chat-adapter";
 import { db } from "./db";
 import { useChatRuntimeStore } from "./stores/chat-runtime-store";
+import { useTelemetrySocket } from "./hooks/use-telemetry-socket";
 import type { MessageRecord, ModelType } from "./types";
 
 const DEFAULT_SUGGESTIONS = [
@@ -758,6 +759,14 @@ function CancelRegistrar(): ReactElement | null {
   return null;
 }
 
+// Phase 3 — boots the telemetry WebSocket at provider scope. Rendered
+// inside <AssistantRuntimeProvider> so it has access to the same
+// runtime/state context as the rest of the chat UI.
+function TelemetrySocketBoot(): ReactElement | null {
+  useTelemetrySocket();
+  return null;
+}
+
 export function ChatRuntimeProvider({
   children,
   modelType = "base",
@@ -790,6 +799,7 @@ export function ChatRuntimeProvider({
       <ActiveThreadSync
         enabled={modelType === "base" && !pairId && !newThreadNonce && !initialThreadId}
       />
+      <TelemetrySocketBoot />
       <CancelRegistrar />
       {initialThreadId && (
         <ThreadAutoSwitch

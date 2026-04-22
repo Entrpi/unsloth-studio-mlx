@@ -63,6 +63,7 @@ from routes import (
     export_router,
     inference_router,
     models_router,
+    telemetry_router,
     training_history_router,
     training_router,
 )
@@ -140,6 +141,22 @@ async def lifespan(app: FastAPI):
 
     threading.Thread(target = _precache, daemon = True).start()
 
+    # Phase 3 — start the GPU sampler. Best-effort: the sampler
+    # chooses its own backend from a fallback chain (iokit → mlx_mem
+    # → powermetrics → unavailable) and swallows its own errors, so
+    # a failure here can never block app startup.
+    try:
+        from core.telemetry import broadcaster as _telemetry_broadcaster
+        from core.telemetry import gpu_sampler as _gpu_sampler
+
+        _gpu_sampler.start(_telemetry_broadcaster)
+    except Exception as exc:
+        import structlog
+
+        structlog.get_logger(__name__).warning(
+            "GPU sampler failed to start: %s", exc
+        )
+
     if storage.ensure_default_admin():
         bootstrap_pw = storage.get_bootstrap_password()
         app.state.bootstrap_password = bootstrap_pw
@@ -155,6 +172,12 @@ async def lifespan(app: FastAPI):
         app.state.bootstrap_password = storage.get_bootstrap_password()
     yield
     # Cleanup
+    try:
+        from core.telemetry import gpu_sampler as _gpu_sampler
+
+        _gpu_sampler.stop()
+    except Exception:
+        pass
     _hw_module.DEVICE = None
     clear_unsloth_compiled_cache()
 
@@ -205,6 +228,12 @@ app.include_router(export_router, prefix = "/api/export", tags = ["export"])
 app.include_router(
     training_history_router, prefix = "/api/train", tags = ["training-history"]
 )
+
+# Phase 3 — live telemetry WebSocket (GPU util + pre-filter tokens).
+# Mounted at root (``/ws/telemetry``) rather than ``/api`` because WS
+# routes aren't namespaced by the OpenAPI tag system and the shorter
+# path is nicer to type when probing the wire from curl / websocat.
+app.include_router(telemetry_router, tags = ["telemetry"])
 
 
 # ============ Health and System Endpoints ============

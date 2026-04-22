@@ -64,6 +64,8 @@ import { type FC, useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { deleteThreadMessage } from "@/features/chat/utils/delete-thread-message";
 import { useChatRuntimeStore } from "@/features/chat/stores/chat-runtime-store";
+import { TokenCounterChip } from "@/features/chat/components/token-counter-chip";
+import { GpuSparkline } from "@/features/chat/components/gpu-sparkline";
 
 export const Thread: FC<{ hideComposer?: boolean; hideWelcome?: boolean }> = ({
   hideComposer,
@@ -130,6 +132,11 @@ export const Thread: FC<{ hideComposer?: boolean; hideWelcome?: boolean }> = ({
             />
             <div className="relative px-5 pb-2">
               <div className="pointer-events-auto mx-auto w-full max-w-(--thread-max-width)">
+                {/* Phase 3 — pre-filter token counter. Lives above the
+                    composer so it coexists with the tool-status /
+                    progress chips that already render inside the
+                    composer surface. */}
+                <TokenCounterChip />
                 <ComposerAnimated />
               </div>
               <p className="mt-1.5 text-center text-[11px] text-muted-foreground">
@@ -583,7 +590,10 @@ const ComposerAction: FC = () => {
         <WebSearchToggle />
         <CodeToolsToggle />
       </div>
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-2">
+        {/* Phase 3 — GPU utilisation sparkline. Auto-hides when the
+            backend sampler reports source=="unavailable". */}
+        <GpuSparkline />
         <ComposerPrimitive.If dictation={false}>
           <ComposerPrimitive.Dictate asChild={true}>
             <TooltipIconButton

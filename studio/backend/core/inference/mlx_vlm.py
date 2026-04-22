@@ -949,8 +949,66 @@ class MlxVlmBackend:
 
         emit_progress = _progress_events_enabled()
 
+        # Phase 3 — telemetry wiring; mirror of MlxLmBackend. See the
+        # peer method for rationale; keeping the two implementations
+        # independent (not shared) so divergent error paths don't get
+        # accidentally coupled.
+        from core.inference.mlx_lm import (
+            _telemetry_enabled as _tw,
+            _telemetry_broadcaster as _tb_get,
+        )
+        emit_telemetry = _tw()
+        _tb, _gs = (_tb_get() if emit_telemetry else (None, None))
+        _last_token_emit_ts = 0.0
+        _TOKEN_EMIT_INTERVAL = 0.25
+
+        def _emit_session_state(state: str, it: int) -> None:
+            if _tb is None:
+                return
+            try:
+                _tb.emit(
+                    "session",
+                    {"state": state, "iteration": it},
+                    session_id = session_id,
+                )
+            except Exception:
+                pass
+
+        def _emit_tokens(it, pre, post, gtps, ptps) -> None:
+            if _tb is None:
+                return
+            try:
+                _tb.emit(
+                    "tokens",
+                    {
+                        "iteration": it,
+                        "pre_filter_tokens": pre,
+                        "post_filter_tokens": post,
+                        "tps": float(gtps) if gtps is not None else None,
+                        "prompt_tps": float(ptps) if ptps is not None else None,
+                    },
+                    session_id = session_id,
+                )
+            except Exception:
+                pass
+
+        if _gs is not None:
+            try:
+                _gs.notify_session_active(session_id, True)
+            except Exception:
+                pass
+
+        def _mark_session_done(final_iter: int) -> None:
+            _emit_session_state("done", final_iter)
+            if _gs is not None:
+                try:
+                    _gs.notify_session_active(session_id, False)
+                except Exception:
+                    pass
+
         for iteration in range(max_tool_iterations):
             if cancel_event is not None and cancel_event.is_set():
+                _mark_session_done(iteration)
                 return
 
             # Only the FIRST iteration uses the user-provided image.
@@ -970,7 +1028,11 @@ class MlxVlmBackend:
                     "phase": "prompt_eval",
                     "iter": iteration,
                 }
+            _emit_session_state("prompt_eval", iteration)
             first_token_seen = False
+            _turn_pre_filter_tokens = 0
+            _turn_generation_tps = None
+            _turn_prompt_tps = None
 
             turn_text = ""
             turn_usage: Dict[str, Any] = {}
@@ -998,6 +1060,12 @@ class MlxVlmBackend:
                     if event.get("type") == "metadata":
                         turn_usage = event.get("usage", {}) or {}
                         turn_timings = event.get("timings", {}) or {}
+                    elif event.get("type") == "token_tick":
+                        _turn_pre_filter_tokens = int(
+                            event.get("pre_filter_tokens", 0) or 0
+                        )
+                        _turn_generation_tps = event.get("generation_tps")
+                        _turn_prompt_tps = event.get("prompt_tps")
                     continue
                 turn_text = event
                 # Same two-stage clean as MlxLmBackend: strip closed
@@ -1035,10 +1103,30 @@ class MlxVlmBackend:
                         "phase": "generating",
                         "iter": iteration,
                     }
+                    _emit_session_state("generating", iteration)
+                _now_ts = time.monotonic()
+                if _now_ts - _last_token_emit_ts >= _TOKEN_EMIT_INTERVAL:
+                    _last_token_emit_ts = _now_ts
+                    _emit_tokens(
+                        iteration,
+                        _turn_pre_filter_tokens,
+                        len(cleaned),
+                        _turn_generation_tps,
+                        _turn_prompt_tps,
+                    )
                 yield {"type": "content", "text": cleaned}
 
             if cancel_event is not None and cancel_event.is_set():
+                _mark_session_done(iteration)
                 return
+
+            _emit_tokens(
+                iteration,
+                _turn_pre_filter_tokens,
+                len(turn_text),
+                _turn_generation_tps,
+                _turn_prompt_tps,
+            )
 
             total_prompt_tokens = turn_usage.get(
                 "prompt_tokens", total_prompt_tokens
@@ -1139,6 +1227,7 @@ class MlxVlmBackend:
                     predicted_n = accumulated_predicted_n,
                     base_timings = turn_timings,
                 )
+                _mark_session_done(iteration)
                 return
 
             # Record the assistant's turn with its tool_calls so
@@ -1389,6 +1478,7 @@ class MlxVlmBackend:
             predicted_n = accumulated_predicted_n,
             base_timings = final_timings,
         )
+        _mark_session_done(max_tool_iterations)
 
     # ── Helpers for the VLM tool loop ─────────────────────────────
 
@@ -1603,6 +1693,16 @@ class MlxVlmBackend:
                     if not text:
                         continue
                     cumulative += text
+                    # Phase 3 — pre-filter token tick (see mlx_lm.py
+                    # peer for rationale). Unlike mlx_lm's response
+                    # object, ``mlx_vlm``'s generator sometimes yields
+                    # a bare string; ``getattr`` returns 0 in that
+                    # case and the tick still fires with a zero count
+                    # so the outer agentic loop's tps rolling avg
+                    # doesn't go stale.
+                    gen_tokens = int(getattr(resp, "generation_tokens", 0) or 0)
+                    gen_tps = getattr(resp, "generation_tps", None)
+                    prompt_tps = getattr(resp, "prompt_tps", None)
                     if stop_strings:
                         scan_start = max(
                             0,
@@ -1620,8 +1720,20 @@ class MlxVlmBackend:
                         if earliest_rel is not None:
                             cut = scan_start + earliest_rel
                             cumulative = cumulative[:cut]
+                            yield {
+                                "type": "token_tick",
+                                "pre_filter_tokens": gen_tokens,
+                                "generation_tps": gen_tps,
+                                "prompt_tps": prompt_tps,
+                            }
                             yield cumulative
                             break
+                    yield {
+                        "type": "token_tick",
+                        "pre_filter_tokens": gen_tokens,
+                        "generation_tps": gen_tps,
+                        "prompt_tps": prompt_tps,
+                    }
                     yield cumulative
             except Exception as e:
                 logger.error(f"mlx_vlm stream_generate (tool turn) raised: {e}")

@@ -72,6 +72,30 @@ def _progress_events_enabled() -> bool:
     return raw.strip() not in {"0", "false", "False", "no", "off"}
 
 
+# Phase 3 — live telemetry. Pre-filter token counts and session-state
+# pings are pushed via an in-process broadcaster to the
+# ``/ws/telemetry`` WebSocket. Feature-flag via
+# ``STUDIO_ENABLE_TELEMETRY_WS`` (mirrors Phase 1 / Phase 2 env-var
+# knobs). Import lazily inside the helper so the telemetry package
+# has no cost in CI builds that don't boot the app.
+def _telemetry_enabled() -> bool:
+    raw = os.environ.get("STUDIO_ENABLE_TELEMETRY_WS")
+    if raw is None:
+        return True
+    return raw.strip() not in {"0", "false", "False", "no", "off"}
+
+
+def _telemetry_broadcaster():
+    """Return the singleton broadcaster or ``None`` if import fails
+    (e.g. unit-test harness that mocks out the backend module).
+    """
+    try:
+        from core.telemetry import broadcaster, gpu_sampler  # noqa: F401
+        return broadcaster, gpu_sampler
+    except Exception:
+        return None, None
+
+
 # Phase 3 — hf_variant extraction. MLX repos commonly ship with a quant
 # suffix: ``-4bit`` / ``-2bit`` / ``-mlx-2bit`` / ``-8bit``. This regex
 # matches at the end of the repo / dir name. Mirrors the shape of
@@ -1627,9 +1651,83 @@ class MlxLmBackend:
             return
 
         emit_progress = _progress_events_enabled()
+        # Phase 3 — telemetry wiring. Grab the broadcaster once per
+        # request; ``None`` if telemetry is disabled or the import
+        # failed (both are silent).
+        emit_telemetry = _telemetry_enabled()
+        _tb, _gs = (_telemetry_broadcaster() if emit_telemetry else (None, None))
+        _last_token_emit_ts = 0.0  # rate-limit tokens events to ~4 Hz
+        _TOKEN_EMIT_INTERVAL = 0.25
+
+        def _emit_session_state(state: str, iteration: int) -> None:
+            if _tb is None:
+                return
+            try:
+                _tb.emit(
+                    "session",
+                    {
+                        "state": state,
+                        "iteration": iteration,
+                    },
+                    session_id = session_id,
+                )
+            except Exception as exc:
+                logger.debug("telemetry emit session raised: %s", exc)
+
+        def _emit_tokens(
+            iteration: int,
+            pre_filter_tokens: int,
+            post_filter_tokens: int,
+            generation_tps,
+            prompt_tps,
+        ) -> None:
+            if _tb is None:
+                return
+            try:
+                _tb.emit(
+                    "tokens",
+                    {
+                        "iteration": iteration,
+                        "pre_filter_tokens": pre_filter_tokens,
+                        "post_filter_tokens": post_filter_tokens,
+                        "tps": float(generation_tps)
+                        if generation_tps is not None else None,
+                        "prompt_tps": float(prompt_tps)
+                        if prompt_tps is not None else None,
+                    },
+                    session_id = session_id,
+                )
+            except Exception as exc:
+                logger.debug("telemetry emit tokens raised: %s", exc)
+
+        # Tell the GPU sampler "a session is active now" so the
+        # ``mlx_mem`` fallback's binary-util signal flips on.
+        if _gs is not None:
+            try:
+                _gs.notify_session_active(session_id, True)
+            except Exception:
+                pass
+
+        def _mark_session_done(final_iter: int) -> None:
+            """Flip the GPU sampler flag off and emit a ``done`` state.
+
+            Safe to call multiple times — ``notify_session_active`` is
+            idempotent and the broadcaster no-ops on extra emits. We
+            rely on the Generator-protocol ``GeneratorExit`` finaliser
+            wired into the caller via ``_finally_cleanup`` below, not a
+            try/finally here, because yielding from inside a finally
+            block confuses PEP 479.
+            """
+            _emit_session_state("done", final_iter)
+            if _gs is not None:
+                try:
+                    _gs.notify_session_active(session_id, False)
+                except Exception:
+                    pass
 
         for iteration in range(max_tool_iterations):
             if cancel_event is not None and cancel_event.is_set():
+                _mark_session_done(iteration)
                 return
 
             # Phase 2 — signal the prompt-eval boundary. Between the
@@ -1644,7 +1742,11 @@ class MlxLmBackend:
                     "phase": "prompt_eval",
                     "iter": iteration,
                 }
+            _emit_session_state("prompt_eval", iteration)
             first_token_seen = False
+            _turn_pre_filter_tokens = 0
+            _turn_generation_tps = None
+            _turn_prompt_tps = None
 
             # ── Generate one assistant turn, accumulating text ────
             turn_text = ""
@@ -1672,6 +1774,17 @@ class MlxLmBackend:
                     if event.get("type") == "metadata":
                         turn_usage = event.get("usage", {}) or {}
                         turn_timings = event.get("timings", {}) or {}
+                    elif event.get("type") == "token_tick":
+                        # Phase 3 — pre-filter telemetry tick from the
+                        # inner generator. Rate-limit broadcaster
+                        # emission so 60+ tokens/s doesn't spam the
+                        # wire; cheap counter updates happen every
+                        # tick regardless.
+                        _turn_pre_filter_tokens = int(
+                            event.get("pre_filter_tokens", 0) or 0
+                        )
+                        _turn_generation_tps = event.get("generation_tps")
+                        _turn_prompt_tps = event.get("prompt_tps")
                     continue
                 # Cumulative text from the inner generator.
                 turn_text = event
@@ -1735,10 +1848,37 @@ class MlxLmBackend:
                         "phase": "generating",
                         "iter": iteration,
                     }
+                    _emit_session_state("generating", iteration)
+                # Phase 3 — rate-limited token-count broadcast. We
+                # emit at most every ~250ms so 60 tok/s streams don't
+                # flood the WS, but the numbers themselves are always
+                # current.
+                _now_ts = time.monotonic()
+                if _now_ts - _last_token_emit_ts >= _TOKEN_EMIT_INTERVAL:
+                    _last_token_emit_ts = _now_ts
+                    _emit_tokens(
+                        iteration,
+                        _turn_pre_filter_tokens,
+                        len(cleaned),
+                        _turn_generation_tps,
+                        _turn_prompt_tps,
+                    )
                 yield {"type": "content", "text": cleaned}
 
             if cancel_event is not None and cancel_event.is_set():
+                _mark_session_done(iteration)
                 return
+
+            # Flush one final tokens event for this turn so the
+            # displayed count catches any tokens generated in the
+            # final <=250ms window.
+            _emit_tokens(
+                iteration,
+                _turn_pre_filter_tokens,
+                len(turn_text),
+                _turn_generation_tps,
+                _turn_prompt_tps,
+            )
 
             total_prompt_tokens = turn_usage.get("prompt_tokens", total_prompt_tokens)
             total_completion_tokens += int(turn_usage.get("completion_tokens", 0) or 0)
@@ -1799,6 +1939,7 @@ class MlxLmBackend:
                     predicted_n = accumulated_predicted_n,
                     base_timings = turn_timings,
                 )
+                _mark_session_done(iteration)
                 return
 
             # ── Execute each tool, then continue the conversation ──
@@ -2031,6 +2172,7 @@ class MlxLmBackend:
             predicted_n = accumulated_predicted_n,
             base_timings = final_timings,
         )
+        _mark_session_done(max_tool_iterations)
 
     # ── Helper methods for the tool loop ──────────────────────────
 
@@ -2141,6 +2283,13 @@ class MlxLmBackend:
         cumulative = ""
         last_resp: Any = None
         finish_reason = "stop"
+        # Phase 3 — pre-filter token counter. ``resp.generation_tokens``
+        # is the authoritative raw token count from ``mlx-lm``'s
+        # generate loop — BEFORE any tool-markup strip / hold-back. We
+        # yield it as a ``token_tick`` event so the outer agentic loop
+        # can forward it to the telemetry broadcaster (which fans out
+        # to the ``/ws/telemetry`` WebSocket). Yielded alongside the
+        # existing cumulative-text yields so we don't double-iterate.
         try:
             for resp in stream_generate(self._model, self._tokenizer, **sg_kwargs):
                 last_resp = resp
@@ -2151,6 +2300,12 @@ class MlxLmBackend:
                 if not text:
                     continue
                 cumulative += text
+                # Phase 3 — piggyback a telemetry marker. Carries the
+                # pre-filter token count for this turn; the outer
+                # agentic loop rate-limits + broadcasts.
+                gen_tokens = int(getattr(resp, "generation_tokens", 0) or 0)
+                prompt_tps = getattr(resp, "prompt_tps", None)
+                gen_tps = getattr(resp, "generation_tps", None)
                 if stop_strings:
                     scan_start = max(0, len(cumulative) - (max_stop_len + len(text)))
                     hay = cumulative[scan_start:]
@@ -2162,8 +2317,20 @@ class MlxLmBackend:
                     if earliest_rel is not None:
                         cut = scan_start + earliest_rel
                         cumulative = cumulative[:cut]
+                        yield {
+                            "type": "token_tick",
+                            "pre_filter_tokens": gen_tokens,
+                            "generation_tps": gen_tps,
+                            "prompt_tps": prompt_tps,
+                        }
                         yield cumulative
                         break
+                yield {
+                    "type": "token_tick",
+                    "pre_filter_tokens": gen_tokens,
+                    "generation_tps": gen_tps,
+                    "prompt_tps": prompt_tps,
+                }
                 yield cumulative
         except Exception as e:
             logger.error(f"MLX stream_generate (tool turn) raised: {e}")
