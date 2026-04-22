@@ -294,6 +294,125 @@ class TestStripToolMarkup:
 
 
 # ---------------------------------------------------------------------
+# Dialect 5 — GLM-4/4.6/4.7 <tool_call>name\n<arg_key>/<arg_value>
+# ---------------------------------------------------------------------
+
+
+class TestGlmDialect:
+    def test_simple_glm_tool_call(self):
+        text = (
+            "<tool_call>web_search\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>Ternary Bonsai</arg_value>\n"
+            "</tool_call>"
+        )
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "web_search"
+        args = json.loads(calls[0]["function"]["arguments"])
+        # Unquoted value → preserved as a string after JSON-decode
+        # fails.
+        assert args == {"query": "Ternary Bonsai"}
+
+    def test_glm_multiple_args(self):
+        text = (
+            "<tool_call>web_search\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>Ternary Bonsai</arg_value>\n"
+            "<arg_key>url</arg_key>\n"
+            "<arg_value>None</arg_value>\n"
+            "</tool_call>"
+        )
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        args = json.loads(calls[0]["function"]["arguments"])
+        # "None" isn't valid JSON → kept as the string "None".
+        assert args == {"query": "Ternary Bonsai", "url": "None"}
+
+    def test_glm_with_think_and_prose_prelude(self):
+        # Real-world shape from GLM-4.6V-Flash: a <think> block, then
+        # prose, then the tool call. Parser ignores surrounding noise.
+        text = (
+            "<think>The user is asking about X. I should search.</think>\n"
+            "I will search for X now.\n"
+            "<tool_call>web_search\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>X</arg_value>\n"
+            "</tool_call>"
+        )
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "web_search"
+
+    def test_glm_json_encoded_value_decodes(self):
+        # When the model emits a JSON-quoted string value the parser
+        # should decode it (avoids double-wrapping in the final
+        # arguments string).
+        text = (
+            "<tool_call>python\n"
+            "<arg_key>code</arg_key>\n"
+            "<arg_value>\"print(1)\"</arg_value>\n"
+            "</tool_call>"
+        )
+        calls = parse_tool_calls_from_text(text)
+        args = json.loads(calls[0]["function"]["arguments"])
+        assert args == {"code": "print(1)"}
+
+    def test_glm_nested_object_value_decodes(self):
+        text = (
+            "<tool_call>configure\n"
+            "<arg_key>options</arg_key>\n"
+            "<arg_value>{\"depth\": 3, \"verbose\": true}</arg_value>\n"
+            "</tool_call>"
+        )
+        calls = parse_tool_calls_from_text(text)
+        args = json.loads(calls[0]["function"]["arguments"])
+        assert args == {"options": {"depth": 3, "verbose": True}}
+
+    def test_glm_multiple_tool_calls(self):
+        text = (
+            "<tool_call>a\n<arg_key>x</arg_key><arg_value>1</arg_value>"
+            "</tool_call>"
+            "<tool_call>b\n<arg_key>y</arg_key><arg_value>2</arg_value>"
+            "</tool_call>"
+        )
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 2
+        assert calls[0]["function"]["name"] == "a"
+        assert calls[1]["function"]["name"] == "b"
+        # ids are re-numbered uniquely
+        assert calls[0]["id"] != calls[1]["id"]
+
+    def test_glm_empty_body_skipped(self):
+        # A <tool_call>name\n</tool_call> with NO arg pairs is not
+        # executable — parser drops it rather than emitting a call
+        # with empty arguments.
+        text = "<tool_call>web_search\n</tool_call>"
+        calls = parse_tool_calls_from_text(text)
+        assert calls == []
+
+    def test_json_dialect_still_wins_when_body_is_json(self):
+        # A proper JSON-in-<tool_call> body must not accidentally be
+        # consumed by the GLM dialect (GLM start regex is guarded by
+        # ``(?!\{)``).
+        text = '<tool_call>{"name": "a", "arguments": {"x": 1}}</tool_call>'
+        calls = parse_tool_calls_from_text(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "a"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"x": 1}
+
+    def test_glm_forced_family_still_parses(self):
+        text = (
+            "<tool_call>f\n"
+            "<arg_key>k</arg_key><arg_value>v</arg_value>\n"
+            "</tool_call>"
+        )
+        calls = parse_tool_calls_from_text(text, model_family="glm")
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "f"
+
+
+# ---------------------------------------------------------------------
 # extract_channel_thought — Gemma-4 <|channel>thought...<channel|>
 # ---------------------------------------------------------------------
 

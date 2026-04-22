@@ -460,7 +460,29 @@ class MlxVlmBackend:
                         hf_kwargs["chat_template_kwargs"] = {
                             "enable_thinking": bool(enable_thinking)
                         }
-                    return processor_tmpl(messages, **hf_kwargs)
+                    # Argument-shape normalisation. OpenAI convention
+                    # stores ``tool_calls[i].function.arguments`` as a
+                    # JSON-encoded string, but chat templates diverge
+                    # on what they accept:
+                    #   • Gemma-4:  ``is mapping`` branch vs
+                    #     ``is string`` branch — accepts both.
+                    #   • GLM-4:    iterates ``_args.items()`` —
+                    #     REQUIRES dict; a JSON string crashes with
+                    #     ``'str object' has no attribute 'items'``.
+                    #   • Qwen3:    uses ``| tojson`` which works on
+                    #     either (dicts get serialised, strings pass).
+                    # Normalise to dict when the string decodes to a
+                    # JSON object so the widest range of templates
+                    # render correctly. Leave as-is on decode failure
+                    # (malformed args shouldn't force a template
+                    # crash; let the model see the raw text).
+                    normalised_messages = [
+                        self._normalize_tool_call_args(m)
+                        for m in messages
+                    ]
+                    return processor_tmpl(
+                        normalised_messages, **hf_kwargs
+                    )
             except Exception as e:
                 logger.warning(
                     "VLM HF apply_chat_template (tool-history path) "
@@ -1312,6 +1334,66 @@ class MlxVlmBackend:
                 return "required"
             return "auto"
         return "auto"
+
+    @staticmethod
+    def _normalize_tool_call_args(message: Any) -> Any:
+        """Convert ``tool_calls[*].function.arguments`` from a JSON
+        string into a dict so chat templates that iterate the
+        arguments (GLM's ``_args.items()``) don't crash.
+
+        Only mutates a *shallow copy* of the message — the caller's
+        conversation list is untouched, which matters for the agentic
+        loop that reuses the ``conversation`` list across iterations.
+
+        Non-message inputs, messages without ``tool_calls``, and
+        arguments that don't decode to a JSON object are all returned
+        unchanged.
+        """
+        if not isinstance(message, dict):
+            return message
+        tool_calls = message.get("tool_calls")
+        if not tool_calls or not isinstance(tool_calls, list):
+            return message
+        # Check whether any call needs rewriting — avoid the copy when
+        # every ``arguments`` is already a dict (the common case once
+        # a template has rendered cleanly once).
+        needs_copy = False
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                needs_copy = True
+                break
+        if not needs_copy:
+            return message
+        new_msg = dict(message)
+        new_calls: List[Dict[str, Any]] = []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                new_calls.append(tc)
+                continue
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                new_calls.append(tc)
+                continue
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    parsed = json.loads(args)
+                    if isinstance(parsed, dict):
+                        new_fn = dict(fn)
+                        new_fn["arguments"] = parsed
+                        new_tc = dict(tc)
+                        new_tc["function"] = new_fn
+                        new_calls.append(new_tc)
+                        continue
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            new_calls.append(tc)
+        new_msg["tool_calls"] = new_calls
+        return new_msg
 
     def _stream_vlm_assistant_turn(
         self,

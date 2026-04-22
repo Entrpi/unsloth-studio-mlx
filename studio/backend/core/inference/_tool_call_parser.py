@@ -114,6 +114,26 @@ _TC_GEMMA_QUOTE = '<|"|>'
 #: elsewhere.
 _TC_GEMMA_KEY_RE = re.compile(r'([{,]\s*)(\w+)\s*:')
 
+#: GLM-4/4.6/4.7 tool-call start: ``<tool_call>{name}\n`` where the
+#: first line after the opening tag is the function name (no JSON, no
+#: colon, just the bare identifier). The ``(?!\s*\{)`` guard ensures
+#: we don't steal matches from the JSON-body dialect — a body that
+#: opens with ``{`` is JSON, not GLM.
+_TC_GLM_START_RE = re.compile(
+    r"<tool_call>\s*(?!\{)([\w.\-]+)\s*\n", re.IGNORECASE
+)
+
+#: GLM argument pair: ``<arg_key>K</arg_key>\s*<arg_value>V</arg_value>``.
+#: Non-greedy so adjacent pairs don't collapse. Values may span
+#: multiple lines (code blocks etc.), so DOTALL.
+_TC_GLM_ARG_RE = re.compile(
+    r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+    re.DOTALL,
+)
+
+#: GLM tool-call close tag.
+_TC_GLM_END_RE = re.compile(r"</tool_call>")
+
 
 # ── Auto-heal / stripping patterns ───────────────────────────────────
 # These are the regexes GGUF uses to *remove* tool-call XML from a
@@ -258,6 +278,7 @@ def parse_tool_calls_from_text(
     try_json = family in ("auto", "qwen", "bonsai", "hermes", "json")
     try_xml = family in ("auto", "claude", "xml", "text-gen", "mistral")
     try_gemma = family in ("auto", "gemma", "gemma4", "gemma-4")
+    try_glm = family in ("auto", "glm", "glm4", "glm-4", "glm4v")
 
     # ── Dialect 1: JSON inside <tool_call> tags ─────────────────
     # Use balanced-brace extraction that skips braces inside JSON
@@ -334,6 +355,19 @@ def parse_tool_calls_from_text(
     if try_gemma and (not tool_calls or family in ("gemma", "gemma4", "gemma-4")):
         gemma_calls = _parse_gemma_dialect(content)
         for call in gemma_calls:
+            call["id"] = f"call_{len(tool_calls)}"
+            tool_calls.append(call)
+
+    # ── Dialect 5: GLM-4/4.6/4.7 <tool_call>name\n<arg_key>...</arg_key>
+    # <arg_value>...</arg_value>...</tool_call> ───────────────────────
+    # Shares the ``<tool_call>`` opener with Dialect 1 but has a bare
+    # identifier (not JSON) after the tag — the JSON regex requires
+    # ``{`` immediately after the opener and therefore never matches a
+    # GLM body. We try GLM on the ``not tool_calls`` branch in auto
+    # mode so it fires when Dialect 1 produced nothing.
+    if try_glm and (not tool_calls or family in ("glm", "glm4", "glm-4", "glm4v")):
+        glm_calls = _parse_glm_dialect(content)
+        for call in glm_calls:
             call["id"] = f"call_{len(tool_calls)}"
             tool_calls.append(call)
 
@@ -579,6 +613,97 @@ def _parse_gemma_dialect(content: str) -> List[Dict[str, Any]]:
                 "function": {
                     "name": func_name,
                     "arguments": json.dumps(obj),
+                },
+            }
+        )
+    return tool_calls
+
+
+def _parse_glm_dialect(content: str) -> List[Dict[str, Any]]:
+    """Parse GLM-4/4.6/4.7's tool-call dialect.
+
+    GLM's chat template instructs the model to emit::
+
+        <tool_call>{function-name}
+        <arg_key>{arg-key-1}</arg_key>
+        <arg_value>{arg-value-1}</arg_value>
+        <arg_key>{arg-key-2}</arg_key>
+        <arg_value>{arg-value-2}</arg_value>
+        ...
+        </tool_call>
+
+    So the first line after the ``<tool_call>`` opener is the function
+    name (bare identifier — no JSON, no colon, no wrapping tag), and
+    the body is a flat list of ``<arg_key>``/``<arg_value>`` pairs.
+
+    The JSON-body dialect's ``_TC_JSON_START_RE`` requires a ``{``
+    after the opener, so a GLM body never matches that dialect — the
+    two are disjoint and can be tried in any order. We still try GLM
+    after JSON in the auto chain so that a model emitting proper
+    JSON-in-``<tool_call>`` isn't slowed down.
+
+    Value coercion policy: the GLM template renders values via
+    ``{{ v | tojson(ensure_ascii=False) if v is not string else v }}``
+    — strings pass through verbatim, everything else is JSON-encoded.
+    When parsing incoming text we:
+      1. Try ``json.loads`` on the raw value (handles ``42``, ``true``,
+         ``null``, nested objects / arrays, JSON-quoted strings).
+      2. On failure, treat as a plain string (handles unquoted names
+         like ``Ternary Bonsai``, Python ``None`` / ``True`` literals
+         the model sometimes emits, natural-language paragraphs).
+
+    Either way the assembled argument dict is JSON-encoded into the
+    OpenAI ``arguments`` string so downstream tool execution sees a
+    consistent shape.
+    """
+    tool_calls: List[Dict[str, Any]] = []
+    for start_match in _TC_GLM_START_RE.finditer(content):
+        name = start_match.group(1)
+        body_start = start_match.end()
+        # Scope the body to the next </tool_call> or the next
+        # <tool_call> opener — whichever comes first — matching the
+        # behaviour of the other dialects that bound cleanly.
+        end_match = _TC_GLM_END_RE.search(content, body_start)
+        next_start = _TC_GLM_START_RE.search(content, body_start)
+        body_end = len(content)
+        if end_match:
+            body_end = min(body_end, end_match.start())
+        if next_start:
+            body_end = min(body_end, next_start.start())
+        body = content[body_start:body_end]
+
+        arguments: Dict[str, Any] = {}
+        for arg_match in _TC_GLM_ARG_RE.finditer(body):
+            key = arg_match.group(1).strip()
+            raw_value = arg_match.group(2)
+            # Don't trim multi-line values (code/text blobs) — only
+            # the surrounding whitespace a template would introduce.
+            value: Any = raw_value.strip()
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                # Keep as string. Some models emit Python literals
+                # (None / True / False) that aren't JSON; we still
+                # preserve them as strings — tool executors can
+                # normalise or reject as appropriate. Common values
+                # like the string "None" for an absent URL are fine
+                # to pass through verbatim.
+                pass
+            arguments[key] = value
+
+        # Skip empty bodies — a malformed ``<tool_call>name\n</tool_call>``
+        # with no args isn't executable and shouldn't be surfaced as a
+        # call.
+        if not arguments:
+            continue
+
+        tool_calls.append(
+            {
+                "id": f"call_{len(tool_calls)}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(arguments),
                 },
             }
         )
