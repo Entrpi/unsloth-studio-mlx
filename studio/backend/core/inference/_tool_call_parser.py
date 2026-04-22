@@ -133,6 +133,13 @@ TOOL_CLOSED_PATS = [
     re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL),
     re.compile(r"<function=\w+>.*?</function>", re.DOTALL),
     re.compile(r"<\|tool_call>.*?<tool_call\|>", re.DOTALL),
+    # Gemma-4 thinking-channel block — emitted as ``<|channel>thought\n
+    # ...<channel|>`` before the tool call. Not a tool call itself, but
+    # the re-render path in ``mlx_vlm`` routes channel content back to
+    # ``reasoning_content`` where the template puts it in the right
+    # place. Strip it from the visible content stream so it doesn't
+    # leak into the UI as raw markup.
+    re.compile(r"<\|channel>.*?<channel\|>", re.DOTALL),
 ]
 
 #: Final-flush patterns: also strip dangling unclosed blocks.
@@ -140,13 +147,30 @@ TOOL_ALL_PATS = TOOL_CLOSED_PATS + [
     re.compile(r"<tool_call>.*$", re.DOTALL),
     re.compile(r"<function=\w+>.*$", re.DOTALL),
     re.compile(r"<\|tool_call>.*$", re.DOTALL),
+    re.compile(r"<\|channel>.*$", re.DOTALL),
+    # Orphan closing fragments. When a tool-call body is stripped by
+    # the closed-pattern above but the stream also contains a stray
+    # trailing close marker (from a malformed / continuation turn —
+    # e.g. Gemma-4 resuming mid-tool_call generates ``<|"|>}<tool_call|>``
+    # with no opening), those fragments would otherwise leak to the UI.
+    # Safe to strip at final-flush time.
+    re.compile(r"<tool_call\|>", re.DOTALL),
+    re.compile(r"<tool_response\|>", re.DOTALL),
+    re.compile(r"<channel\|>", re.DOTALL),
+    re.compile(r"<turn\|>", re.DOTALL),
+    re.compile(r'<\|"\|>', re.DOTALL),
 ]
 
 #: Prefixes that the speculative buffer watches for. If the assistant
 #: stream starts with any of these, the buffer holds back emission
 #: until the shape resolves (either into a complete tool call, which
 #: gets drained, or into plain content, which gets flushed).
-TOOL_XML_SIGNALS = ("<tool_call>", "<function=", "<|tool_call>")
+TOOL_XML_SIGNALS = (
+    "<tool_call>",
+    "<function=",
+    "<|tool_call>",
+    "<|channel>",
+)
 
 
 # ── Public dataclass result (optional) ───────────────────────────────
@@ -362,6 +386,53 @@ def strip_tool_markup(
     for pat in patterns:
         text = pat.sub("", text)
     return text.strip() if final else text
+
+
+#: Gemma-4 thinking-channel block. The opening tag is
+#: ``<|channel>thought`` (or similar channel-name suffix); the closing
+#: tag is ``<channel|>``. ``strip_thinking`` in the Gemma chat template
+#: removes these from content at render time, so to avoid double-
+#: emitting (once as raw markup in content, once as a re-rendered
+#: ``reasoning_content`` block) we extract them out of the raw turn
+#: text before storing the assistant message.
+_CHANNEL_BLOCK_RE = re.compile(
+    r"<\|channel>(?:thought\s*\n?)?(.*?)<channel\|>",
+    re.DOTALL,
+)
+
+
+def extract_channel_thought(text: str) -> Tuple[Optional[str], str]:
+    """Split Gemma-4's ``<|channel>thought\\n...<channel|>`` block.
+
+    Returns ``(reasoning, remaining_content)``.
+
+    - ``reasoning`` is ``None`` when no channel block is present.
+      Otherwise it is the concatenation of all channel bodies (trimmed,
+      newline-joined). The Gemma template re-renders ``reasoning`` /
+      ``reasoning_content`` back into ``<|channel>thought\\n...<channel|>``
+      at the correct position (before tool_calls), so round-tripping
+      is lossless.
+    - ``remaining_content`` is the original text with all channel
+      blocks removed, preserving surrounding prose verbatim (no
+      ``.strip()`` — callers decide whether to trim).
+
+    Multiple channel blocks in the same text concatenate into a single
+    reasoning string separated by ``\\n\\n``. This matches the UX
+    expectation of showing one "thoughts" section per assistant turn.
+    """
+    if not text or "<|channel>" not in text:
+        return None, text
+    thoughts: List[str] = []
+
+    def _capture(m: "re.Match[str]") -> str:
+        body = m.group(1).strip()
+        if body:
+            thoughts.append(body)
+        return ""
+
+    remaining = _CHANNEL_BLOCK_RE.sub(_capture, text)
+    reasoning = "\n\n".join(thoughts) if thoughts else None
+    return reasoning, remaining
 
 
 # ── Internal helpers ─────────────────────────────────────────────────
@@ -678,6 +749,7 @@ __all__ = [
     "ParsedToolCall",
     "parse_tool_calls_from_text",
     "strip_tool_markup",
+    "extract_channel_thought",
     "TOOL_CLOSED_PATS",
     "TOOL_ALL_PATS",
     "TOOL_XML_SIGNALS",

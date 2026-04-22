@@ -835,6 +835,7 @@ class MlxVlmBackend:
 
         from core.inference._tool_call_parser import (
             TOOL_XML_SIGNALS,
+            extract_channel_thought,
             parse_tool_calls_from_text,
             strip_tool_markup,
         )
@@ -1051,16 +1052,68 @@ class MlxVlmBackend:
 
             # Record the assistant's turn with its tool_calls so
             # apply_chat_template in the next iteration has history.
-            assistant_content = (
+            #
+            # Gemma-4 hygiene — critical for the agentic loop to
+            # continue generating after the tool result:
+            #
+            # The raw ``turn_text`` contains:
+            #   (1) ``<|channel>thought\n...<channel|>`` — the thinking
+            #       trace that Gemma emits BEFORE the tool call, and
+            #   (2) ``<|tool_call>call:NAME{...}<tool_call|>`` — the
+            #       serialised call, already lifted into
+            #       ``tool_calls``.
+            #
+            # If we store the raw text verbatim as assistant.content,
+            # the Gemma chat template on the next turn will:
+            #   - call ``strip_thinking(content)`` which removes (1),
+            #     but leaves (2) — the tool_call markup — doubly
+            #     rendered (once inline, once via ``tool_calls``);
+            #   - emit ``<turn|>\n`` after the rendered content
+            #     (because content is truthy);
+            #   - SKIP ``<|turn>model\n`` because prev_message_type is
+            #     ``tool_response`` (lines 340-343 of the template),
+            #     leaving the prompt anchored nowhere.
+            #
+            # The symptom is that iter=1 produces a tiny fragment like
+            # ``<|"|>}<tool_call|>`` as Gemma continues a malformed
+            # tool-call body into empty space.
+            #
+            # Fix: extract channel-thought → ``reasoning_content``
+            # (the template re-renders it at the correct spot); strip
+            # tool_call markup from prose; leave the assistant message
+            # with empty ``content`` when no prose survives, so the
+            # template's ``not (ns_tr_out.flag and not content)``
+            # branch correctly keeps the turn OPEN for the model to
+            # resume generating after the tool_response.
+            assistant_raw = (
                 strip_tool_markup(turn_text, final = True)
                 if auto_heal_tool_calls
                 else turn_text
             )
+            # ``strip_tool_markup`` at final=True already strips
+            # ``<|channel>...<channel|>`` blocks (per the updated
+            # TOOL_CLOSED_PATS). But we want to *capture* the thought
+            # body to re-emit as reasoning_content on the recorded
+            # message — so re-extract from the original turn_text
+            # (before strip) instead of from the stripped version.
+            reasoning_content, _channel_stripped = extract_channel_thought(
+                turn_text
+            )
+            # After extracting channels, also run tool-markup strip to
+            # drop the ``<|tool_call>...<tool_call|>`` block that's
+            # already lifted into ``tool_calls``.
+            prose_content = strip_tool_markup(
+                _channel_stripped, final = True
+            ) if auto_heal_tool_calls else _channel_stripped
+            # Use empty string (not None) for prose — matches HF chat-
+            # template expectations and keeps the Gemma turn open.
             assistant_msg: Dict[str, Any] = {
                 "role": "assistant",
-                "content": assistant_content,
+                "content": prose_content or "",
                 "tool_calls": tool_calls,
             }
+            if reasoning_content:
+                assistant_msg["reasoning_content"] = reasoning_content
             conversation.append(assistant_msg)
 
             for tc in tool_calls:

@@ -24,6 +24,7 @@ from core.inference._tool_call_parser import (  # noqa: E402
     TOOL_ALL_PATS,
     TOOL_CLOSED_PATS,
     TOOL_XML_SIGNALS,
+    extract_channel_thought,
     parse_tool_calls_from_text,
     strip_tool_markup,
 )
@@ -247,15 +248,114 @@ class TestStripToolMarkup:
         assert strip_tool_markup("") == ""
         assert strip_tool_markup("", final=True) == ""
 
+    def test_strip_gemma_channel_block(self):
+        # Gemma-4 thinking-channel blocks are stripped even mid-stream
+        # (closed variant): downstream routes channel content to
+        # reasoning_content via ``extract_channel_thought``.
+        text = "<|channel>thought\nanalysing...<channel|>prose"
+        assert strip_tool_markup(text) == "prose"
+
+    def test_final_strips_orphan_tool_call_close(self):
+        # When Gemma-4 resumes mid-tool-call (template anchored the
+        # prompt into an open tool_call body), the continuation turn
+        # emits only the tail close markers like
+        # ``<|"|>}<tool_call|>``. At final-flush time the markup
+        # tokens are strippable; residual JSON punctuation (``}``) is
+        # harmless debris and fine to leave as-is.
+        out = strip_tool_markup('<|"|>}<tool_call|>', final=True)
+        assert "<tool_call|>" not in out
+        assert '<|"|>' not in out
+
+    def test_final_strips_orphan_tool_response_close(self):
+        assert strip_tool_markup("<tool_response|>", final=True) == ""
+
+    def test_final_strips_orphan_channel_close(self):
+        assert strip_tool_markup("<channel|>tail", final=True) == "tail"
+
+    def test_final_strips_gemma_quote_token(self):
+        assert (
+            strip_tool_markup('foo <|"|>bar<|"|> baz', final=True)
+            == "foo bar baz"
+        )
+
     def test_patterns_are_exported(self):
-        # Three dialects: JSON-in-<tool_call>, XML <function=>, and
-        # Gemma-4 <|tool_call>. ALL_PATS adds one unclosed variant per
-        # dialect for the final-flush pass.
-        assert len(TOOL_CLOSED_PATS) == 3
-        assert len(TOOL_ALL_PATS) == 6
+        # Closed patterns: JSON-in-<tool_call>, XML <function=>,
+        # Gemma-4 <|tool_call>, and Gemma-4 <|channel> (thinking
+        # block). ALL_PATS adds one unclosed variant per dialect for
+        # the final-flush pass, plus orphan-fragment strippers for
+        # stray close markers that leak out of malformed / resume-
+        # mid-body continuation turns.
+        assert len(TOOL_CLOSED_PATS) == 4
+        assert len(TOOL_ALL_PATS) == 13
         assert "<tool_call>" in TOOL_XML_SIGNALS
         assert "<function=" in TOOL_XML_SIGNALS
         assert "<|tool_call>" in TOOL_XML_SIGNALS
+        assert "<|channel>" in TOOL_XML_SIGNALS
+
+
+# ---------------------------------------------------------------------
+# extract_channel_thought — Gemma-4 <|channel>thought...<channel|>
+# ---------------------------------------------------------------------
+
+
+class TestExtractChannelThought:
+    def test_no_channel_returns_input_unchanged(self):
+        reasoning, remaining = extract_channel_thought("Just plain prose.")
+        assert reasoning is None
+        assert remaining == "Just plain prose."
+
+    def test_empty_input(self):
+        reasoning, remaining = extract_channel_thought("")
+        assert reasoning is None
+        assert remaining == ""
+
+    def test_gemma_channel_with_thought_prefix(self):
+        text = (
+            "<|channel>thought\n"
+            "The user wants the weather.\n"
+            "<channel|>"
+            "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>"
+        )
+        reasoning, remaining = extract_channel_thought(text)
+        assert reasoning == "The user wants the weather."
+        # Channel block gone, tool_call preserved verbatim for the
+        # tool-markup stripper to handle.
+        assert "<|channel>" not in remaining
+        assert "<channel|>" not in remaining
+        assert "<|tool_call>call:get_weather" in remaining
+
+    def test_channel_without_thought_prefix(self):
+        text = "<|channel>raw analysis text<channel|>after"
+        reasoning, remaining = extract_channel_thought(text)
+        assert reasoning == "raw analysis text"
+        assert remaining == "after"
+
+    def test_multiple_channels_concatenate(self):
+        text = (
+            "<|channel>thought\nfirst thought<channel|>"
+            "prose"
+            "<|channel>thought\nsecond thought<channel|>"
+        )
+        reasoning, remaining = extract_channel_thought(text)
+        assert reasoning == "first thought\n\nsecond thought"
+        assert remaining == "prose"
+
+    def test_empty_channel_body_yields_no_reasoning(self):
+        text = "<|channel>thought\n<channel|>after"
+        reasoning, remaining = extract_channel_thought(text)
+        # Empty body after trim → contributes nothing. Channel block
+        # still removed from remaining.
+        assert reasoning is None
+        assert remaining == "after"
+
+    def test_unclosed_channel_left_alone(self):
+        # Mid-stream state — opener without closer. We don't strip it
+        # here; the caller's hold-back logic will buffer until the
+        # closer arrives or the stream ends.
+        text = "<|channel>thought\nstill thinking..."
+        reasoning, remaining = extract_channel_thought(text)
+        assert reasoning is None
+        assert remaining == text
 
 
 # ---------------------------------------------------------------------
