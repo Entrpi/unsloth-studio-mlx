@@ -841,8 +841,8 @@ class MlxVlmBackend:
         )
         from core.inference.tools import execute_tool
 
-        logger.info(
-            "VLM generate_chat_completion_with_tools ENTRY: tools=%d, "
+        logger.debug(
+            "VLM generate_chat_completion_with_tools: tools=%d, "
             "messages=%d, image=%s, max_iter=%d, auto_heal=%s",
             len(tools or []),
             len(messages or []),
@@ -1002,7 +1002,7 @@ class MlxVlmBackend:
                 else []
             )
 
-            logger.info(
+            logger.debug(
                 "VLM agentic iter=%d: turn_text=%r parsed_calls=%d",
                 iteration,
                 (turn_text or "")[:500],
@@ -1355,10 +1355,15 @@ class MlxVlmBackend:
             tools = render_tools,
             enable_thinking = enable_thinking,
         )
-        # Diagnostic: dump the rendered prompt tail (last 1500 chars) so
-        # we can verify tool results are present + correctly formatted
-        # when generation on an agentic-loop follow-up turn produces an
-        # empty turn_text (observed with Gemma-4 E4B).
+        # Diagnostic (DEBUG-level): dump the rendered prompt tail so
+        # agentic-loop issues are traceable without re-adding logging
+        # each time. The Gemma-4 "iter=1 empty turn_text" hunt lived
+        # here — the tail is how we confirmed the template was
+        # rendering `<turn|>\n` with no `<|turn>model\n` opener when
+        # assistant.content leaked channel + tool_call markup. The
+        # conv_shape build is always cheap; the tail slice is 1500 B.
+        # Structlog will drop the record before formatting when DEBUG
+        # is off, so this adds negligible overhead in production.
         try:
             _conv_shape = [
                 {
@@ -1369,8 +1374,9 @@ class MlxVlmBackend:
                 }
                 for m in conversation
             ]
-            logger.info(
-                "VLM _stream_turn: conv=%d msgs shape=%r prompt_len=%d prompt_tail=%r",
+            logger.debug(
+                "VLM _stream_turn: conv=%d msgs shape=%r "
+                "prompt_len=%d prompt_tail=%r",
                 len(conversation),
                 _conv_shape,
                 len(prompt) if isinstance(prompt, str) else -1,
