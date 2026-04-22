@@ -1,3 +1,69 @@
+# unsloth-studio-mlx
+
+**Development fork of [`unslothai/unsloth`](https://github.com/unslothai/unsloth) focused on MLX backend enablement for Unsloth Studio on Apple Silicon, plus cross-platform streaming / telemetry improvements that apply everywhere Studio runs.**
+
+This fork exists to stage a cohesive body of work — spanning backend streaming architecture, MLX tool-calling, telemetry UX, and cross-platform GPU sampling — before a single PR back to upstream. Everything here is destined for `unslothai/unsloth`; we track upstream continuously and will rebase before opening the PR.
+
+Development happens on the **`mlx-studio-enablement`** branch. The `main` branch here mirrors `unslothai/unsloth:main` — no direct commits.
+
+## What this fork adds on top of upstream
+
+**MLX tool-calling (chat + agentic loop):**
+- `MlxVlmBackend.generate_chat_completion_with_tools` — full agentic tool loop for vision-language MLX models, mirroring `MlxLmBackend`'s shape (image_b64 passthrough on iteration 0, shared parser, hold-back semantics, per-tool timeout wrapper with responsive cancel).
+- 5-dialect tool-call parser covering JSON-in-`<tool_call>` (Qwen / Hermes / Bonsai), XML `<function=>`, Gemma-4 native `<|tool_call>call:…`, loose-JSON envelope fallback, and GLM-4/4.6/4.7 `<tool_call>name\n<arg_key>…`.
+- Gemma-4 channel-thought extraction (`<|channel>thought…<channel|>` → `reasoning_content`).
+- Globally-unique tool-call IDs across agentic iterations (fixes a reproducible assistant-ui crash on multi-iteration tool loops).
+
+**Streaming architecture — SSE health:**
+- 5-second SSE keepalive comments (`:ka\n\n`) during silent periods (tool execution, prompt re-eval) so browsers / reverse-proxies don't idle-close.
+- 15-second frontend inactivity watchdog that surfaces "connection stalled" rather than hanging forever.
+- Wall-clock-bounded `_fetch_page_text` with cancel_event propagation and explicit socket close to prevent CLOSE_WAIT leaks.
+- Structured `{"type":"progress","phase":…}` events for iteration boundaries ("Re-reading conversation…" / "Generating…" chips during the otherwise-opaque prompt-eval window).
+
+**Live telemetry — token counter + GPU sparkline:**
+- Dedicated `/ws/telemetry` WebSocket (separate from chat SSE) for session state, pre-filter token counts, and device-wide GPU stats.
+- Pre-filter token counter (counts raw tokens from `stream_generate` before hold-back, so the counter ticks during held-back reasoning).
+- GPU sparkline with severity color-coding (muted / amber / destructive bands at 50% / 85% thresholds) and a compact WifiOff badge when the telemetry stream goes silent.
+
+**Cross-platform GPU sampling (robust for 100K+ user base):**
+- macOS Apple Silicon: `IOReport` via ctypes (`/usr/lib/libIOReport.dylib`, no sudo — the mechanism `mactop` / `macmon` use).
+- Linux NVIDIA (incl. DGX Spark aarch64): `pynvml` with `nvidia-smi` subprocess fallback.
+- Linux AMD: `/sys/class/drm/card*/device/gpu_busy_percent`.
+- Linux Intel: sysfs engine busy counters.
+- Windows: `pynvml` primary, PDH (`\GPU Engine`) secondary for any-GPU coverage.
+- Platform-aware fallback chain with `STUDIO_TELEMETRY_GPU_SOURCE` override.
+
+**Model-picker parity:**
+- MLX repos surface alongside GGUF in the dropdown on Apple Silicon (search, download, load).
+- MLX variant picker (2 / 4 / 5 / 6 / 8-bit / bf16 sibling-repo enumeration across `unsloth/*-MLX-*` and `mlx-community/*` repos).
+- Loaded-model chip shows consistent `MLX · 4bit · 19.5 GB` detail for models from LM Studio / custom paths — parity with the existing GGUF chip.
+
+**Feature-flag posture:**
+Every new surface is gated behind an env-var knob with a documented rollback value — see [`docs/env-vars.md`](docs/env-vars.md) for the full reference.
+
+## Status
+
+- ~122 commits on `mlx-studio-enablement` vs upstream branchpoint.
+- Full backend test suite: +~400 new tests, all passing. Identical environmental failure set on `main` and this branch (flash-attn Linux, CUDA-gated GPU tests, etc. — not introduced by this fork).
+- Frontend TypeScript + build clean.
+- Verified end-to-end via Chrome preview against multiple real models (GLM-4.6V-Flash, Gemma-4 E4B, Ternary Bonsai, Qwen3-1.7B).
+- Deferred items documented: [`docs/chunk-h2-matrix/sglang-parser-migration.md`](docs/chunk-h2-matrix/sglang-parser-migration.md) (next-generation parser framework), plus follow-ups in [`docs/chunk-h2-matrix/parity-audit.md`](docs/chunk-h2-matrix/parity-audit.md).
+
+## Relationship to upstream
+
+- Canonical Unsloth development: [`unslothai/unsloth`](https://github.com/unslothai/unsloth).
+- This repo's `main` branch mirrors upstream; no drift.
+- All work lands on `mlx-studio-enablement`. When upstream reviewers are ready, we'll rebase on latest `unslothai/unsloth:main` and open the PR.
+- License: inherited from upstream. Studio-specific source is AGPL-3.0 (see `studio/LICENSE.AGPL-3.0`); other paths retain their original licenses.
+
+## Installing / running
+
+Same as upstream — follow the instructions below. The MLX enhancements in this fork are additive: macOS Apple Silicon users get the new MLX picker + chip detail + IOReport GPU sampling; other platforms get the cross-platform GPU sampling and the streaming keepalive / telemetry improvements.
+
+---
+
+<!-- ↓ Upstream Unsloth README begins below ↓ -->
+
 <h1 align="center" style="margin:0;">
   <a href="https://unsloth.ai/docs"><picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/unslothai/unsloth/main/images/unsloth%20logo%20white%20text.png">
