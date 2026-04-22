@@ -8,6 +8,12 @@
 // a 60x18 px inline sparkline is an order of magnitude smaller and
 // rendering a recharts <LineChart> just to draw 120 points costs more
 // DOM than the whole surrounding composer.
+//
+// Severity tint: drives chip + text + line stroke off the LATEST
+// util sample — crossing 85 % is the "this is actually hot" signal
+// (matches how the training progress UI uses `text-destructive` for
+// error / critical), 50–85 % is a softer warning in amber (matches
+// the auth-form helperText colour). Under 50 % we stay muted.
 
 import type { FC } from "react";
 import { useMemo } from "react";
@@ -20,6 +26,29 @@ const PAD = 1;
 // sampler is best-effort and losing the stream for >10s is a reliable
 // "something is wrong" signal worth communicating visually.
 const STALE_MS = 10_000;
+
+// Severity thresholds (percent). Anything in between 50 and 85 is
+// "warning" (amber); >=85 is "danger" (destructive).
+const UTIL_WARN = 50;
+const UTIL_DANGER = 85;
+
+type Severity = "muted" | "warn" | "danger";
+
+function severityForUtil(util: number | null | undefined): Severity {
+  if (util === null || util === undefined || !Number.isFinite(util)) return "muted";
+  if (util >= UTIL_DANGER) return "danger";
+  if (util >= UTIL_WARN) return "warn";
+  return "muted";
+}
+
+// Tailwind classes keyed on severity. We stay within the palette the
+// repo already uses (destructive / amber-600) rather than inventing a
+// new warning token.
+const CHIP_CLASSES: Record<Severity, string> = {
+  muted: "border-muted-foreground/15 bg-muted/20 text-muted-foreground",
+  warn: "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400",
+  danger: "border-destructive/40 bg-destructive/10 text-destructive",
+};
 
 function buildPath(values: number[]): string {
   if (values.length < 2) return "";
@@ -66,11 +95,15 @@ export const GpuSparkline: FC = () => {
       ? "–"
       : `${Math.round(latest)}%`;
 
+  const severity = severityForUtil(latest);
+  const chipClass = CHIP_CLASSES[severity];
+
   return (
     <div
-      className="flex items-center gap-1.5 rounded-full border border-muted-foreground/15 bg-muted/20 px-2 py-0.5 text-[10px] text-muted-foreground"
+      className={`flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] transition-colors ${chipClass}`}
       title={`GPU ${latestText}${source ? ` (${source})` : ""}`}
       data-testid="gpu-sparkline"
+      data-severity={severity}
       style={{ opacity: stale ? 0.35 : 1, transition: "opacity 600ms" }}
     >
       <span className="tabular-nums">GPU {latestText}</span>
@@ -87,7 +120,7 @@ export const GpuSparkline: FC = () => {
           strokeWidth={1}
           strokeLinecap="round"
           strokeLinejoin="round"
-          opacity={0.6}
+          opacity={severity === "muted" ? 0.6 : 0.85}
         />
       </svg>
     </div>
