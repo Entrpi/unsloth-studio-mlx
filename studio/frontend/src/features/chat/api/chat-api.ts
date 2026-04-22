@@ -317,6 +317,53 @@ function parseSseEvent(rawEvent: string): string[] {
   return dataLines;
 }
 
+// Inactivity watchdog for the SSE reader. The backend emits a
+// ``:ka\n\n`` SSE comment every ~5s during silent periods (tool
+// execution, prompt re-eval). If no bytes arrive for this long the
+// stream is genuinely broken — abort the reader and surface a
+// connection-stalled error rather than hanging the UI forever. The
+// threshold is intentionally 3x the server's 5s keepalive cadence so
+// a single missed tick (GC pause, slow tab) doesn't false-positive.
+const STREAM_INACTIVITY_TIMEOUT_MS = 15_000;
+
+/**
+ * Race a reader.read() against an inactivity deadline. Resolves with
+ * the read result on success; rejects with an Error if the deadline
+ * fires first. On timeout the reader is cancelled so the underlying
+ * connection closes and the server's disconnect poller sees it.
+ */
+async function readWithInactivityTimeout<T>(
+  reader: ReadableStreamDefaultReader<T>,
+  timeoutMs: number,
+): Promise<ReadableStreamReadResult<T>> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new Error(
+          `Stream inactive for ${Math.round(timeoutMs / 1000)}s — ` +
+            "connection stalled (server keepalive missing)",
+        ),
+      );
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([reader.read(), timeout]);
+  } catch (err) {
+    // On timeout, proactively cancel the reader so the fetch socket
+    // closes — this makes the server's ``request.is_disconnected()``
+    // poller fire and stop burning cycles on our behalf.
+    try {
+      await reader.cancel();
+    } catch {
+      // Best-effort — the reader may already be in a terminal state.
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function* streamChatCompletions(
   payload: OpenAIChatCompletionsRequest,
   signal: AbortSignal,
@@ -342,7 +389,10 @@ export async function* streamChatCompletions(
   let buffer = "";
 
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await readWithInactivityTimeout(
+      reader,
+      STREAM_INACTIVITY_TIMEOUT_MS,
+    );
     if (done) {
       break;
     }

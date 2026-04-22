@@ -1061,6 +1061,13 @@ class MlxVlmBackend:
                     if auto_heal_tool_calls
                     else turn_text
                 )
+                logger.debug(
+                    "VLM agentic iter=%d: no tool_calls parsed — "
+                    "returning final_text (len=%d, prev_text_truncated=%r)",
+                    iteration,
+                    len(final_text or ""),
+                    (final_text or "")[:120],
+                )
                 yield {"type": "content", "text": final_text}
                 yield {"type": "status", "text": ""}
                 yield self._build_vlm_metadata_event(
@@ -1256,6 +1263,12 @@ class MlxVlmBackend:
             yield {"type": "status", "text": ""}
 
         # ── Tool iteration cap reached ────────────────────────────
+        logger.debug(
+            "VLM agentic loop exited: entering final-nudge "
+            "(max_iter=%d, conv_len=%d)",
+            max_tool_iterations,
+            len(conversation),
+        )
         passthrough_mode = max_tool_iterations == 0
         if max_tool_iterations > 0:
             conversation.append(

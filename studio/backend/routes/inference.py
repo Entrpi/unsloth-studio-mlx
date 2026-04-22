@@ -5154,12 +5154,52 @@ async def _openai_passthrough_stream(
         # GeneratorExit" / anyio cancel-scope traces on Python 3.13 +
         # httpcore 1.0.x.
         lines_iter = None
+        # Keepalive: llama-server is usually fast but a long prompt
+        # eval or a slow tool-call cycle can produce idle periods that
+        # cause intermediary proxies to close the connection. Same
+        # rationale as ``_mlx_agentic_stream``'s keepalive — race the
+        # upstream aiter_lines against a deadline and emit a ``:ka``
+        # comment on timeout. See ``_sse_keepalive_interval`` for the
+        # env-var tuning knob.
+        keepalive_interval = _sse_keepalive_interval()
         try:
             lines_iter = resp.aiter_lines()
-            async for raw_line in lines_iter:
+            iter_anext = lines_iter.__anext__
+
+            async def _next_line_or_keepalive():
+                """Race the next upstream line against the keepalive
+                deadline. Returns ``(line, is_keepalive, is_end)``."""
+                fut = asyncio.create_task(iter_anext())
+                try:
+                    if keepalive_interval > 0:
+                        try:
+                            line = await asyncio.wait_for(
+                                asyncio.shield(fut),
+                                timeout = keepalive_interval,
+                            )
+                            return line, False, False
+                        except asyncio.TimeoutError:
+                            return None, True, False
+                    else:
+                        line = await fut
+                        return line, False, False
+                except StopAsyncIteration:
+                    return None, False, True
+                except BaseException:
+                    fut.cancel()
+                    raise
+
+            while True:
                 if await request.is_disconnected():
                     cancel_event.set()
                     break
+                line, is_keepalive, is_end = await _next_line_or_keepalive()
+                if is_end:
+                    break
+                if is_keepalive:
+                    yield ":ka\n\n"
+                    continue
+                raw_line = line
                 if not raw_line:
                     continue
                 if not raw_line.startswith("data: "):
@@ -5273,6 +5313,50 @@ async def _openai_passthrough_non_streaming(
 #     Claude Code / Cursor) can execute the tools itself.
 
 
+# ── SSE keepalive configuration (Phase 1 of streaming-session overhaul) ──
+#
+# Problem this solves: the MLX agentic loop has two long silent periods
+# where no bytes cross the SSE wire:
+#   (1) Tool execution — a synchronous web_search / fetch_url can run
+#       for 10–30 s inside a ThreadPoolExecutor; the driving generator
+#       is blocked on ``tool_future.result(timeout=0.5)`` and yields
+#       nothing.
+#   (2) Prompt re-eval between iterations — after a tool returns, the
+#       backend rebuilds a multi-thousand-token prompt and runs
+#       prefill before the first token of the next turn; the generator
+#       is inside ``stream_generate`` with no output yet.
+#
+# During either gap any intermediate layer (browser idle-connection
+# heuristic, reverse-proxy ``proxy_read_timeout``, dev-tunnel) may
+# silently drop the connection. When the backend finally yields the
+# next event it writes into a dead socket, and the user sees a stuck
+# UI even though the server completed successfully.
+#
+# Fix: race the generator-next() call against an asyncio timeout and,
+# on timeout, yield a single SSE comment line ("``:ka\n\n``"). Comment
+# lines are ignored by every conforming SSE parser (the frontend's
+# ``parseSseEvent`` only collects lines starting with "data:") — so
+# this is pure transport-level keepalive, no payload-shape change.
+#
+# The cadence is configurable via ``STUDIO_SSE_KEEPALIVE_INTERVAL``
+# (seconds, float). Default 5.0 — well under any reasonable idle
+# heuristic. Set to 0 to disable entirely (fallback if this causes
+# regressions).
+def _sse_keepalive_interval() -> float:
+    raw = os.environ.get("STUDIO_SSE_KEEPALIVE_INTERVAL")
+    if raw is None:
+        return 5.0
+    try:
+        v = float(raw)
+    except ValueError:
+        return 5.0
+    # Clamp to a sane range. 0 disables; below 1 is too chatty;
+    # above 30 defeats the purpose for most proxy defaults.
+    if v <= 0:
+        return 0.0
+    return max(1.0, min(30.0, v))
+
+
 async def _mlx_vlm_agentic_stream(
     *,
     request,
@@ -5367,6 +5451,64 @@ async def _mlx_agentic_stream(
 
     _disconnect_task = asyncio.create_task(_disconnect_poller())
 
+    # Keepalive state — when the generator is blocked (tool execution,
+    # prompt re-eval) we race ``next(gen)`` against an asyncio timeout
+    # and emit a ``:ka\n\n`` comment on timeout so the SSE wire never
+    # goes silent for more than ``keepalive_interval`` seconds.
+    keepalive_interval = _sse_keepalive_interval()
+    _last_yield_ts = [time.monotonic()]  # closure-mutable box
+
+    # Deviation threshold: if ANY two consecutive yields are further
+    # apart than ``keepalive_interval * 2``, the keepalive racing the
+    # generator is broken — log a warning so the issue is visible.
+    _gap_warn_threshold = (
+        keepalive_interval * 2.0 if keepalive_interval > 0 else 30.0
+    )
+
+    def _mark_yield(kind: str) -> None:
+        now = time.monotonic()
+        gap = now - _last_yield_ts[0]
+        if gap > _gap_warn_threshold:
+            logger.warning(
+                "SSE silent-period exceeded threshold: kind=%s gap=%.2fs "
+                "(threshold=%.2fs, keepalive_interval=%.2fs) — "
+                "check keepalive configuration",
+                kind, gap, _gap_warn_threshold, keepalive_interval,
+            )
+        _last_yield_ts[0] = now
+
+    async def _next_or_keepalive():
+        """Race next(gen) against the keepalive deadline.
+
+        Returns ``(event, is_keepalive)``. When ``is_keepalive`` is
+        True the caller should yield a keepalive comment and loop back
+        — the generator task was *not* cancelled (we shield it), so
+        it's still running and the next call will pick up where it
+        left off.
+        """
+        fut = asyncio.create_task(asyncio.to_thread(next, gen, _sentinel))
+        try:
+            if keepalive_interval > 0:
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(fut),
+                        timeout = keepalive_interval,
+                    )
+                    return result, False
+                except asyncio.TimeoutError:
+                    return None, True
+            else:
+                return await fut, False
+        except BaseException:
+            # On any other failure (cancellation etc.), cancel the
+            # spawned task so it doesn't outlive us. ``shield`` would
+            # otherwise leak it if the outer request is cancelled
+            # while the thread is still running. Best-effort — the
+            # thread itself can't be killed, but the Future wrapper
+            # gets cleaned up when next() eventually returns.
+            fut.cancel()
+            raise
+
     try:
         while True:
             if await request.is_disconnected():
@@ -5374,7 +5516,15 @@ async def _mlx_agentic_stream(
                 return
             if cancel_event.is_set():
                 return
-            event = await asyncio.to_thread(next, gen, _sentinel)
+            event, is_keepalive = await _next_or_keepalive()
+            if is_keepalive:
+                # Comment-line SSE heartbeat. Standards-compliant SSE
+                # clients (including the frontend's parseSseEvent)
+                # ignore lines not starting with "data:". See the
+                # long comment on ``_sse_keepalive_interval`` above.
+                _mark_yield("keepalive")
+                yield ":ka\n\n"
+                continue
             if event is _sentinel:
                 break
 
@@ -5385,12 +5535,14 @@ async def _mlx_agentic_stream(
                 # the next assistant turn streams cleanly.
                 if not event.get("text"):
                     prev_text = ""
+                _mark_yield("status")
                 yield f"data: {json.dumps({'type': 'tool_status', 'content': event.get('text', '')})}\n\n"
                 continue
 
             if etype in ("tool_start", "tool_end"):
                 if etype == "tool_start":
                     prev_text = ""
+                _mark_yield(etype)
                 yield f"data: {json.dumps(event)}\n\n"
                 continue
 
@@ -5416,6 +5568,7 @@ async def _mlx_agentic_stream(
                         )
                     ],
                 )
+                _mark_yield("content")
                 yield f"data: {chunk.model_dump_json(exclude_none = True)}\n\n"
 
         # Final chunk with finish_reason=stop.
@@ -5427,6 +5580,7 @@ async def _mlx_agentic_stream(
                 ChunkChoice(delta = ChoiceDelta(), finish_reason = "stop"),
             ],
         )
+        _mark_yield("final")
         yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
 
         if _stream_usage or _stream_timings:
