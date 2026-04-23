@@ -719,6 +719,15 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
             presence_penalty: params.presencePenalty,
             image_base64: imageBase64,
             audio_base64: audioBase64,
+            // Phase 3 — always include the thread-scoped session_id
+            // (independent of tool use) so the backend's telemetry
+            // broadcaster can fan ``tokens`` events back to the
+            // matching WS subscriber. Originally added for the
+            // tool-execution sandbox (see tools.py _get_workdir),
+            // it now also keys per-session telemetry on every chat
+            // path. ``null`` becomes the omitted-field path on the
+            // backend (Optional[str] default None).
+            ...(resolvedThreadId ? { session_id: resolvedThreadId } : {}),
             ...(useAdapter === undefined ? {} : { use_adapter: useAdapter }),
             ...(supportsReasoning ? { enable_thinking: reasoningEnabled } : {}),
             ...(supportsTools && (toolsEnabled || codeToolsEnabled)
@@ -734,7 +743,6 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
                     const mins = useChatRuntimeStore.getState().toolCallTimeout;
                     return mins >= 9999 ? 9999 : mins * 60;
                   })(),
-                  session_id: resolvedThreadId,
                 }
               : {}),
           },

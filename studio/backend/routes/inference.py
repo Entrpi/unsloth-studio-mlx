@@ -2494,6 +2494,20 @@ async def openai_chat_completions(
             _tool_sentinel = object()
 
             async def gguf_tool_stream():
+                # Phase 3 — token telemetry. Same shape as
+                # ``gguf_stream_chunks``: direct ``note_token`` /
+                # ``note_usage`` calls keyed off the cumulative text
+                # diff and the ``metadata`` event's
+                # ``usage.completion_tokens``. The tool loop's
+                # ``status`` / ``tool_start`` / ``tool_end`` events
+                # are not generated tokens (they're Studio-internal
+                # control events) so they don't contribute to the
+                # count.
+                _tok_tracker = _PassthroughTokenTracker(
+                    _passthrough_telemetry_broadcaster()
+                    if _passthrough_telemetry_enabled() else None,
+                    getattr(payload, "session_id", None),
+                )
                 try:
                     first_chunk = ChatCompletionChunk(
                         id = completion_id,
@@ -2550,6 +2564,12 @@ async def openai_chat_completions(
                         if event["type"] == "metadata":
                             _stream_usage = event.get("usage")
                             _stream_timings = event.get("timings")
+                            # Phase 3 — reconcile with the exact
+                            # final count once the tool-loop wrap-up
+                            # surfaces it.
+                            ct = (_stream_usage or {}).get("completion_tokens")
+                            if isinstance(ct, int):
+                                _tok_tracker.note_usage(ct)
                             continue
 
                         # "content" type -- cumulative text
@@ -2562,6 +2582,9 @@ async def openai_chat_completions(
                         prev_text = clean_cumulative
                         if not new_text:
                             continue
+                        # Phase 3 — one yielded text delta ≈ one
+                        # llama-server SSE chunk ≈ one token.
+                        _tok_tracker.note_token(content_chars = len(new_text))
                         chunk = ChatCompletionChunk(
                             id = completion_id,
                             created = created,
@@ -2655,6 +2678,16 @@ async def openai_chat_completions(
         if payload.stream:
 
             async def gguf_stream_chunks():
+                # Phase 3 — token telemetry. ``_PassthroughTokenTracker``
+                # has the same shape used by the verbatim OpenAI passthrough
+                # — direct ``note_token`` / ``note_usage`` calls (no SSE
+                # parsing) since this path already has the cumulative
+                # text + final metadata dict in hand.
+                _tok_tracker = _PassthroughTokenTracker(
+                    _passthrough_telemetry_broadcaster()
+                    if _passthrough_telemetry_enabled() else None,
+                    getattr(payload, "session_id", None),
+                )
                 try:
                     # First chunk: role
                     first_chunk = ChatCompletionChunk(
@@ -2688,6 +2721,10 @@ async def openai_chat_completions(
                             if cumulative.get("type") == "metadata":
                                 _stream_usage = cumulative.get("usage")
                                 _stream_timings = cumulative.get("timings")
+                                # Phase 3 — reconcile with exact count.
+                                ct = (_stream_usage or {}).get("completion_tokens")
+                                if isinstance(ct, int):
+                                    _tok_tracker.note_usage(ct)
                             else:
                                 logger.warning(
                                     "gguf_stream_chunks: unexpected dict event: %s",
@@ -2702,6 +2739,9 @@ async def openai_chat_completions(
                         prev_text = cumulative
                         if not new_text:
                             continue
+                        # Phase 3 — one yielded text delta ≈ one
+                        # llama-server SSE chunk ≈ one token.
+                        _tok_tracker.note_token(content_chars = len(new_text))
                         chunk = ChatCompletionChunk(
                             id = completion_id,
                             created = created,
@@ -5723,6 +5763,22 @@ async def _openai_passthrough_stream(
             detail = f"llama-server error: {err_text[:500]}",
         )
 
+    # Phase 3 — token telemetry for the GGUF passthrough path.
+    # Resolve the broadcaster + session_id once before we enter the
+    # async generator so the per-chunk hot loop only does cheap dict
+    # lookups. Telemetry is gated by ``STUDIO_ENABLE_TELEMETRY_WS``
+    # AND by the request carrying a ``session_id`` (events without one
+    # would broadcast to every WS subscriber and pollute unrelated
+    # token-counter chips).
+    _tb = (
+        _passthrough_telemetry_broadcaster()
+        if _passthrough_telemetry_enabled()
+        else None
+    )
+    _session_id = getattr(payload, "session_id", None)
+    if _session_id is None:
+        _tb = None
+
     async def _stream():
         # Same httpx lifecycle pattern as _anthropic_passthrough_stream:
         # avoid `async with` on the client/response AND explicitly save
@@ -5743,6 +5799,17 @@ async def _openai_passthrough_stream(
         # comment on timeout. See ``_sse_keepalive_interval`` for the
         # env-var tuning knob.
         keepalive_interval = _sse_keepalive_interval()
+
+        # ── Phase 3 — token telemetry tracker ──────────────────────
+        # ``_PassthroughTokenTracker`` parses each SSE chunk to
+        # increment a per-token interpolation count, then reconciles
+        # with llama-server's exact ``usage.completion_tokens`` from
+        # the final ``stream_options.include_usage`` chunk. The
+        # tracker is inert when ``_tb`` or ``_session_id`` is None,
+        # so the per-chunk hot loop only does an ``if self._enabled``
+        # check in the no-telemetry path. See the class docstring
+        # for wire-format details.
+        tok_tracker = _PassthroughTokenTracker(_tb, _session_id)
         try:
             lines_iter = resp.aiter_lines()
             iter_anext = lines_iter.__anext__
@@ -5803,7 +5870,13 @@ async def _openai_passthrough_stream(
                 # sees its native `id`, `finish_reason`, `delta.tool_calls`,
                 # and final `usage` unchanged.
                 yield raw_line + "\n\n"
-                if raw_line[6:].strip() == "[DONE]":
+                payload_str = raw_line[6:].strip()
+                # Phase 3 — feed the same chunk into the token
+                # counter AFTER relaying it. Any parse/emit failure
+                # is swallowed inside the tracker so it cannot affect
+                # the relayed stream.
+                tok_tracker.ingest(payload_str)
+                if payload_str == "[DONE]":
                     break
         except Exception as e:
             # Mid-stream failures still have to be reported inside the SSE
@@ -5950,6 +6023,232 @@ def _sse_keepalive_interval() -> float:
     if v <= 0:
         return 0.0
     return max(1.0, min(30.0, v))
+
+
+# Phase 3 — telemetry (GGUF passthrough peer of mlx_lm.py's
+# ``_telemetry_enabled`` / ``_telemetry_broadcaster``). The MLX backend
+# emits ``tokens`` events from inside its own streaming loop; the GGUF
+# path goes through llama-server's SSE relay below, so we re-derive
+# token counts from the SSE chunks here. Same env-var knob
+# (``STUDIO_ENABLE_TELEMETRY_WS``) and same lazy import to keep the
+# CI / no-WS test path zero-cost.
+def _passthrough_telemetry_enabled() -> bool:
+    raw = os.environ.get("STUDIO_ENABLE_TELEMETRY_WS")
+    if raw is None:
+        return True
+    return raw.strip() not in {"0", "false", "False", "no", "off"}
+
+
+def _passthrough_telemetry_broadcaster():
+    """Return the singleton broadcaster or ``None`` if import fails.
+
+    Mirrors ``mlx_lm._telemetry_broadcaster`` but only returns the
+    broadcaster (the GGUF passthrough doesn't drive ``gpu_sampler``
+    notify hooks — the global GPU sampler keeps polling regardless of
+    which backend is generating).
+    """
+    try:
+        from core.telemetry import broadcaster as _tb
+        return _tb
+    except Exception:
+        return None
+
+
+class _PassthroughTokenTracker:
+    """Reconstructs token counts from a llama-server stream.
+
+    The GGUF backend proxies llama-server's ``/v1/chat/completions``
+    via three different streaming paths (verbatim SSE byte relay,
+    Studio-wrapped tool-loop, plain non-tool stream) — so unlike the
+    MLX backend (which controls its own generator and can emit token
+    telemetry inline), we have to re-derive the counts from whatever
+    shape each path surfaces.
+
+    Two signals feed the tracker:
+
+    1. **Live interpolation.** llama-server emits one chunk per
+       generated token (one delta per forward pass). Counting
+       non-empty deltas gives a tight upper bound on the true token
+       count throughout generation. ``content`` lengths are also
+       accumulated for future char-based estimates (current chip uses
+       token count only).
+
+    2. **Final reconciliation.** ``stream_options.include_usage`` (set
+       in :func:`_build_passthrough_payload`) makes llama-server emit
+       one trailing chunk whose ``choices`` is empty and whose
+       ``usage`` carries the exact ``completion_tokens``. Studio's
+       wrapped streams surface the same number through their
+       ``metadata`` event. The tracker overrides the interpolated
+       count with this and force-emits so the chip always settles on
+       the precise number.
+
+    Emissions are pushed through the in-process ``broadcaster`` to
+    every WS subscriber whose ``session_id`` matches the request.
+    Without a session_id the tracker is inert (would otherwise pollute
+    every other open chip). All emit / parse failures are swallowed
+    to ``logger.debug`` — telemetry must never affect the user-visible
+    stream.
+
+    Three entry points so each streaming path uses what it has:
+
+    - :meth:`ingest` — pure SSE-payload parser, used by the verbatim
+      OpenAI passthrough that already has the raw ``data: …`` line.
+    - :meth:`note_token` — direct push of one token, used by Studio
+      wrapped streams that yield cumulative text strings.
+    - :meth:`note_usage` — direct push of the final exact count,
+      used by Studio wrapped streams when their generator yields the
+      ``metadata`` event with ``usage.completion_tokens``.
+
+    Args:
+        broadcaster: The telemetry broadcaster, or ``None`` to disable.
+        session_id: The session this stream belongs to. ``None``
+            disables emission.
+        emit_interval: Minimum seconds between non-forced emissions
+            (rate limit). Defaults to 0.25 — matches the MLX path
+            (~4 Hz, well below WS frame coalescing thresholds).
+        now_fn: Wall clock for tps calculation. Defaults to
+            ``time.monotonic`` — overridable in tests for determinism.
+    """
+
+    def __init__(
+        self,
+        broadcaster,
+        session_id: Optional[str],
+        *,
+        emit_interval: float = 0.25,
+        now_fn = time.monotonic,
+    ) -> None:
+        # Disable entirely if either dep is missing — the per-chunk
+        # hot path becomes a single ``if self._enabled:`` check.
+        self._enabled = broadcaster is not None and session_id is not None
+        self._broadcaster = broadcaster
+        self._session_id = session_id
+        self._emit_interval = emit_interval
+        self._now = now_fn
+        self.tok_count = 0
+        self.chars_streamed = 0
+        self.first_content_ts: Optional[float] = None
+        self.last_emit_ts = 0.0
+        self.final_completion_tokens: Optional[int] = None
+
+    # ── Direct push API (Studio-wrapped streams) ──────────────────
+
+    def note_token(self, content_chars: int = 0) -> None:
+        """Record one generated token plus optional content-char delta.
+
+        Used by streaming paths that already deliver new text per
+        chunk (``gguf_stream_chunks`` and ``gguf_tool_stream``) — the
+        per-chunk text length goes to ``chars_streamed`` and the
+        per-chunk count of 1 goes to ``tok_count``. Triggers a
+        rate-limited emit.
+        """
+        if not self._enabled:
+            return
+        self.tok_count += 1
+        if content_chars:
+            self.chars_streamed += content_chars
+        if self.first_content_ts is None:
+            self.first_content_ts = self._now()
+        self.emit()
+
+    def note_usage(self, completion_tokens: int) -> None:
+        """Record llama-server's exact ``usage.completion_tokens``.
+
+        Force-emits regardless of the rate-limit window so the chip
+        lands on the precise number.
+        """
+        if not self._enabled:
+            return
+        if not isinstance(completion_tokens, int):
+            return
+        self.final_completion_tokens = completion_tokens
+        self.emit(force = True)
+
+    # ── SSE-payload parser API (verbatim passthrough) ─────────────
+
+    def ingest(self, payload_str: str) -> None:
+        """Parse one ``data: ...`` payload and update token state.
+
+        Called AFTER the chunk has been relayed to the client, so any
+        parse / emit failure here cannot corrupt the wire response.
+        """
+        if not self._enabled:
+            return
+        if not payload_str or payload_str == "[DONE]":
+            return
+        try:
+            chunk = json.loads(payload_str)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(chunk, dict):
+            return
+        try:
+            choices = chunk.get("choices") or []
+            if choices:
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                tool_calls = delta.get("tool_calls")
+                # ``tool_calls`` deltas are output tokens too (the
+                # model is generating the function-call JSON).
+                if content or tool_calls:
+                    chars = len(content) if isinstance(content, str) else 0
+                    self.note_token(content_chars = chars)
+            usage = chunk.get("usage")
+            if isinstance(usage, dict):
+                ct = usage.get("completion_tokens")
+                if isinstance(ct, int):
+                    self.note_usage(ct)
+        except Exception as exc:
+            logger.debug(
+                "openai passthrough token-parse raised: %s", exc
+            )
+
+    def emit(self, force: bool = False) -> None:
+        """Push a ``tokens`` event to the telemetry WS, rate-limited.
+
+        ``force=True`` bypasses the rate limit — used for the final
+        usage-chunk reconciliation so the chip lands on the exact
+        count rather than the last interpolated value.
+        """
+        if not self._enabled:
+            return
+        now = self._now()
+        if not force and now - self.last_emit_ts < self._emit_interval:
+            return
+        self.last_emit_ts = now
+        # Prefer llama-server's exact count once it arrives.
+        pre = (
+            self.final_completion_tokens
+            if self.final_completion_tokens is not None
+            else self.tok_count
+        )
+        tps: Optional[float] = None
+        if self.first_content_ts is not None:
+            elapsed = now - self.first_content_ts
+            if elapsed > 0:
+                tps = pre / elapsed
+        try:
+            self._broadcaster.emit(
+                "tokens",
+                {
+                    # GGUF passthrough has no inner tool-call iteration
+                    # loop (all turns happen on the client) — pin to 0
+                    # to match the chip's "iter 0" rendering on the
+                    # MLX path's first turn.
+                    "iteration": 0,
+                    "pre_filter_tokens": int(pre),
+                    # GGUF has no thinking-block hold-back filter;
+                    # post == pre by definition.
+                    "post_filter_tokens": int(pre),
+                    "tps": float(tps) if tps is not None else None,
+                    "prompt_tps": None,
+                },
+                session_id = self._session_id,
+            )
+        except Exception as exc:
+            logger.debug(
+                "openai passthrough token telemetry emit raised: %s", exc
+            )
 
 
 async def _mlx_vlm_agentic_stream(
